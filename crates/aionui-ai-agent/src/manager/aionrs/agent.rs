@@ -135,10 +135,10 @@ struct ModelSettingsSource {
     provider_id: String,
 }
 
-fn tool_round_reasoning_models(settings: HashMap<String, ModelSettings>) -> HashSet<String> {
+fn tool_round_reasoning_exclusions(settings: HashMap<String, ModelSettings>) -> HashSet<String> {
     settings
         .into_iter()
-        .filter_map(|(model, settings)| (settings.reasoning_tool_round_only == Some(true)).then_some(model))
+        .filter_map(|(model, settings)| (settings.reasoning_tool_round_only == Some(false)).then_some(model))
         .collect()
 }
 
@@ -318,7 +318,7 @@ impl AionrsAgentManager {
         if !engine.supports_tool_round_reasoning_policy() {
             return self;
         }
-        engine.set_tool_round_reasoning_models(tool_round_reasoning_models(initial_settings));
+        engine.set_tool_round_reasoning_policy(true, tool_round_reasoning_exclusions(initial_settings));
         self.model_settings_source = Some(ModelSettingsSource {
             repository,
             user_id,
@@ -357,7 +357,7 @@ impl AionrsAgentManager {
                 );
                 AgentError::internal("Stored model settings are invalid")
             })?;
-        engine.set_tool_round_reasoning_models(tool_round_reasoning_models(settings));
+        engine.set_tool_round_reasoning_policy(true, tool_round_reasoning_exclusions(settings));
         Ok(())
     }
 

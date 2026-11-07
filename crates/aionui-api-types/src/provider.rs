@@ -54,7 +54,7 @@ pub struct ModelSettings {
     pub image_input: Option<ModelImageInputCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_api_mode: Option<ModelOpenAiApiMode>,
-    /// Limit Chat Completions reasoning replay to tool continuations in the current turn.
+    /// Limit Chat Completions reasoning replay to tool continuations in the current turn. Defaults to true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_tool_round_only: Option<bool>,
 }

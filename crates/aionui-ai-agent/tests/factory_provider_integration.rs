@@ -315,7 +315,7 @@ async fn live_aionrs_runtime_refreshes_the_model_reasoning_policy_between_turns(
     update_model_settings(
         &*provider_repo,
         provider_id,
-        r#"{"gpt-5.4":{"reasoning_tool_round_only":true}}"#,
+        r#"{"gpt-4o":{"reasoning_tool_round_only":false}}"#,
     )
     .await;
     send("use a tool").await.unwrap().unwrap();
@@ -334,12 +334,7 @@ async fn live_aionrs_runtime_refreshes_the_model_reasoning_policy_between_turns(
         ["reply reasoning 0", "tool reasoning", "reply reasoning 2"]
     );
 
-    update_model_settings(
-        &*provider_repo,
-        provider_id,
-        r#"{"gpt-5.4":{"reasoning_tool_round_only":true}}"#,
-    )
-    .await;
+    update_model_settings(&*provider_repo, provider_id, "{}").await;
     send("ordinary follow-up").await.unwrap().unwrap();
     assert!(reasoning_values(&requests.try_recv().unwrap()).is_empty());
     let session = SessionManager::new(directory.path().join("aionrs-sessions"), 100)
