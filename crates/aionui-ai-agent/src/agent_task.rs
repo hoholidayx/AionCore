@@ -652,6 +652,7 @@ mod aionrs_config_option_tests {
             model: "claude-sonnet-4-20250514".into(),
             base_url: None,
             system_prompt: None,
+            custom_prompt_has_instructions: None,
             max_tokens: None,
             max_turns: None,
             max_tool_call_malformed_turns: None,

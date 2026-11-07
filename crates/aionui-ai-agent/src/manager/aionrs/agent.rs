@@ -220,6 +220,9 @@ impl AionrsAgentManager {
         let provider_label = config.provider_label.clone();
 
         let mut bootstrap = AgentBootstrap::new(config, &workspace, sink).runtime_env(runtime_env);
+        if let Some(has_instructions) = config_extra.custom_prompt_has_instructions {
+            bootstrap = bootstrap.custom_prompt_has_instructions(has_instructions);
+        }
         if let Some(session) = resume_session {
             info!(
                 conversation_id = %conversation_id,

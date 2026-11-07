@@ -33,15 +33,16 @@ async fn skill_index_text(deps: &AgentFactoryDeps, user_id: &str, skills: &[Stri
     crate::capability::skill_manager::build_skills_index_text(&index)
 }
 
-/// Append the index to the system prompt, keeping the assistant's own rules in
-/// the leading position.
-///
-/// Pure so the composition rules are testable without standing up a factory.
-fn merge_skill_index_into_system_prompt(system_prompt: Option<String>, index: &str) -> Option<String> {
-    match (system_prompt, index.is_empty()) {
-        (prompt, true) => prompt,
-        (Some(prompt), false) => Some(format!("{prompt}\n\n{index}")),
-        (None, false) => Some(index.to_owned()),
+/// Append the index and report whether the text preceding it contains
+/// instructions. When there is no index, the engine can infer this itself.
+fn merge_skill_index_into_system_prompt(system_prompt: Option<String>, index: &str) -> (Option<String>, Option<bool>) {
+    if index.is_empty() {
+        return (system_prompt, None);
+    }
+
+    match system_prompt.filter(|prompt| !prompt.trim().is_empty()) {
+        Some(prompt) => (Some(format!("{prompt}\n\n{index}")), Some(true)),
+        None => (Some(index.to_owned()), Some(false)),
     }
 }
 
@@ -86,7 +87,7 @@ pub(super) async fn build(
     // reading the session-skills view directory directly), that is a change in
     // the aionrs crate itself, and this is where it would re-join the shared
     // delivery decision.
-    overrides.system_prompt = merge_skill_index_into_system_prompt(
+    let (system_prompt, custom_prompt_has_instructions) = merge_skill_index_into_system_prompt(
         overrides.system_prompt.take(),
         &skill_index_text(&deps, &ctx.user_id, &resolved_skills).await,
     );
@@ -187,7 +188,8 @@ pub(super) async fn build(
         api_key,
         model: model_id,
         base_url,
-        system_prompt: overrides.system_prompt,
+        system_prompt,
+        custom_prompt_has_instructions,
         max_tokens: None,
         max_turns: overrides.max_turns,
         max_tool_call_malformed_turns: overrides.max_tool_call_malformed_turns,
@@ -2308,9 +2310,10 @@ mod tests {
                 description: "Schedule stuff".into(),
             },
         ]);
-        let merged =
-            merge_skill_index_into_system_prompt(Some("Be concise.".to_owned()), &index).expect("a prompt exists");
+        let (merged, has_instructions) = merge_skill_index_into_system_prompt(Some("Be concise.".to_owned()), &index);
+        let merged = merged.expect("a prompt exists");
 
+        assert_eq!(has_instructions, Some(true));
         assert!(
             merged.starts_with("Be concise."),
             "assistant rules keep the lead: {merged}"
@@ -2325,9 +2328,9 @@ mod tests {
     fn no_skills_leaves_the_system_prompt_untouched() {
         assert_eq!(
             merge_skill_index_into_system_prompt(Some("Be concise.".to_owned()), ""),
-            Some("Be concise.".to_owned())
+            (Some("Be concise.".to_owned()), None)
         );
-        assert_eq!(merge_skill_index_into_system_prompt(None, ""), None);
+        assert_eq!(merge_skill_index_into_system_prompt(None, ""), (None, None));
     }
 
     /// An assistant with no rules but with skills must still get the index —
@@ -2340,8 +2343,11 @@ mod tests {
                 description: "d".into(),
             },
         ]);
-        let merged = merge_skill_index_into_system_prompt(None, &index).expect("skills alone produce a prompt");
-        assert!(merged.starts_with("## Available Skills"));
+        for empty_prompt in [None, Some("  \n".to_owned())] {
+            let (merged, has_instructions) = merge_skill_index_into_system_prompt(empty_prompt, &index);
+            assert_eq!(merged.as_deref(), Some(index.as_str()));
+            assert_eq!(has_instructions, Some(false));
+        }
     }
 
     #[test]

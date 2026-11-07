@@ -93,6 +93,7 @@ impl ProviderHealthCheckService {
             model: model_id.to_owned(),
             base_url,
             system_prompt: Some("You are a provider health probe. Reply with exactly OK and do not use tools.".into()),
+            custom_prompt_has_instructions: None,
             max_tokens: Some(HEALTH_CHECK_MAX_TOKENS),
             max_turns: Some(1),
             max_tool_call_malformed_turns: Some(1),

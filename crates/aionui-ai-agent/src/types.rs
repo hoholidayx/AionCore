@@ -140,6 +140,8 @@ pub struct AionrsResolvedConfig {
     pub base_url: Option<String>,
     /// System prompt override.
     pub system_prompt: Option<String>,
+    /// Whether the prompt had instructions before the factory appended a skill index.
+    pub custom_prompt_has_instructions: Option<bool>,
     /// Internal response cap for specialized flows such as provider health probes.
     /// Normal AionUi conversations leave this unset.
     pub max_tokens: Option<u32>,

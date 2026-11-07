@@ -29,6 +29,7 @@ fn make_test_config() -> AionrsResolvedConfig {
         model: "claude-sonnet-4-20250514".into(),
         base_url: None,
         system_prompt: None,
+        custom_prompt_has_instructions: None,
         max_tokens: None,
         max_turns: None,
         max_tool_call_malformed_turns: None,
@@ -174,6 +175,79 @@ fn aionrs_final_input_dump_value_contains_raw_split_input_and_context() {
         "raw-token-value"
     );
     assert_eq!(value["resolved_context"]["runtime_env"][0][1], "raw-env-value");
+}
+
+#[tokio::test]
+async fn assistant_rules_control_identity_in_the_provider_request() {
+    use axum::{Json, Router, routing::post};
+    use serde_json::Value;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (request_tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+    let router = Router::new().route(
+        "/chat/completions",
+        post(move |Json(body): Json<Value>| async move {
+            request_tx.send(body).unwrap();
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Ready\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let index = "## Available Skills\n- Test skill";
+    let identity =
+        "You are an AI assistant that can use tools to help with tasks.\nYou are powered by the model test-model.";
+    let rules = "Custom assistant rules";
+    for (id, prompt, has_instructions, prefix) in [
+        ("skills-only", index.to_owned(), false, format!("{identity}\n\n{index}")),
+        (
+            "custom-rules",
+            format!("{rules}\n\n{index}"),
+            true,
+            format!("{rules}\n\n{index}"),
+        ),
+    ] {
+        let mut config = make_test_config();
+        config.provider = "openai".into();
+        config.model = "test-model".into();
+        config.base_url = Some(format!("http://{address}"));
+        config.system_prompt = Some(prompt);
+        config.custom_prompt_has_instructions = Some(has_instructions);
+        config.session_directory = workspace.path().join("sessions");
+        let agent = AionrsAgentManager::new(id.into(), workspace.path().to_string_lossy().into_owned(), config, None)
+            .await
+            .unwrap();
+        timeout(
+            Duration::from_secs(10),
+            agent.send_message(SendMessageData {
+                content: "Test".into(),
+                msg_id: id.into(),
+                turn_id: None,
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+            }),
+        )
+        .await
+        .expect("provider request timed out")
+        .unwrap();
+
+        let body = requests.try_recv().unwrap();
+        assert_eq!(body["model"], "test-model");
+        assert_eq!(body["messages"][0]["role"], "system");
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(system.starts_with(&format!("{prefix}\n\nWorking directory:")));
+        assert_eq!(system.contains(identity), !has_instructions);
+        assert!(!system.contains("Current date:"));
+        assert!(!system.contains("# Using your tools"));
+    }
+    server.abort();
 }
 
 #[tokio::test]
