@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use aion_agent::bootstrap::AgentBootstrap;
 use aion_agent::engine::AgentEngine;
+use aion_agent::error::AgentError as AionrsEngineError;
 use aion_agent::output::OutputSink;
 use aion_agent::session::Session;
 use aion_config::compat::ProviderCompat;
@@ -16,11 +17,12 @@ use aion_protocol::commands::{ApprovalScope, SessionMode};
 use aion_protocol::{ToolApprovalManager, ToolApprovalResult};
 use aionui_api_types::{
     AcpConfigOptionDto, AcpConfigSelectOptionDto, AgentModeResponse, ConfigOptionConfirmation,
-    GetConfigOptionsResponse, SetConfigOptionResponse, SlashCommandItem,
+    GetConfigOptionsResponse, ModelSettings, SetConfigOptionResponse, SlashCommandItem,
 };
 use aionui_common::{
     AgentKillReason, AgentType, Confirmation, ConversationStatus, ErrorChain, TimestampMs, generate_short_id, now_ms,
 };
+use aionui_db::IProviderRepository;
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify, broadcast};
 use tokio::time::timeout;
@@ -106,6 +108,7 @@ fn build_aionrs_final_input_dump_value(
 pub struct AionrsAgentManager {
     runtime: AgentRuntime,
     engine: Mutex<AgentEngine>,
+    model_settings_source: Option<ModelSettingsSource>,
     /// Static slash command metadata captured at bootstrap so UI lookups do
     /// not wait behind an active `engine.run()` turn.
     slash_commands: Vec<SlashCommandItem>,
@@ -124,6 +127,19 @@ pub struct AionrsAgentManager {
     cancel_notify: Arc<Notify>,
     /// Signalled after an in-flight turn emits its terminal event.
     turn_finished_notify: Arc<Notify>,
+}
+
+struct ModelSettingsSource {
+    repository: Arc<dyn IProviderRepository>,
+    user_id: String,
+    provider_id: String,
+}
+
+fn tool_round_reasoning_models(settings: HashMap<String, ModelSettings>) -> HashSet<String> {
+    settings
+        .into_iter()
+        .filter_map(|(model, settings)| (settings.reasoning_tool_round_only == Some(true)).then_some(model))
+        .collect()
 }
 
 impl Drop for AionrsAgentManager {
@@ -280,6 +296,7 @@ impl AionrsAgentManager {
         Ok(Self {
             runtime,
             engine: Mutex::new(engine),
+            model_settings_source: None,
             slash_commands,
             mcp_managers: result.mcp_managers,
             approval_manager,
@@ -288,6 +305,84 @@ impl AionrsAgentManager {
             cancel_notify: Arc::new(Notify::new()),
             turn_finished_notify: Arc::new(Notify::new()),
         })
+    }
+
+    pub(crate) fn with_model_settings_source(
+        mut self,
+        repository: Arc<dyn IProviderRepository>,
+        user_id: String,
+        provider_id: String,
+        initial_settings: HashMap<String, ModelSettings>,
+    ) -> Self {
+        let engine = self.engine.get_mut();
+        if !engine.supports_tool_round_reasoning_policy() {
+            return self;
+        }
+        engine.set_tool_round_reasoning_models(tool_round_reasoning_models(initial_settings));
+        self.model_settings_source = Some(ModelSettingsSource {
+            repository,
+            user_id,
+            provider_id,
+        });
+        self
+    }
+
+    /// Freeze the provider's current model policies for the whole user turn.
+    async fn refresh_reasoning_policy(&self, engine: &mut AgentEngine) -> Result<(), AgentError> {
+        let Some(source) = &self.model_settings_source else {
+            return Ok(());
+        };
+        let provider = source
+            .repository
+            .find_by_id(&source.user_id, &source.provider_id)
+            .await
+            .map_err(|error| {
+                warn!(
+                    conversation_id = %self.runtime.conversation_id(),
+                    provider_id = %source.provider_id,
+                    error = %ErrorChain(&error),
+                    "Failed to load Aionrs model settings"
+                );
+                AgentError::internal("Failed to load model settings")
+            })?
+            .ok_or_else(|| AgentError::internal("The model provider no longer exists"))?;
+        let settings: HashMap<String, ModelSettings> =
+            serde_json::from_str(&provider.model_settings).map_err(|error| {
+                warn!(
+                    conversation_id = %self.runtime.conversation_id(),
+                    provider_id = %source.provider_id,
+                    line = error.line(),
+                    column = error.column(),
+                    "Stored Aionrs model settings are invalid"
+                );
+                AgentError::internal("Stored model settings are invalid")
+            })?;
+        engine.set_tool_round_reasoning_models(tool_round_reasoning_models(settings));
+        Ok(())
+    }
+
+    fn log_engine_send_error(&self, error: &AionrsEngineError, data: &SendMessageData, elapsed_ms: TimestampMs) {
+        let summary = aionrs_runtime_error_summary(error);
+        error!(
+            conversation_id = %self.runtime.conversation_id(),
+            elapsed_ms,
+            error = %ErrorChain(error),
+            "Aionrs engine.run() failed, emitting Error"
+        );
+        error!(
+            target: "aionui_feedback_diagnostics",
+            diagnostic_event = "feedback.runtime.aionrs_error",
+            conversation_id = %self.runtime.conversation_id(),
+            msg_id = %data.msg_id,
+            turn_id = data.turn_id.as_deref().unwrap_or("none"),
+            elapsed_ms,
+            error_kind = summary.kind,
+            provider_error_class = summary.provider_error_class,
+            http_status = summary.http_status,
+            failure_count = summary.failure_count,
+            failure_limit = summary.failure_limit,
+            "feedback.runtime.aionrs_error"
+        );
     }
 
     fn request_stop(&self, reason: Option<AgentKillReason>, operation: &'static str) -> bool {
@@ -424,16 +519,27 @@ impl IAgentTask for AionrsAgentManager {
             .send(AgentStreamEvent::BackendTurnBound(turn_anchor.clone()));
 
         let mut engine = self.engine.lock().await;
-        engine.set_next_turn_id(Some(turn_anchor));
-
+        let mut engine_started = false;
         let result = tokio::select! {
-            res = engine.run_with_blocks(content_blocks, &data.msg_id) => Some(res),
+            res = async {
+                self.refresh_reasoning_policy(&mut engine)
+                    .await
+                    .map_err(AgentSendError::from_agent_error)?;
+                engine.set_next_turn_id(Some(turn_anchor));
+                engine_started = true;
+                engine.run_with_blocks(content_blocks, &data.msg_id).await.map_err(|error| {
+                    self.log_engine_send_error(&error, &data, now_ms() - started_at);
+                    aionrs_engine_error_to_send_error(&error)
+                })
+            } => Some(res),
             _ = self.cancel_notify.notified() => {
                 info!(
                     conversation_id = %self.runtime.conversation_id(),
                     "Aionrs engine.run() cancelled by stop signal"
                 );
-                engine.abort_current_turn("Tool execution canceled by user");
+                if engine_started {
+                    engine.abort_current_turn("Tool execution canceled by user");
+                }
                 None
             }
         };
@@ -451,29 +557,7 @@ impl IAgentTask for AionrsAgentManager {
                 self.runtime.emit_finish(None);
                 Ok(())
             }
-            Some(Err(e)) => {
-                let summary = aionrs_runtime_error_summary(&e);
-                error!(
-                    conversation_id = %self.runtime.conversation_id(),
-                    elapsed_ms,
-                    error = %ErrorChain(&e),
-                    "Aionrs engine.run() failed, emitting Error"
-                );
-                error!(
-                    target: "aionui_feedback_diagnostics",
-                    diagnostic_event = "feedback.runtime.aionrs_error",
-                    conversation_id = %self.runtime.conversation_id(),
-                    msg_id = %data.msg_id,
-                    turn_id = data.turn_id.as_deref().unwrap_or("none"),
-                    elapsed_ms,
-                    error_kind = summary.kind,
-                    provider_error_class = summary.provider_error_class,
-                    http_status = summary.http_status,
-                    failure_count = summary.failure_count,
-                    failure_limit = summary.failure_limit,
-                    "feedback.runtime.aionrs_error"
-                );
-                let send_error = aionrs_engine_error_to_send_error(&e);
+            Some(Err(send_error)) => {
                 self.runtime.emit_error_data(send_error.stream_error().clone());
                 Err(send_error)
             }

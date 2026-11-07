@@ -143,7 +143,8 @@ pub(super) async fn build(
         .to_owned();
 
     let provider = map_aionrs_provider(&row.platform, &model_id, row.model_protocols.as_deref())?;
-    let model_overrides = resolve_model_compat_overrides(&model_id, &row.model_settings)?;
+    let model_settings = parse_model_settings(&model_id, &row.model_settings)?;
+    let model_overrides = model_compat_overrides(model_settings.get(&model_id));
 
     let (base_url, mut compat_overrides) = resolve_aionrs_url_and_compat_with_mode(
         &row.platform,
@@ -236,7 +237,14 @@ pub(super) async fn build(
         }
     }
 
-    let agent = AionrsAgentManager::new(ctx.conversation_id, ctx.workspace, config, resume_session).await?;
+    let agent = AionrsAgentManager::new(ctx.conversation_id, ctx.workspace, config, resume_session)
+        .await?
+        .with_model_settings_source(
+            Arc::clone(&deps.provider_repo),
+            ctx.user_id,
+            model.provider_id,
+            model_settings,
+        );
     Ok(AgentInstance::Aionrs(Arc::new(agent)))
 }
 
@@ -498,14 +506,25 @@ pub(crate) fn resolve_model_compat_overrides(
     model_id: &str,
     model_settings_json: &str,
 ) -> Result<ModelCompatOverrides, AgentError> {
-    let settings = serde_json::from_str::<HashMap<String, ModelSettings>>(model_settings_json).map_err(|error| {
+    let settings = parse_model_settings(model_id, model_settings_json)?;
+    Ok(model_compat_overrides(settings.get(model_id)))
+}
+
+fn parse_model_settings(
+    model_id: &str,
+    model_settings_json: &str,
+) -> Result<HashMap<String, ModelSettings>, AgentError> {
+    serde_json::from_str(model_settings_json).map_err(|error| {
         AgentError::bad_request(format!("Invalid model settings config for model '{model_id}': {error}"))
-    })?;
-    let Some(settings) = settings.get(model_id) else {
-        return Ok(ModelCompatOverrides::default());
+    })
+}
+
+fn model_compat_overrides(settings: Option<&ModelSettings>) -> ModelCompatOverrides {
+    let Some(settings) = settings else {
+        return ModelCompatOverrides::default();
     };
 
-    Ok(ModelCompatOverrides {
+    ModelCompatOverrides {
         image_input: settings.image_input.map(|value| match value {
             ModelImageInputCapability::Supported => ImageInputCapability::Supported,
             ModelImageInputCapability::Unsupported => ImageInputCapability::Unsupported,
@@ -514,7 +533,7 @@ pub(crate) fn resolve_model_compat_overrides(
             ModelOpenAiApiMode::ChatCompletions => OpenAiApiMode::ChatCompletions,
             ModelOpenAiApiMode::Responses => OpenAiApiMode::Responses,
         }),
-    })
+    }
 }
 
 fn resolve_model_protocol(model_id: &str, model_protocols: Option<&str>) -> Result<String, AgentError> {

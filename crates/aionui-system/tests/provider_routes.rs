@@ -334,11 +334,14 @@ async fn create_provider_with_optional_fields() {
 async fn create_provider_persists_model_settings() {
     let (_app, db) = setup().await;
     let mut body = sample_create_body();
-    body["models"] = json!(["gpt-5.6-sol"]);
+    body["models"] = json!(["gpt-5.6-sol", "gpt-4o"]);
     body["model_settings"] = json!({
         "gpt-5.6-sol": {
             "image_input": "supported",
             "openai_api_mode": "responses"
+        },
+        "gpt-4o": {
+            "reasoning_tool_round_only": true
         }
     });
 
@@ -360,6 +363,15 @@ async fn create_provider_persists_model_settings() {
         list_json["data"][0]["model_settings"]["gpt-5.6-sol"]["openai_api_mode"],
         "responses"
     );
+    assert_eq!(
+        list_json["data"][0]["model_settings"]["gpt-4o"]["reasoning_tool_round_only"],
+        true
+    );
+    assert!(
+        list_json["data"][0]["model_settings"]["gpt-5.6-sol"]
+            .get("reasoning_tool_round_only")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -367,6 +379,17 @@ async fn create_provider_rejects_unknown_model_setting_value() {
     let (app, _db) = setup().await;
     let mut body = sample_create_body();
     body["model_settings"] = json!({"gpt-5.6-sol": {"image_input": "sometimes"}});
+
+    let resp = app.oneshot(json_request("POST", "/api/providers", body)).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn create_provider_rejects_non_boolean_reasoning_tool_round_only() {
+    let (app, _db) = setup().await;
+    let mut body = sample_create_body();
+    body["model_settings"] = json!({"gpt-4o": {"reasoning_tool_round_only": "true"}});
 
     let resp = app.oneshot(json_request("POST", "/api/providers", body)).await.unwrap();
 
@@ -494,7 +517,8 @@ async fn update_provider_replaces_model_settings() {
                 "model_settings": {
                     "gpt-4o": {
                         "image_input": "unsupported",
-                        "openai_api_mode": "chat_completions"
+                        "openai_api_mode": "chat_completions",
+                        "reasoning_tool_round_only": false
                     }
                 }
             }),
@@ -508,6 +532,10 @@ async fn update_provider_replaces_model_settings() {
     assert_eq!(
         json["data"]["model_settings"]["gpt-4o"]["openai_api_mode"],
         "chat_completions"
+    );
+    assert_eq!(
+        json["data"]["model_settings"]["gpt-4o"]["reasoning_tool_round_only"],
+        false
     );
 }
 
