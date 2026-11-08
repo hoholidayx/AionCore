@@ -12,7 +12,7 @@ pub const IMAGE_BACKEND_OVERRIDE_KEY: &str = "image_backend_id";
 
 pub struct AsyncImageBackend {
     pub id: String,
-    pub name: String,
+    pub selector: String,
     pub supports_edit: Option<bool>,
 }
 

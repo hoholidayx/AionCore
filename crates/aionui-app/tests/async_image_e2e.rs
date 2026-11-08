@@ -39,12 +39,20 @@ async fn model(State(state): State<Arc<Upstream>>, Json(body): Json<Value>) -> R
     let probe = messages
         .last()
         .is_some_and(|message| message["content"].to_string().contains("Check backend visibility."));
+    let explicit = messages
+        .last()
+        .is_some_and(|message| message["content"].to_string().contains("Use another-image."));
     let (call_id, arguments) = if edit {
         let result = messages.iter().rev().find(|message| message["role"] == "tool").unwrap();
         let receipt: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
         (
             "call_edit_mock",
             json!({"prompt": "Make the square darker", "references": [receipt["attachment_id"]]}),
+        )
+    } else if explicit {
+        (
+            "call_explicit_mock",
+            json!({"prompt": "Draw with the selected backend", "backend": "another-image"}),
         )
     } else {
         ("call_image_mock", json!({"prompt": "Draw a small square"}))
@@ -130,6 +138,14 @@ async fn post_json(app: &Router, route: &str, body: Value, auth: (&str, &str), e
     value["data"].clone()
 }
 
+fn image_backend_enum(request: &Value) -> Option<&Value> {
+    request["tools"]
+        .as_array()?
+        .iter()
+        .find(|tool| tool["function"]["name"] == "image_generate_async")?
+        .pointer("/function/parameters/properties/backend/enum")
+}
+
 #[tokio::test]
 async fn model_receives_a_receipt_and_delayed_image_stays_in_its_original_conversation() {
     let upstream = Arc::new(Upstream::default());
@@ -165,7 +181,7 @@ async fn model_receives_a_receipt_and_delayed_image_stays_in_its_original_conver
     let server = post_json(
         &app,
         "/api/mcp/servers",
-        json!({"name":"image-fixture", "purpose":"async_image",
+        json!({"name":"Image Fixture", "purpose":"async_image",
                "transport":{"type":"http", "url":format!("{base_url}/mcp")}}),
         auth,
         StatusCode::CREATED,
@@ -210,7 +226,7 @@ async fn model_receives_a_receipt_and_delayed_image_stays_in_its_original_conver
             "selected_mcp_server_ids":[server_id],
             "selected_session_mcp_servers":[{
                 "id":"inline-image-fixture",
-                "name":"image-fixture",
+                "name":"Image Fixture",
                 "transport":{"type":"http","url":"http://127.0.0.1:1/mcp"}
             }]
         }
@@ -256,6 +272,8 @@ async fn model_receives_a_receipt_and_delayed_image_stays_in_its_original_conver
     });
     let tools = model_requests[0]["tools"].to_string();
     assert!(tools.contains("image_generate_async"));
+    assert_eq!(image_backend_enum(&model_requests[0]), Some(&json!(["Image Fixture"])));
+    assert!(!tools.contains(server_id));
     assert!(tools.contains("unrelated"));
     assert!(!tools.contains("image_submit") && !tools.contains("image_status") && !tools.contains("image_result"));
     let result = model_requests[1]["messages"]
@@ -368,7 +386,7 @@ async fn model_receives_a_receipt_and_delayed_image_stays_in_its_original_conver
     let second = post_json(
         &app,
         "/api/mcp/servers",
-        json!({"name":"another-image-fixture", "purpose":"async_image",
+        json!({"name":"Another Image Fixture", "purpose":"async_image", "backend_alias":"another-image",
                "transport":{"type":"http", "url":format!("{base_url}/mcp")}}),
         auth,
         StatusCode::CREATED,
@@ -441,15 +459,16 @@ async fn model_receives_a_receipt_and_delayed_image_stays_in_its_original_conver
         .await
         .unwrap();
     assert_eq!(edit_backend, second_id);
-    assert!(
-        upstream
-            .model_requests
-            .lock()
-            .unwrap()
-            .iter()
-            .skip(2)
-            .any(|request| request["tools"].to_string().contains(second_id))
-    );
+    {
+        let requests = upstream.model_requests.lock().unwrap();
+        let edit_request = &requests[2];
+        let options = image_backend_enum(edit_request).unwrap().as_array().unwrap();
+        assert_eq!(options.len(), 2);
+        assert!(options.contains(&json!("Image Fixture")));
+        assert!(options.contains(&json!("another-image")));
+        let tools = edit_request["tools"].to_string();
+        assert!(!tools.contains(second_id) && !tools.contains(server_id));
+    }
     let cleared = save_backend(Value::Null).await.unwrap();
     assert_eq!(cleared.status(), StatusCode::OK);
     assert!(body_json(cleared).await["data"]["extra"]["image_backend_id"].is_null());
@@ -492,7 +511,7 @@ async fn model_receives_a_receipt_and_delayed_image_stays_in_its_original_conver
         "backend_unavailable"
     );
 
-    for (allowed, expected_backend) in [(json!([second_id]), Some(second_id)), (json!([]), None)] {
+    for (allowed, expected_backend) in [(json!([second_id]), Some(json!(["another-image"]))), (json!([]), None)] {
         assert_eq!(set_allowed(allowed).await.unwrap().status(), StatusCode::OK);
         let count = upstream.model_requests.lock().unwrap().len();
         post_json(
@@ -503,7 +522,7 @@ async fn model_receives_a_receipt_and_delayed_image_stays_in_its_original_conver
             StatusCode::ACCEPTED,
         )
         .await;
-        let tools = tokio::time::timeout(Duration::from_secs(12), async {
+        let request = tokio::time::timeout(Duration::from_secs(12), async {
             loop {
                 let response = app
                     .clone()
@@ -513,19 +532,48 @@ async fn model_receives_a_receipt_and_delayed_image_stays_in_its_original_conver
                 if body_json(response).await["data"]["status"] == "finished"
                     && let Some(request) = upstream.model_requests.lock().unwrap().get(count)
                 {
-                    break request["tools"].to_string();
+                    break request.clone();
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
         .await
         .expect("model received the scoped tool inventory");
+        let tools = request["tools"].to_string();
         assert_eq!(tools.contains("image_generate_async"), expected_backend.is_some());
-        assert!(!tools.contains(server_id));
-        if let Some(id) = expected_backend {
-            assert!(tools.contains(id));
-        }
+        assert!(!tools.contains(server_id) && !tools.contains(second_id) && !tools.contains("Image Fixture"));
+        assert_eq!(image_backend_enum(&request), expected_backend.as_ref());
     }
+
+    assert_eq!(
+        set_allowed(json!([server_id, second_id])).await.unwrap().status(),
+        StatusCode::OK
+    );
+    post_json(
+        &app,
+        &format!("/api/conversations/{switched}/messages"),
+        json!({"content":"Use another-image."}),
+        auth,
+        StatusCode::ACCEPTED,
+    )
+    .await;
+    let explicit_backend = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            if let Some(server) =
+                sqlx::query_scalar::<_, String>("SELECT server_id FROM async_image_jobs WHERE tool_call_id = ?")
+                    .bind("call_explicit_mock")
+                    .fetch_optional(services.database.pool())
+                    .await
+                    .unwrap()
+            {
+                break server;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the named backend overrides the saved ID");
+    assert_eq!(explicit_backend, second_id);
 
     shutdown.send(true).unwrap();
     worker.await.unwrap();

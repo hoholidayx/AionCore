@@ -116,6 +116,19 @@ impl AsyncImageTool {
         }
         let turn = self.turn.lock().map_err(|_| invalid_ref())?;
         let turn = turn.as_ref().ok_or_else(invalid_ref)?;
+        let requested_server_id = args
+            .backend
+            .map(|selector| {
+                let mut matches = turn.backends.iter().filter(|entry| entry.selector == selector);
+                match (matches.next(), matches.next()) {
+                    (Some(entry), None) => Ok(entry.id.clone()),
+                    _ => Err(AsyncImageError::new(
+                        "backend_unavailable",
+                        "The selected image backend is unavailable",
+                    )),
+                }
+            })
+            .transpose()?;
         let references = args
             .references
             .iter()
@@ -140,7 +153,7 @@ impl AsyncImageTool {
             turn_id: turn.id.clone(),
             tool_call_id: call_id.to_owned(),
             prompt: args.prompt,
-            requested_server_id: args.backend,
+            requested_server_id,
             size: args.size,
             preset: args.preset,
             references,
@@ -159,28 +172,7 @@ impl Tool for AsyncImageTool {
     }
 
     fn input_schema(&self) -> JsonSchema {
-        let endpoints = self
-            .turn
-            .lock()
-            .ok()
-            .and_then(|turn| {
-                turn.as_ref().map(|turn| {
-                    turn.backends
-                        .iter()
-                        .map(|entry| {
-                            let editing = match entry.supports_edit {
-                                Some(true) => " (supports editing)",
-                                Some(false) => " (generation only)",
-                                None => "",
-                            };
-                            format!("{}: {}{editing}", entry.id, entry.name)
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-            })
-            .unwrap_or_default();
-        json!({
+        let mut schema = json!({
             "type": "object",
             "required": ["prompt"],
             "additionalProperties": false,
@@ -189,10 +181,27 @@ impl Tool for AsyncImageTool {
                 "size": {"type": "string", "description": "Optional output size or aspect ratio."},
                 "preset": {"type": "string", "enum": ["fast", "quality"], "description": "Optional speed or quality preference."},
                 "references": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_IMAGE_REFERENCES,
-                               "description": "Ordered attachment references from this turn or a previous image receipt."},
-                "backend": {"type": "string", "description": format!("Image backend ID. Set only when the user explicitly names a backend for this task; otherwise omit to use the conversation or account selection. Available backends: {endpoints}")}
+                               "description": "Ordered attachment references from this turn or a previous image receipt."}
             }
-        })
+        });
+        if let Ok(turn) = self.turn.lock()
+            && let Some(turn) = turn.as_ref().filter(|turn| !turn.backends.is_empty())
+        {
+            let selectors = turn.backends.iter().map(|entry| &entry.selector).collect::<Vec<_>>();
+            let generation_only = turn
+                .backends
+                .iter()
+                .filter(|entry| entry.supports_edit == Some(false))
+                .map(|entry| entry.selector.as_str())
+                .collect::<Vec<_>>();
+            let mut description = "Set only when the user explicitly names a backend for this task; otherwise omit to use the conversation or account default.".to_owned();
+            if !generation_only.is_empty() {
+                description.push_str(" Generation only: ");
+                description.push_str(&generation_only.join(", "));
+            }
+            schema["properties"]["backend"] = json!({"type": "string", "enum": selectors, "description": description});
+        }
+        schema
     }
 
     fn is_concurrency_safe(&self, _input: &Value) -> bool {

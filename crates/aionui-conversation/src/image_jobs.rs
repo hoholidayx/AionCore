@@ -336,9 +336,10 @@ impl AsyncImageQueue for AsyncImageJobs {
                             .get("properties")
                             .map(|properties| properties.get("images").is_some())
                     });
+                let selector = row.image_backend_selector().to_owned();
                 AsyncImageBackend {
                     id: row.id,
-                    name: row.name,
+                    selector,
                     supports_edit,
                 }
             })
