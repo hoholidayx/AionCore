@@ -14,16 +14,21 @@ aionui-ai-agent.workspace = true
 aionui-extension.workspace = true
 aionui-mcp.workspace = true
 aionui-runtime.workspace = true
+aion-config.workspace = true
+aion-mcp.workspace = true
 axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
+crc32fast.workspace = true
 regex.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

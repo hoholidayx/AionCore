@@ -10,7 +10,9 @@ use aionui_ai_agent::{
 };
 use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_encryption_secret, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
+use aionui_conversation::image_jobs::AsyncImageJobs;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
+use aionui_db::SqliteAsyncImageJobRepository;
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
     IProjectStore, ISkillRepository, IUserOrderStore, IUserRepository, SqliteAcpSessionRepository,
@@ -41,6 +43,7 @@ pub struct AppServices {
     pub runtime_token_service: Arc<RuntimeTokenService>,
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     pub conversation_service: ConversationService,
+    pub async_image_jobs: Arc<AsyncImageJobs>,
     /// Cross-session messaging. The queue, the rate limiter and the notify
     /// handle are shared by the send path, the drainer, and the cancel hook, so
     /// they are built once here (`AppServices` is the sole construction centre).
@@ -256,6 +259,11 @@ impl AppServices {
         // so the agent gets the operator's tools (ELECTRON-1JG fix).
         let mcp_server_repo: Arc<dyn IMcpServerRepository> =
             Arc::new(SqliteMcpServerRepository::new(database.pool().clone()));
+        let async_image_jobs = Arc::new(AsyncImageJobs::new(
+            Arc::new(SqliteAsyncImageJobRepository::new(database.pool().clone())),
+            mcp_server_repo.clone(),
+            event_bus.clone(),
+        ));
 
         let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
             Arc::new(SqliteAgentMetadataRepository::new(database.pool().clone()));
@@ -369,6 +377,7 @@ impl AppServices {
             broadcaster: event_bus.clone(),
             backend_binary_path: backend_binary_path.clone(),
             mcp_server_repo: Some(mcp_server_repo),
+            async_image_queue: Some(async_image_jobs.clone()),
             session_spawner,
             // agy cannot prompt for tool permission in headless mode, so AionUi
             // registers itself as its PreToolUse hook; the hook process calls
@@ -438,6 +447,7 @@ impl AppServices {
             runtime_token_service,
             conversation_runtime_state,
             conversation_service,
+            async_image_jobs,
             session_message_service,
             session_message_queue,
             session_message_notify,

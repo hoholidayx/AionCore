@@ -5,12 +5,12 @@ use std::time::Instant;
 
 use axum::Json;
 use axum::extract::DefaultBodyLimit;
-use axum::extract::Request;
+use axum::extract::{Path, Request};
 use axum::http::{HeaderName, Method, StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{Router, middleware};
+use axum::{Extension, Router, middleware};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use aionui_ai_agent::{
@@ -20,13 +20,14 @@ use aionui_api_types::{ErrorResponse, WebSocketMessage};
 use aionui_assets::{AssetRouterState, asset_routes};
 use aionui_assistant::assistant_routes;
 use aionui_auth::{
-    AuthIdentityMode, AuthRouterState, AuthState, IRuntimeTokenVerifier, RefreshCoalescer,
+    AuthIdentityMode, AuthRouterState, AuthState, CurrentUser, IRuntimeTokenVerifier, RefreshCoalescer,
     SystemDefaultFilesystemAdopter, auth_middleware, auth_routes, csrf_middleware, security_headers_middleware,
 };
 use aionui_channel::channel_routes;
 #[cfg(feature = "weixin")]
 use aionui_channel::weixin_login_route;
 use aionui_common::ApiErrorLogContext;
+use aionui_conversation::image_jobs::AsyncImageJobs;
 use aionui_conversation::{
     ConversationRuntimeRouterState, conversation_ops_routes, conversation_routes, conversation_runtime_routes,
 };
@@ -57,6 +58,31 @@ use super::trace::with_access_log;
 pub struct RouterRuntime {
     pub client_pref_service: ClientPrefService,
     pub team_service: Arc<TeamSessionService>,
+}
+
+#[allow(clippy::disallowed_types)]
+async fn read_async_image(
+    Extension(user): Extension<CurrentUser>,
+    Extension(jobs): Extension<Arc<AsyncImageJobs>>,
+    Path((conversation_id, attachment_id)): Path<(String, String)>,
+) -> Result<Response, aionui_common::ApiError> {
+    use aionui_common::ApiError;
+
+    let attachment = jobs
+        .read_image(&user.id, &conversation_id, &attachment_id)
+        .await
+        .map_err(|error| match error.code {
+            "attachment_not_found" | "conversation_not_found" => ApiError::NotFound(error.message),
+            _ => ApiError::Internal(error.message),
+        })?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "private, no-store"),
+        ],
+        attachment.png,
+    )
+        .into_response())
 }
 
 async fn forward_event_bus_to_websocket(
@@ -282,7 +308,22 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
 
     // Conversation routes protected by auth middleware
     let conversation_authenticated = conversation_routes(states.conversation.clone())
-        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware))
+        .merge(
+            Router::new()
+                .route(
+                    "/api/conversations/{conversation_id}/async-images/{attachment_id}",
+                    get(read_async_image),
+                )
+                .layer(Extension(services.async_image_jobs.clone()))
+                .route_layer(from_fn_with_state(
+                    AuthState {
+                        runtime_token_verifier: None,
+                        ..auth_mw_state.clone()
+                    },
+                    auth_middleware,
+                )),
+        );
 
     let conversation_ops_authenticated = conversation_ops_routes(states.conversation)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));

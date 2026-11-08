@@ -172,6 +172,8 @@ mod tests {
 
     fn make_row(name: &str, transport_type: &str, transport_config: &str) -> McpServerRow {
         McpServerRow {
+            purpose: "general".to_owned(),
+            is_default: false,
             id: format!("mcp_{name}"),
             user_id: "user-1".into(),
             name: name.to_owned(),

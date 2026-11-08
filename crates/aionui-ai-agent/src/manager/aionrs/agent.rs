@@ -39,6 +39,7 @@ use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
 use crate::types::{AionrsResolvedConfig, SendMessageData};
 
+use super::async_image_tool::AsyncImageTool;
 use super::content::build_content_blocks;
 use super::error::{aionrs_engine_error_to_send_error, aionrs_runtime_error_summary};
 
@@ -109,6 +110,7 @@ pub struct AionrsAgentManager {
     runtime: AgentRuntime,
     engine: Mutex<AgentEngine>,
     model_settings_source: Option<ModelSettingsSource>,
+    async_image: Option<AsyncImageTool>,
     /// Static slash command metadata captured at bootstrap so UI lookups do
     /// not wait behind an active `engine.run()` turn.
     slash_commands: Vec<SlashCommandItem>,
@@ -159,8 +161,31 @@ impl AionrsAgentManager {
         config_extra: AionrsResolvedConfig,
         resume_session: Option<Session>,
     ) -> Result<Self, AgentError> {
+        Self::new_with_async_image(
+            conversation_id,
+            workspace,
+            config_extra,
+            resume_session,
+            None,
+            HashMap::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn new_with_async_image(
+        conversation_id: String,
+        workspace: String,
+        config_extra: AionrsResolvedConfig,
+        resume_session: Option<Session>,
+        async_image: Option<AsyncImageTool>,
+        image_exclusions: HashMap<String, HashSet<String>>,
+    ) -> Result<Self, AgentError> {
         let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128);
-        let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(runtime.event_sender()));
+        let mut output = BackendOutputSink::new(runtime.event_sender());
+        if async_image.is_some() {
+            output = output.with_host_managed_tool(crate::async_image::TOOL_NAME);
+        }
+        let sink: Arc<dyn OutputSink> = Arc::new(output);
         let runtime_env = config_extra.runtime_env.clone();
         let image_input_override = config_extra.compat_overrides.image_input;
         let image_input_capability = image_input_override.unwrap_or_else(|| {
@@ -235,7 +260,12 @@ impl AionrsAgentManager {
         let is_resume = resume_session.is_some();
         let provider_label = config.provider_label.clone();
 
-        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink).runtime_env(runtime_env);
+        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink)
+            .runtime_env(runtime_env)
+            .exclude_mcp_tools(image_exclusions);
+        if let Some(tool) = &async_image {
+            bootstrap = bootstrap.host_tool(Box::new(tool.clone()));
+        }
         if let Some(has_instructions) = config_extra.custom_prompt_has_instructions {
             bootstrap = bootstrap.custom_prompt_has_instructions(has_instructions);
         }
@@ -297,6 +327,7 @@ impl AionrsAgentManager {
             runtime,
             engine: Mutex::new(engine),
             model_settings_source: None,
+            async_image,
             slash_commands,
             mcp_managers: result.mcp_managers,
             approval_manager,
@@ -498,7 +529,7 @@ impl IAgentTask for AionrsAgentManager {
             attachment_count = data.files.len(),
             "Building structured Aionrs content blocks"
         );
-        let content_blocks = build_content_blocks(&data.content, &data.files);
+        let mut content_blocks = build_content_blocks(&data.content, &data.files);
         debug!(
             block_count = content_blocks.len(),
             "Built structured Aionrs content blocks"
@@ -519,6 +550,10 @@ impl IAgentTask for AionrsAgentManager {
             .send(AgentStreamEvent::BackendTurnBound(turn_anchor.clone()));
 
         let mut engine = self.engine.lock().await;
+        let _attachment_turn = self
+            .async_image
+            .as_ref()
+            .map(|tool| tool.begin_turn(&turn_anchor, &data.files, &mut content_blocks));
         let mut engine_started = false;
         let result = tokio::select! {
             res = async {

@@ -110,6 +110,8 @@ mod aionui {
 
     fn make_row(name: &str, t_type: &str, t_config: &str) -> McpServerRow {
         McpServerRow {
+            purpose: "general".to_owned(),
+            is_default: false,
             user_id: TEST_USER_ID.to_string(),
             id: format!("mcp_{name}"),
             name: name.to_owned(),

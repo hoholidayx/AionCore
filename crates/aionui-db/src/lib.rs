@@ -33,6 +33,7 @@ pub use models::{
     UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams, UserOrderRow,
     UserStatus, UserType,
 };
+pub use repository::async_image_job::AsyncImageJobUpdate;
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
     ConversationFilters, ConversationRowUpdate, MentionableCandidatesParams, MessagePageCursor, MessagePageDirection,
@@ -64,6 +65,7 @@ pub use repository::{
     SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSidebarStore,
     SqliteSkillRepository, SqliteTeamRepository, SqliteUserOrderStore, SqliteUserRepository,
 };
+pub use repository::{IAsyncImageJobRepository, SqliteAsyncImageJobRepository};
 
 // Re-export sqlx pool type for downstream crates
 pub use sqlx::SqlitePool;

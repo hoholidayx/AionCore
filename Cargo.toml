@@ -66,6 +66,7 @@ aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-app = { path = "crates/aionui-app" }
 
 aion-agent = { path = "../aionrs/crates/aion-agent" }
+aion-tools = { path = "../aionrs/crates/aion-tools" }
 aion-providers = { path = "../aionrs/crates/aion-providers" }
 aion-types = { path = "../aionrs/crates/aion-types" }
 aion-protocol = { path = "../aionrs/crates/aion-protocol" }
@@ -199,6 +200,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 # Encoding
 base64 = "0.22"
+crc32fast = "1"
 
 # HTTP body utilities (testing)
 http-body-util = "0.1"

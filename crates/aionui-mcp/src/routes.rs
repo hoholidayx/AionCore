@@ -8,9 +8,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 
 use aionui_api_types::{
-    ApiResponse, BatchImportMcpServersRequest, CreateMcpServerRequest, DetectedMcpServerResponse, ErrorResponse,
-    McpConnectionTestErrorCode, McpServerResponse, OAuthCheckStatusRequest, OAuthLoginRequest, OAuthLoginResponse,
-    OAuthLogoutRequest, OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
+    ASYNC_IMAGE_TOOLS, ApiResponse, BatchImportMcpServersRequest, CreateMcpServerRequest, DetectedMcpServerResponse,
+    ErrorResponse, McpConnectionTestErrorCode, McpServerPurpose, McpServerResponse, OAuthCheckStatusRequest,
+    OAuthLoginRequest, OAuthLoginResponse, OAuthLogoutRequest, OAuthStatusResponse, TestMcpConnectionRequest,
+    UpdateMcpServerRequest, async_image_schema_matches,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -199,8 +200,13 @@ async fn test_connection(
     body: Result<Json<TestMcpConnectionRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    let purpose = match (req.purpose, req.id.as_deref()) {
+        (Some(purpose), _) => purpose,
+        (None, Some(id)) => state.config_service.get_server(&user.id, id).await?.purpose,
+        (None, None) => McpServerPurpose::General,
+    };
     let transport = McpServerTransport::from(req.transport);
-    let result = state
+    let mut result = state
         .connection_test_service
         .test_connection_with_runtime_scope(
             &req.name,
@@ -209,6 +215,23 @@ async fn test_connection(
             req.runtime_scope_id.as_deref().or(req.id.as_deref()),
         )
         .await;
+    if purpose == McpServerPurpose::AsyncImage
+        && result.success
+        && (transport.transport_type() != "http"
+            || !ASYNC_IMAGE_TOOLS.iter().all(|(name, _)| {
+                result.tools.iter().flatten().any(|tool| {
+                    tool.name == *name
+                        && tool
+                            .input_schema
+                            .as_ref()
+                            .is_some_and(|schema| async_image_schema_matches(name, schema))
+                })
+            }))
+    {
+        result.success = false;
+        result.error = Some("The server does not support the image_jobs_v1 contract".into());
+        result.code = Some(McpConnectionTestErrorCode::ProtocolError);
+    }
     if let Some(server_id) = req.id.as_deref() {
         state
             .config_service

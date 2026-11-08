@@ -193,6 +193,8 @@ pub struct McpServer {
     pub last_connected: Option<TimestampMs>,
     pub original_json: Option<String>,
     pub builtin: bool,
+    pub purpose: aionui_api_types::McpServerPurpose,
+    pub is_default: bool,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
@@ -223,6 +225,12 @@ impl McpServer {
             last_connected: row.last_connected,
             original_json: row.original_json,
             builtin: row.builtin,
+            purpose: if row.purpose == "async_image" {
+                aionui_api_types::McpServerPurpose::AsyncImage
+            } else {
+                aionui_api_types::McpServerPurpose::General
+            },
+            is_default: row.is_default,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
@@ -247,6 +255,8 @@ impl McpServer {
             last_connected: self.last_connected,
             original_json: self.original_json,
             builtin: self.builtin,
+            purpose: self.purpose,
+            is_default: self.is_default,
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -441,6 +451,8 @@ mod tests {
 
     fn make_test_row(transport_type: &str, transport_config: &str, tools: Option<&str>, status: &str) -> McpServerRow {
         McpServerRow {
+            purpose: "general".to_owned(),
+            is_default: false,
             id: "mcp_123".into(),
             user_id: "user-1".into(),
             name: "test-server".into(),
@@ -540,6 +552,8 @@ mod tests {
     #[test]
     fn into_response_with_tools() {
         let server = McpServer {
+            purpose: Default::default(),
+            is_default: false,
             id: "mcp_1".into(),
             name: "test".into(),
             description: None,
@@ -570,6 +584,8 @@ mod tests {
     #[test]
     fn into_response_empty_tools_is_none() {
         let server = McpServer {
+            purpose: Default::default(),
+            is_default: false,
             id: "mcp_2".into(),
             name: "test".into(),
             description: Some("desc".into()),

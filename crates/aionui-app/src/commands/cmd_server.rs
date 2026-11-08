@@ -49,6 +49,7 @@ const WORKER_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_KEEP_AWAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_ASYNC_IMAGE_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 const SHUTDOWN_DB_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -62,6 +63,7 @@ const _: () = assert!(
             + SHUTDOWN_KEEP_AWAKE_TIMEOUT.as_secs()
             + SHUTDOWN_DRAIN_TIMEOUT.as_secs()
             + SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT.as_secs()
+            + SHUTDOWN_ASYNC_IMAGE_JOIN_TIMEOUT.as_secs()
             + SHUTDOWN_DB_CLOSE_TIMEOUT.as_secs()
 );
 
@@ -323,6 +325,11 @@ pub(crate) async fn run_server(
     // watch channel propagates graceful-shutdown so the scanner exits on
     // SIGINT/SIGTERM.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let async_image_shutdown = shutdown_rx.clone();
+    let async_image_jobs = services.async_image_jobs.clone();
+    let mut async_image_handle = tokio::spawn(async move {
+        async_image_jobs.run(async_image_shutdown).await;
+    });
     let (shutdown_error_tx, shutdown_error_rx) = tokio::sync::oneshot::channel::<BootstrapError>();
     let idle_cleanup_coordinator: Arc<dyn aionui_ai_agent::IdleCleanupCoordinator> =
         Arc::new(TeamIdleCleanupCoordinator::new(
@@ -477,6 +484,15 @@ pub(crate) async fn run_server(
             SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT,
             "idle scanner join timed out; abandoning scanner task",
         ),
+    }
+
+    match tokio::time::timeout(SHUTDOWN_ASYNC_IMAGE_JOIN_TIMEOUT, &mut async_image_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(%error, stage = "shutdown.async_image", "asynchronous image worker join failed"),
+        Err(_) => {
+            async_image_handle.abort();
+            let _ = async_image_handle.await;
+        }
     }
 
     // `sqlx::Pool::close()` waits for all checked-out connections to be

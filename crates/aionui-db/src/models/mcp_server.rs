@@ -31,6 +31,8 @@ pub struct McpServerRow {
     pub original_json: Option<String>,
     /// Whether this is a built-in server (hidden from edit/delete in UI).
     pub builtin: bool,
+    pub purpose: String,
+    pub is_default: bool,
     /// Soft-delete timestamp. `NULL` means active.
     pub deleted_at: Option<TimestampMs>,
     pub created_at: TimestampMs,

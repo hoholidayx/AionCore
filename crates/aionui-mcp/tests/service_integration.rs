@@ -28,6 +28,8 @@ async fn make_service_with_other_user() -> (McpConfigService, String) {
 
 fn stdio_req(name: &str) -> CreateMcpServerRequest {
     CreateMcpServerRequest {
+        purpose: None,
+        is_default: None,
         name: name.to_owned(),
         description: Some("test".to_owned()),
         transport: McpTransport::Stdio {
@@ -42,6 +44,8 @@ fn stdio_req(name: &str) -> CreateMcpServerRequest {
 
 fn http_req(name: &str) -> CreateMcpServerRequest {
     CreateMcpServerRequest {
+        purpose: None,
+        is_default: None,
         name: name.to_owned(),
         description: None,
         transport: McpTransport::Http {
@@ -55,6 +59,8 @@ fn http_req(name: &str) -> CreateMcpServerRequest {
 
 fn stdio_import_req(name: &str) -> ImportMcpServerRequest {
     ImportMcpServerRequest {
+        purpose: None,
+        is_default: None,
         name: name.to_owned(),
         description: Some("test".to_owned()),
         transport: McpTransport::Stdio {
@@ -70,6 +76,8 @@ fn stdio_import_req(name: &str) -> ImportMcpServerRequest {
 
 fn http_import_req(name: &str) -> ImportMcpServerRequest {
     ImportMcpServerRequest {
+        purpose: None,
+        is_default: None,
         name: name.to_owned(),
         description: None,
         transport: McpTransport::Http {
@@ -171,6 +179,8 @@ async fn servers_are_scoped_by_current_user() {
             TEST_USER_ID,
             &other_server.id,
             UpdateMcpServerRequest {
+                purpose: None,
+                is_default: None,
                 name: None,
                 description: Some(Some("forged".into())),
                 transport: None,
@@ -208,6 +218,8 @@ async fn edit_name_is_rejected() {
             TEST_USER_ID,
             &created.id,
             UpdateMcpServerRequest {
+                purpose: None,
+                is_default: None,
                 name: Some("new".into()),
                 description: None,
                 transport: None,
@@ -230,6 +242,8 @@ async fn edit_transport() {
             TEST_USER_ID,
             &created.id,
             UpdateMcpServerRequest {
+                purpose: None,
+                is_default: None,
                 name: None,
                 description: None,
                 transport: Some(McpTransport::Sse {
@@ -259,6 +273,8 @@ async fn edit_clears_description() {
             TEST_USER_ID,
             &created.id,
             UpdateMcpServerRequest {
+                purpose: None,
+                is_default: None,
                 name: None,
                 description: Some(None),
                 transport: None,
@@ -279,6 +295,8 @@ async fn edit_not_found() {
             TEST_USER_ID,
             "nonexistent",
             UpdateMcpServerRequest {
+                purpose: None,
+                is_default: None,
                 name: Some("x".into()),
                 description: None,
                 transport: None,
@@ -302,6 +320,8 @@ async fn edit_name_conflict() {
             TEST_USER_ID,
             &b.id,
             UpdateMcpServerRequest {
+                purpose: None,
+                is_default: None,
                 name: Some("a".into()),
                 description: None,
                 transport: None,

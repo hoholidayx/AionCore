@@ -83,6 +83,8 @@ fn detected_to_response(detected: DetectedServer) -> DetectedMcpServerEntry {
 
     DetectedMcpServerEntry {
         server: aionui_api_types::McpServerResponse {
+            purpose: Default::default(),
+            is_default: false,
             id: format!("detected_{}", detected.name),
             name: detected.name,
             description: None,

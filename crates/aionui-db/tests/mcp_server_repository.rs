@@ -20,6 +20,8 @@ async fn repo() -> (Arc<dyn IMcpServerRepository>, aionui_db::Database) {
 
 fn stdio_params() -> CreateMcpServerParams<'static> {
     CreateMcpServerParams {
+        purpose: None,
+        is_default: None,
         user_id: USER_ID,
         name: "test-mcp",
         description: Some("A test MCP server"),
@@ -34,6 +36,8 @@ fn stdio_params() -> CreateMcpServerParams<'static> {
 
 fn http_params() -> CreateMcpServerParams<'static> {
     CreateMcpServerParams {
+        purpose: None,
+        is_default: None,
         user_id: USER_ID,
         name: "http-mcp",
         description: None,
@@ -48,6 +52,8 @@ fn http_params() -> CreateMcpServerParams<'static> {
 
 fn sse_params() -> CreateMcpServerParams<'static> {
     CreateMcpServerParams {
+        purpose: None,
+        is_default: None,
         user_id: USER_ID,
         name: "sse-mcp",
         description: Some("SSE transport server"),

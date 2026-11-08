@@ -4958,6 +4958,8 @@ mod build_mapping_tests {
 
     fn direct_mcp_row(id: &str, name: &str) -> aionui_db::models::McpServerRow {
         aionui_db::models::McpServerRow {
+            purpose: "general".to_owned(),
+            is_default: false,
             id: id.into(),
             user_id: "user-1".into(),
             name: name.into(),

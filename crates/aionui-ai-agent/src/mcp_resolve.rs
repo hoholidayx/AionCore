@@ -60,7 +60,7 @@ pub async fn resolve_session_mcp_servers(
         // `aionui-team` is a reserved wire-level name: the team coordination MCP
         // must win, so a user row that collides with it is skipped (never
         // injected), regardless of selection state.
-        if !selected || row.builtin || row.name == TEAM_MCP_SERVER_NAME {
+        if !selected || row.builtin || row.name == TEAM_MCP_SERVER_NAME || row.purpose == "async_image" {
             continue;
         }
         match row_to_session_mcp_server(&row).await {
@@ -262,6 +262,8 @@ mod tests {
 
     fn make_row(name: &str, enabled: bool) -> McpServerRow {
         McpServerRow {
+            purpose: "general".to_owned(),
+            is_default: false,
             id: format!("mcp_{name}"),
             user_id: TEST_USER_ID.to_owned(),
             name: name.to_owned(),
@@ -302,6 +304,8 @@ mod tests {
                 make_row("docs", true),
                 make_row("off", false),
                 McpServerRow {
+                    purpose: "general".to_owned(),
+                    is_default: false,
                     id: "mcp_builtin".into(),
                     user_id: TEST_USER_ID.to_owned(),
                     name: "chrome-devtools".into(),

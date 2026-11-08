@@ -90,6 +90,8 @@ pub struct CreateMcpServerParams<'a> {
     pub tools: Option<&'a str>,
     pub original_json: Option<&'a str>,
     pub builtin: bool,
+    pub purpose: Option<&'a str>,
+    pub is_default: Option<bool>,
 }
 
 /// Parameters for updating an existing MCP server.
@@ -107,5 +109,7 @@ pub struct UpdateMcpServerParams<'a> {
     pub tools: Option<Option<&'a str>>,
     pub original_json: Option<Option<&'a str>>,
     pub builtin: Option<bool>,
+    pub purpose: Option<&'a str>,
+    pub is_default: Option<bool>,
     pub deleted_at: Option<Option<aionui_common::TimestampMs>>,
 }

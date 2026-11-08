@@ -49,13 +49,55 @@ pub struct McpToolResponse {
     pub input_schema: Option<serde_json::Value>,
 }
 
+/// Tool names and mandatory string arguments of the image_jobs_v1 profile.
+pub const ASYNC_IMAGE_TOOLS: [(&str, &[&str]); 3] = [
+    ("image_submit", &["request_id", "prompt"]),
+    ("image_status", &["task_id"]),
+    ("image_result", &["task_id"]),
+];
+
+pub fn async_image_schema_matches(name: &str, schema: &serde_json::Value) -> bool {
+    let Some((_, fields)) = ASYNC_IMAGE_TOOLS.iter().find(|(tool, _)| *tool == name) else {
+        return false;
+    };
+    schema["type"].as_str() == Some("object")
+        && fields.iter().all(|field| {
+            schema["properties"][field]["type"].as_str() == Some("string")
+                && schema["required"]
+                    .as_array()
+                    .is_some_and(|required| required.iter().any(|value| value.as_str() == Some(*field)))
+        })
+}
+
 // ---------------------------------------------------------------------------
 // C. Server CRUD — Request DTOs
 // ---------------------------------------------------------------------------
 
+/// How the host should expose the server's tools to a session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerPurpose {
+    #[default]
+    General,
+    AsyncImage,
+}
+
+impl McpServerPurpose {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::AsyncImage => "async_image",
+        }
+    }
+}
+
 /// Request body for `POST /api/mcp/servers` — create (or upsert by name).
 #[derive(Debug, Deserialize)]
 pub struct CreateMcpServerRequest {
+    #[serde(default)]
+    pub purpose: Option<McpServerPurpose>,
+    #[serde(default)]
+    pub is_default: Option<bool>,
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
@@ -73,6 +115,10 @@ pub struct CreateMcpServerRequest {
 /// enabled flag in a follow-up toggle request.
 #[derive(Debug, Deserialize)]
 pub struct ImportMcpServerRequest {
+    #[serde(default)]
+    pub purpose: Option<McpServerPurpose>,
+    #[serde(default)]
+    pub is_default: Option<bool>,
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
@@ -88,6 +134,10 @@ pub struct ImportMcpServerRequest {
 /// Request body for `PUT /api/mcp/servers/:id` — partial update.
 #[derive(Debug, Deserialize)]
 pub struct UpdateMcpServerRequest {
+    #[serde(default)]
+    pub purpose: Option<McpServerPurpose>,
+    #[serde(default)]
+    pub is_default: Option<bool>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
@@ -113,6 +163,10 @@ pub struct BatchImportMcpServersRequest {
 /// Full MCP server configuration response.
 #[derive(Debug, Clone, Serialize)]
 pub struct McpServerResponse {
+    #[serde(default)]
+    pub purpose: McpServerPurpose,
+    #[serde(default)]
+    pub is_default: bool,
     pub id: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,6 +209,8 @@ pub struct DetectedMcpServerResponse {
 /// Request body for `POST /api/mcp/test-connection`.
 #[derive(Debug, Deserialize)]
 pub struct TestMcpConnectionRequest {
+    #[serde(default)]
+    pub purpose: Option<McpServerPurpose>,
     #[serde(default)]
     pub id: Option<String>,
     pub name: String,
@@ -419,6 +475,8 @@ mod tests {
     #[test]
     fn test_server_response_serialization() {
         let resp = McpServerResponse {
+            purpose: Default::default(),
+            is_default: false,
             id: "mcp_123".into(),
             name: "test".into(),
             description: None,
@@ -586,6 +644,8 @@ mod tests {
     fn test_detected_server_entry() {
         let entry = DetectedMcpServerEntry {
             server: McpServerResponse {
+                purpose: Default::default(),
+                is_default: false,
                 id: "detected_test".into(),
                 name: "test".into(),
                 description: None,

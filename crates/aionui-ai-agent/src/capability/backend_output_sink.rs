@@ -8,11 +8,20 @@ use crate::protocol::events::{
 
 pub struct BackendOutputSink {
     event_tx: broadcast::Sender<AgentStreamEvent>,
+    host_managed_tool: Option<&'static str>,
 }
 
 impl BackendOutputSink {
     pub fn new(event_tx: broadcast::Sender<AgentStreamEvent>) -> Self {
-        Self { event_tx }
+        Self {
+            event_tx,
+            host_managed_tool: None,
+        }
+    }
+
+    pub(crate) fn with_host_managed_tool(mut self, name: &'static str) -> Self {
+        self.host_managed_tool = Some(name);
+        self
     }
 
     fn internal_call_id(tool_use_id: &str) -> Option<String> {
@@ -42,6 +51,9 @@ impl OutputSink for BackendOutputSink {
     }
 
     fn emit_tool_call(&self, tool_use_id: &str, name: &str, input: &str) {
+        if self.host_managed_tool == Some(name) {
+            return;
+        }
         let Some(call_id) = Self::internal_call_id(tool_use_id) else {
             tracing::error!(tool = name, "Cannot emit tool_call with empty tool_use_id");
             return;
@@ -81,6 +93,9 @@ impl OutputSink for BackendOutputSink {
     }
 
     fn emit_tool_result(&self, tool_use_id: &str, name: &str, is_error: bool, content: &str) {
+        if self.host_managed_tool == Some(name) && !is_error {
+            return;
+        }
         let Some(call_id) = Self::internal_call_id(tool_use_id) else {
             tracing::error!(tool = name, "Cannot emit tool_result with empty tool_use_id");
             return;

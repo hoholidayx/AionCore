@@ -7,8 +7,8 @@ use aion_config::compat::OpenAiApiMode;
 use aion_config::config::{McpServerConfig, TransportType};
 use aion_types::message::ImageInputCapability;
 use aionui_api_types::{
-    AionrsBuildExtra, ForkSpec, ModelImageInputCapability, ModelOpenAiApiMode, ModelSettings, SessionMcpServer,
-    SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
+    ASYNC_IMAGE_TOOLS, AionrsBuildExtra, ForkSpec, ModelImageInputCapability, ModelOpenAiApiMode, ModelSettings,
+    SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
 };
 use aionui_common::ProviderWithModel;
 use aionui_db::IMcpServerRepository;
@@ -19,9 +19,11 @@ use serde_json::{Map, Value};
 use tracing::{debug, info, warn};
 
 use crate::agent_task::AgentInstance;
+use crate::async_image::AsyncImageEndpoint;
 use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
+use crate::manager::aionrs::async_image_tool::AsyncImageTool;
 use crate::manager::aionrs::{AionrsAgentManager, sanitize_session_messages};
 use crate::runtime_status::conversation_runtime_reporter;
 use crate::session_context::AionrsSessionBuildContext;
@@ -93,18 +95,26 @@ pub(super) async fn build(
     );
 
     let mut extra_mcp_servers = resolve_mcp_servers(&overrides);
+    let mut image_endpoints = Vec::new();
+    let mut image_proxies = HashMap::new();
     if let Some(repo) = deps.mcp_server_repo.as_ref() {
-        for (name, config) in load_user_mcp_servers(
+        let (servers, endpoints) = load_user_mcp_servers(
             repo.as_ref(),
             overrides.mcp_server_ids.as_deref(),
             &ctx.user_id,
             &ctx.conversation_id,
             deps.broadcaster.clone(),
         )
-        .await
-        {
+        .await;
+        for endpoint in &endpoints {
+            if let Some(config) = servers.get(&endpoint.name) {
+                image_proxies.insert(endpoint.name.clone(), config.clone());
+            }
+        }
+        for (name, config) in servers {
             extra_mcp_servers.entry(name).or_insert(config);
         }
+        image_endpoints = endpoints;
     }
     merge_session_snapshot_mcp_servers(
         &mut extra_mcp_servers,
@@ -114,6 +124,30 @@ pub(super) async fn build(
         deps.broadcaster.clone(),
     )
     .await;
+    // A stored, explicitly marked endpoint owns this registration even when a
+    // conversation snapshot happens to contain the same display name.
+    let image_exclusions = image_proxies
+        .keys()
+        .map(|name| {
+            (
+                name.clone(),
+                ASYNC_IMAGE_TOOLS.into_iter().map(|(tool, _)| tool.to_owned()).collect(),
+            )
+        })
+        .collect();
+    extra_mcp_servers.extend(image_proxies);
+    let async_image = deps
+        .async_image_queue
+        .as_ref()
+        .filter(|_| !image_endpoints.is_empty())
+        .map(|queue| {
+            AsyncImageTool::new(
+                queue.clone(),
+                ctx.user_id.clone(),
+                ctx.conversation_id.clone(),
+                image_endpoints,
+            )
+        });
 
     if !extra_mcp_servers.is_empty() {
         info!(
@@ -237,14 +271,21 @@ pub(super) async fn build(
         }
     }
 
-    let agent = AionrsAgentManager::new(ctx.conversation_id, ctx.workspace, config, resume_session)
-        .await?
-        .with_model_settings_source(
-            Arc::clone(&deps.provider_repo),
-            ctx.user_id,
-            model.provider_id,
-            model_settings,
-        );
+    let agent = AionrsAgentManager::new_with_async_image(
+        ctx.conversation_id,
+        ctx.workspace,
+        config,
+        resume_session,
+        async_image,
+        image_exclusions,
+    )
+    .await?
+    .with_model_settings_source(
+        Arc::clone(&deps.provider_repo),
+        ctx.user_id,
+        model.provider_id,
+        model_settings,
+    );
     Ok(AgentInstance::Aionrs(Arc::new(agent)))
 }
 
@@ -577,7 +618,7 @@ async fn load_user_mcp_servers(
     user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
-) -> HashMap<String, McpServerConfig> {
+) -> (HashMap<String, McpServerConfig>, Vec<AsyncImageEndpoint>) {
     let rows_result = match selected_ids {
         Some(ids) => repo.list_by_ids_any(user_id, ids).await,
         None => repo.list(user_id).await,
@@ -590,11 +631,12 @@ async fn load_user_mcp_servers(
                 error = %err,
                 "user_mcp: list() failed; skipping injection"
             );
-            return HashMap::new();
+            return (HashMap::new(), Vec::new());
         }
     };
 
     let mut servers = HashMap::new();
+    let mut image_endpoints = Vec::new();
     for row in rows {
         let selected = selected_ids
             .map(|ids| ids.iter().any(|id| id == &row.id))
@@ -602,12 +644,30 @@ async fn load_user_mcp_servers(
         // `aionui-team` is the reserved team coordination MCP name; a user row
         // that collides with it is never injected here (the team bridge is
         // folded in separately and must win).
-        if !selected || row.builtin || row.name == TEAM_MCP_SERVER_NAME {
+        if !selected
+            || row.builtin
+            || row.name == TEAM_MCP_SERVER_NAME
+            || (row.purpose == "async_image" && row.deleted_at.is_some())
+        {
             continue;
         }
 
         match row_to_mcp_server_config(&row, user_id, conversation_id, broadcaster.clone()).await {
-            Ok(config) => {
+            Ok(mut config) => {
+                if row.purpose == "async_image"
+                    && let Some(url) = &config.url
+                {
+                    image_endpoints.push(AsyncImageEndpoint {
+                        id: row.id.clone(),
+                        name: row.name.clone(),
+                        url: url.clone(),
+                        headers: config.headers.clone().unwrap_or_default(),
+                        is_default: row.is_default,
+                    });
+                    // Ordinary tools on this endpoint can still be discovered.
+                    // An unavailable image backend should not hold up the chat.
+                    config.startup_timeout_ms = Some(3_000);
+                }
                 servers.insert(row.name.clone(), config);
             }
             Err(err) => {
@@ -622,7 +682,7 @@ async fn load_user_mcp_servers(
         }
     }
 
-    servers
+    (servers, image_endpoints)
 }
 
 async fn row_to_mcp_server_config(
@@ -1012,6 +1072,8 @@ mod tests {
         builtin: bool,
     ) -> McpServerRow {
         McpServerRow {
+            purpose: "general".to_owned(),
+            is_default: false,
             id: format!("mcp_{name}"),
             user_id: TEST_USER_ID.to_owned(),
             name: name.to_owned(),
@@ -1121,7 +1183,7 @@ mod tests {
         let repo = MockMcpRepo { rows: vec![row] };
         let selected = vec!["mcp-docs".to_owned()];
 
-        let extra_mcp_servers = load_user_mcp_servers(
+        let (extra_mcp_servers, _) = load_user_mcp_servers(
             &repo,
             Some(&selected),
             TEST_USER_ID,
@@ -2038,9 +2100,8 @@ mod tests {
             ..Default::default()
         };
         let mut assembled = resolve_mcp_servers(&overrides);
-        for (name, config) in
-            load_user_mcp_servers(&repo, None, TEST_USER_ID, "conv-assembly", test_broadcaster()).await
-        {
+        let (servers, _) = load_user_mcp_servers(&repo, None, TEST_USER_ID, "conv-assembly", test_broadcaster()).await;
+        for (name, config) in servers {
             assembled.entry(name).or_insert(config);
         }
         let executable = std::env::current_exe()

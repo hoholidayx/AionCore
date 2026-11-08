@@ -443,7 +443,7 @@ async fn load_user_mcp_servers(
         // `aionui-team` is the reserved team coordination MCP name; a user row
         // that collides with it is never injected here (the team bridge is
         // folded in separately and must win).
-        if !selected || row.builtin || row.name == TEAM_MCP_SERVER_NAME {
+        if !selected || row.builtin || row.name == TEAM_MCP_SERVER_NAME || row.purpose == "async_image" {
             continue;
         }
         if !row_supported_by_capabilities(&row, capabilities) {
@@ -661,6 +661,8 @@ mod tests {
         builtin: bool,
     ) -> McpServerRow {
         McpServerRow {
+            purpose: "general".to_owned(),
+            is_default: false,
             id: format!("mcp_{name}"),
             user_id: TEST_USER_ID.to_owned(),
             name: name.to_owned(),

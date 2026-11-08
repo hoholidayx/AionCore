@@ -101,13 +101,19 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
         let id = aionui_common::generate_prefixed_id("mcp");
         let now = aionui_common::now_ms();
         let last_test_status = "disconnected";
+        let purpose = params.purpose.unwrap_or("general");
+        let is_default = params.is_default.unwrap_or(false);
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if is_default {
+            clear_default(&mut tx, params.user_id, &id).await?;
+        }
 
         sqlx::query(
             "INSERT INTO mcp_servers \
                 (id, user_id, name, description, enabled, transport_type, transport_config, \
                  tools, last_test_status, last_connected, original_json, builtin, \
-                 deleted_at, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 deleted_at, created_at, updated_at, purpose, is_default) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(params.user_id)
@@ -124,7 +130,9 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
         .bind(Option::<TimestampMs>::None)
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .bind(purpose)
+        .bind(is_default)
+        .execute(&mut *tx)
         .await
         .map_err(|e| match &e {
             sqlx::Error::Database(db_err) if is_unique_violation(db_err.as_ref()) => {
@@ -132,6 +140,7 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
             }
             _ => DbError::Query(e),
         })?;
+        tx.commit().await?;
 
         Ok(McpServerRow {
             id,
@@ -146,6 +155,8 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
             last_connected: None,
             original_json: params.original_json.map(String::from),
             builtin: params.builtin,
+            purpose: purpose.to_owned(),
+            is_default,
             deleted_at: None,
             created_at: now,
             updated_at: now,
@@ -158,18 +169,24 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
         id: &str,
         params: UpdateMcpServerParams<'_>,
     ) -> Result<McpServerRow, DbError> {
-        let existing = self
-            .find_by_id_any(user_id, id)
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let existing = sqlx::query_as::<_, McpServerRow>("SELECT * FROM mcp_servers WHERE user_id = ? AND id = ?")
+            .bind(user_id)
+            .bind(id)
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| DbError::NotFound(format!("MCP server '{id}' not found")))?;
 
         let merged = merge_update(existing, params);
+        if merged.is_default {
+            clear_default(&mut tx, user_id, id).await?;
+        }
 
         sqlx::query(
             "UPDATE mcp_servers SET \
                 name = ?, description = ?, enabled = ?, transport_type = ?, \
                 transport_config = ?, tools = ?, original_json = ?, \
-                builtin = ?, deleted_at = ?, updated_at = ? \
+                builtin = ?, deleted_at = ?, updated_at = ?, purpose = ?, is_default = ? \
              WHERE user_id = ? AND id = ?",
         )
         .bind(&merged.name)
@@ -182,9 +199,11 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
         .bind(merged.builtin)
         .bind(merged.deleted_at)
         .bind(merged.updated_at)
+        .bind(&merged.purpose)
+        .bind(merged.is_default)
         .bind(user_id)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| match &e {
             sqlx::Error::Database(db_err) if is_unique_violation(db_err.as_ref()) => {
@@ -193,13 +212,14 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
             _ => DbError::Query(e),
         })?;
 
+        tx.commit().await?;
         Ok(merged)
     }
 
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
         let now = aionui_common::now_ms();
         let result = sqlx::query(
-            "UPDATE mcp_servers SET enabled = 0, deleted_at = ?, updated_at = ? \
+            "UPDATE mcp_servers SET enabled = 0, is_default = 0, deleted_at = ?, updated_at = ? \
              WHERE user_id = ? AND id = ? AND deleted_at IS NULL",
         )
         .bind(now)
@@ -234,6 +254,8 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
                         tools: Some(params.tools),
                         original_json: Some(params.original_json),
                         builtin: Some(params.builtin),
+                        purpose: params.purpose,
+                        is_default: params.is_default,
                         ..Default::default()
                     };
                     self.update(user_id, &existing.id, update_params).await?
@@ -297,9 +319,20 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
     }
 }
 
+async fn clear_default(connection: &mut sqlx::SqliteConnection, user_id: &str, id: &str) -> Result<(), DbError> {
+    sqlx::query("UPDATE mcp_servers SET is_default = 0 WHERE user_id = ? AND id != ? AND is_default = 1")
+        .bind(user_id)
+        .bind(id)
+        .execute(connection)
+        .await?;
+    Ok(())
+}
+
 /// Merge partial update params into an existing row, returning a new instance.
 fn merge_update(existing: McpServerRow, params: UpdateMcpServerParams<'_>) -> McpServerRow {
     let now = aionui_common::now_ms();
+    let purpose = params.purpose.unwrap_or(&existing.purpose).to_owned();
+    let is_default = purpose == "async_image" && params.is_default.unwrap_or(existing.is_default);
     McpServerRow {
         id: existing.id,
         user_id: existing.user_id,
@@ -318,6 +351,8 @@ fn merge_update(existing: McpServerRow, params: UpdateMcpServerParams<'_>) -> Mc
             .original_json
             .map_or(existing.original_json, |v| v.map(String::from)),
         builtin: params.builtin.unwrap_or(existing.builtin),
+        purpose,
+        is_default,
         deleted_at: params.deleted_at.map_or(existing.deleted_at, |v| v),
         created_at: existing.created_at,
         updated_at: now,
@@ -353,6 +388,8 @@ mod tests {
 
     fn stdio_params() -> CreateMcpServerParams<'static> {
         CreateMcpServerParams {
+            purpose: None,
+            is_default: None,
             user_id: USER_A,
             name: "test-mcp",
             description: Some("A test MCP server"),
@@ -367,6 +404,8 @@ mod tests {
 
     fn http_params() -> CreateMcpServerParams<'static> {
         CreateMcpServerParams {
+            purpose: None,
+            is_default: None,
             user_id: USER_A,
             name: "http-mcp",
             description: None,
@@ -377,6 +416,64 @@ mod tests {
             original_json: None,
             builtin: false,
         }
+    }
+
+    #[tokio::test]
+    async fn async_image_default_is_per_user_and_tracks_endpoint_edits() {
+        let (repo, _db) = setup().await;
+        let marked = CreateMcpServerParams {
+            purpose: Some("async_image"),
+            is_default: Some(true),
+            ..http_params()
+        };
+        let first = repo.create(marked.clone()).await.unwrap();
+        let other_user = repo
+            .create(CreateMcpServerParams {
+                user_id: USER_B,
+                ..marked.clone()
+            })
+            .await
+            .unwrap();
+        let second = repo
+            .create(CreateMcpServerParams {
+                name: "second",
+                ..marked
+            })
+            .await
+            .unwrap();
+        assert!(!repo.find_by_id(USER_A, &first.id).await.unwrap().unwrap().is_default);
+        assert!(
+            repo.find_by_id(USER_B, &other_user.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_default
+        );
+        let edited = repo
+            .update(
+                USER_A,
+                &second.id,
+                UpdateMcpServerParams {
+                    description: Some(Some("updated description")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(edited.purpose, "async_image");
+        assert!(edited.is_default);
+        let demoted = repo
+            .update(
+                USER_A,
+                &second.id,
+                UpdateMcpServerParams {
+                    purpose: Some("general"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!demoted.is_default);
     }
 
     #[tokio::test]

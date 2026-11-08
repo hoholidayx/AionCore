@@ -6294,6 +6294,8 @@ mod tests {
     #[test]
     fn explicitly_selected_disabled_mcp_row_remains_injectable() {
         let row = McpServerRow {
+            purpose: "general".to_owned(),
+            is_default: false,
             id: "mcp-disabled".into(),
             user_id: "user-1".into(),
             name: "selected-disabled".into(),

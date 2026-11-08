@@ -17,6 +17,8 @@ use aionui_mcp::{
 
 fn make_server(name: &str, enabled: bool, transport: McpServerTransport) -> McpServer {
     McpServer {
+        purpose: Default::default(),
+        is_default: false,
         id: format!("mcp_{name}"),
         name: name.into(),
         description: None,

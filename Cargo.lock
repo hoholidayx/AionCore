@@ -331,6 +331,7 @@ dependencies = [
  "aion-mcp",
  "aion-protocol",
  "aion-providers",
+ "aion-tools",
  "aion-types",
  "aionui-api-types",
  "aionui-auth",
@@ -566,6 +567,8 @@ dependencies = [
 name = "aionui-conversation"
 version = "0.2.2"
 dependencies = [
+ "aion-config",
+ "aion-mcp",
  "aionui-ai-agent",
  "aionui-api-types",
  "aionui-auth",
@@ -581,10 +584,12 @@ dependencies = [
  "axum",
  "base64",
  "chrono",
+ "crc32fast",
  "futures-util",
  "regex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",
@@ -592,6 +597,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

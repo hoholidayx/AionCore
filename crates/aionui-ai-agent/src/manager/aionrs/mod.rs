@@ -1,3 +1,4 @@
+pub(crate) mod async_image_tool;
 mod content;
 mod error;
 
