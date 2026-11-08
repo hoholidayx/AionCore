@@ -1,9 +1,12 @@
 #![allow(clippy::disallowed_types)]
 
+use std::sync::Arc;
+
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 
 use aionui_api_types::{
@@ -18,6 +21,7 @@ use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 
 use crate::ConversationError;
+use crate::image_jobs::AsyncImageJobs;
 use crate::state::ConversationRouterState;
 
 impl From<ConversationError> for ApiError {
@@ -147,7 +151,39 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .with_state(state)
 }
 
+/// Build attachment routes so the caller can require end-user authentication.
+pub fn conversation_attachment_routes(jobs: Arc<AsyncImageJobs>) -> Router {
+    Router::new()
+        .route(
+            "/api/conversations/{conversation_id}/async-images/{attachment_id}",
+            get(read_async_image),
+        )
+        .with_state(jobs)
+}
+
 // ── Handlers ───────────────────────────────────────────────────────
+
+async fn read_async_image(
+    State(jobs): State<Arc<AsyncImageJobs>>,
+    Extension(user): Extension<CurrentUser>,
+    Path((conversation_id, attachment_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let attachment = jobs
+        .read_image(&user.id, &conversation_id, &attachment_id)
+        .await
+        .map_err(|error| match error.code {
+            "attachment_not_found" | "conversation_not_found" => ApiError::NotFound(error.message),
+            _ => ApiError::Internal(error.message),
+        })?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "private, no-store"),
+        ],
+        attachment.png,
+    )
+        .into_response())
+}
 
 async fn create(
     State(state): State<ConversationRouterState>,

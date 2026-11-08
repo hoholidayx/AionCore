@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use aionui_ai_agent::async_image::{
     AsyncImageEndpoint, AsyncImageError, AsyncImageQueue, AsyncImageReceipt, AsyncImageReference, AsyncImageRequest,
+    IMAGE_REFERENCE_PREFIX, MAX_IMAGE_REFERENCES,
 };
-use aionui_api_types::WebSocketMessage;
 use aionui_common::{TimestampMs, now_ms};
 use aionui_db::models::{
     AsyncImageJobKey, AsyncImageJobReceiptRow, AsyncImageJobState as State, ClaimedAsyncImageJob, MessageRow,
@@ -24,10 +24,12 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{Notify, watch};
 use uuid::Uuid;
 
+use crate::message_persistence::persisted_message_stream;
+
 use self::clients::{EndpointKey, ImageJobClients};
 use self::protocol::{
-    BackendError, CONTRACT, EndpointConfig, ImageJobClient, MAX_REFERENCE, MAX_REFERENCES, MAX_REQUEST, MAX_TOTAL,
-    RemoteState, endpoint_fingerprint, png_dimensions,
+    BackendError, CONTRACT, EndpointConfig, ImageJobClient, MAX_REFERENCE, MAX_REQUEST, MAX_TOTAL, RemoteState,
+    endpoint_fingerprint, png_dimensions,
 };
 
 const CHECK_DELAY: TimestampMs = 2_000;
@@ -176,7 +178,8 @@ impl AsyncImageJobs {
             })
             .await?;
         if committed && let Some(card) = card {
-            self.broadcast_card(&job.user_id, &card);
+            self.broadcaster
+                .broadcast(persisted_message_stream(&job.user_id, &card, None));
             if let Some(code) = error {
                 tracing::warn!(task_id = %job.task_id, code, "Asynchronous image job failed");
             } else if state == State::Completed {
@@ -271,26 +274,6 @@ impl AsyncImageJobs {
         job.state = State::Submitting;
         Ok(Some(client.submit(request, &job.task_id).await))
     }
-
-    fn broadcast_card(&self, user_id: &str, row: &MessageRow) {
-        let Ok(data) = serde_json::from_str::<Value>(&row.content) else {
-            return;
-        };
-        self.broadcaster.broadcast(WebSocketMessage::new(
-            "message.stream",
-            json!({
-                "user_id": user_id,
-                "conversation_id": row.conversation_id,
-                "msg_id": row.msg_id,
-                "type": row.r#type,
-                "data": data,
-                "position": row.position,
-                "status": row.status,
-                "hidden": row.hidden,
-                "replace": true,
-            }),
-        ));
-    }
 }
 
 #[async_trait::async_trait]
@@ -311,8 +294,11 @@ impl AsyncImageQueue for AsyncImageJobs {
                 "Enter a prompt of up to 8000 characters",
             ));
         }
-        if request.references.len() > MAX_REFERENCES {
-            return Err(AsyncImageError::new("invalid_reference", "Use up to 10 PNG references"));
+        if request.references.len() > MAX_IMAGE_REFERENCES {
+            return Err(AsyncImageError::new(
+                "invalid_reference",
+                format!("Use up to {MAX_IMAGE_REFERENCES} PNG references"),
+            ));
         }
         let mut source = None;
         let mut images = Vec::with_capacity(request.references.len());
@@ -377,7 +363,8 @@ impl AsyncImageQueue for AsyncImageJobs {
         };
         let (receipt, created) = self.repo.enqueue(&job, &card).await.map_err(database_error)?;
         if created {
-            self.broadcast_card(&job.key.user_id, &card);
+            self.broadcaster
+                .broadcast(persisted_message_stream(&job.key.user_id, &card, None));
             self.wake.notify_one();
         }
         Ok(to_receipt(receipt))
@@ -450,7 +437,7 @@ fn database_error(error: DbError) -> AsyncImageError {
 
 fn to_receipt(row: AsyncImageJobReceiptRow) -> AsyncImageReceipt {
     AsyncImageReceipt {
-        attachment_id: format!("async-image:{}", row.task_id),
+        attachment_id: format!("{IMAGE_REFERENCE_PREFIX}{}", row.task_id),
         task_id: row.task_id,
         state: ui_status(row.state).0.into(),
     }
@@ -473,7 +460,7 @@ fn build_card(
     error: Option<&str>,
     created_at: TimestampMs,
 ) -> MessageRow {
-    let id = format!("async-image:{task_id}");
+    let id = format!("{IMAGE_REFERENCE_PREFIX}{task_id}");
     let (tool_status, message_status) = ui_status(state);
     let mut image = json!({});
     if state == State::Completed {

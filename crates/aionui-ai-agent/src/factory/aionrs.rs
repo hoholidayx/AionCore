@@ -95,33 +95,43 @@ pub(super) async fn build(
     );
 
     let mut extra_mcp_servers = resolve_mcp_servers(&overrides);
-    let mut image_endpoints = Vec::new();
-    let mut image_proxies = HashMap::new();
-    if let Some(repo) = deps.mcp_server_repo.as_ref() {
-        let (servers, endpoints) = load_user_mcp_servers(
+    let (servers, image_endpoints) = if let Some(repo) = deps.mcp_server_repo.as_ref() {
+        load_user_mcp_servers(
             repo.as_ref(),
             overrides.mcp_server_ids.as_deref(),
             &ctx.user_id,
             &ctx.conversation_id,
             deps.broadcaster.clone(),
         )
-        .await;
-        for endpoint in &endpoints {
-            if let Some(config) = servers.get(&endpoint.name) {
-                image_proxies.insert(endpoint.name.clone(), config.clone());
-            }
-        }
-        for (name, config) in servers {
+        .await
+    } else {
+        Default::default()
+    };
+    let image_exclusions: HashMap<_, _> = image_endpoints
+        .iter()
+        .map(|endpoint| {
+            (
+                endpoint.name.clone(),
+                ASYNC_IMAGE_TOOLS.into_iter().map(|(tool, _)| tool.to_owned()).collect(),
+            )
+        })
+        .collect();
+    // Marked endpoints must use the live registration even if a snapshot
+    // contains another connection with the same display name.
+    for (name, config) in servers {
+        if image_exclusions.contains_key(&name) {
+            extra_mcp_servers.insert(name, config);
+        } else {
             extra_mcp_servers.entry(name).or_insert(config);
         }
-        image_endpoints = endpoints;
     }
-    let session_snapshots = crate::mcp_resolve::filter_inline_mcp_servers(
+    let mut session_snapshots = crate::mcp_resolve::filter_inline_mcp_servers(
         deps.mcp_server_repo.as_deref(),
         &ctx.user_id,
         &overrides.session_mcp_servers,
     )
     .await;
+    session_snapshots.retain(|server| !image_exclusions.contains_key(&server.name));
     merge_session_snapshot_mcp_servers(
         &mut extra_mcp_servers,
         session_snapshots,
@@ -130,18 +140,6 @@ pub(super) async fn build(
         deps.broadcaster.clone(),
     )
     .await;
-    // A stored, explicitly marked endpoint owns this registration even when a
-    // conversation snapshot happens to contain the same display name.
-    let image_exclusions = image_proxies
-        .keys()
-        .map(|name| {
-            (
-                name.clone(),
-                ASYNC_IMAGE_TOOLS.into_iter().map(|(tool, _)| tool.to_owned()).collect(),
-            )
-        })
-        .collect();
-    extra_mcp_servers.extend(image_proxies);
     let async_image = deps
         .async_image_queue
         .as_ref()

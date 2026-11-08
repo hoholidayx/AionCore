@@ -9,7 +9,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::async_image::{
-    AsyncImageEndpoint, AsyncImageError, AsyncImageQueue, AsyncImageReference, AsyncImageRequest, TOOL_NAME,
+    AsyncImageEndpoint, AsyncImageError, AsyncImageQueue, AsyncImageReference, AsyncImageRequest,
+    IMAGE_REFERENCE_PREFIX, MAX_IMAGE_REFERENCES, TOOL_NAME,
 };
 
 #[derive(Clone)]
@@ -99,10 +100,10 @@ impl AsyncImageTool {
                 "Image reference is unavailable in this conversation",
             )
         };
-        if args.references.len() > 10 {
+        if args.references.len() > MAX_IMAGE_REFERENCES {
             return Err(AsyncImageError::new(
                 "invalid_request",
-                "Use at most ten reference images",
+                format!("Use at most {MAX_IMAGE_REFERENCES} reference images"),
             ));
         }
         let turn = self.turn.lock().map_err(|_| invalid_ref())?;
@@ -111,7 +112,7 @@ impl AsyncImageTool {
             .references
             .iter()
             .map(|reference| {
-                if let Some(id) = reference.strip_prefix("async-image:") {
+                if let Some(id) = reference.strip_prefix(IMAGE_REFERENCE_PREFIX) {
                     return Ok(AsyncImageReference::Generated(id.to_owned()));
                 }
                 let index = reference
@@ -164,7 +165,7 @@ impl Tool for AsyncImageTool {
                 "prompt": {"type": "string"},
                 "size": {"type": "string", "description": "Optional output size or aspect ratio."},
                 "preset": {"type": "string", "enum": ["fast", "quality"], "description": "Optional speed or quality preference."},
-                "references": {"type": "array", "items": {"type": "string"}, "maxItems": 10,
+                "references": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_IMAGE_REFERENCES,
                                "description": "Ordered attachment references from this turn or a previous image receipt."},
                 "backend": {"type": "string", "description": format!("Optional image endpoint ID. Available endpoints: {}", endpoints.join(", "))}
             }

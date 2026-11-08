@@ -1,10 +1,35 @@
 use aionui_ai_agent::AgentSendError;
+use aionui_api_types::WebSocketMessage;
 use aionui_common::{ErrorChain, now_ms};
 use aionui_db::models::MessageRow;
+use serde_json::{Value, json};
 use tracing::warn;
 
 use crate::runtime_persistence::RuntimeWriteKind;
 use crate::service::ConversationService;
+
+pub(crate) fn persisted_message_stream(
+    user_id: &str,
+    row: &MessageRow,
+    turn_id: Option<&str>,
+) -> WebSocketMessage<Value> {
+    let data: Value = serde_json::from_str(&row.content).unwrap_or_else(|_| Value::String(row.content.clone()));
+    let mut payload = json!({
+        "user_id": user_id,
+        "conversation_id": row.conversation_id,
+        "msg_id": row.msg_id.as_deref().unwrap_or(&row.id),
+        "type": row.r#type,
+        "data": data,
+        "position": row.position,
+        "status": row.status,
+        "hidden": row.hidden,
+        "replace": true,
+    });
+    if let Some(turn_id) = turn_id {
+        payload["turn_id"] = json!(turn_id);
+    }
+    WebSocketMessage::new("message.stream", payload)
+}
 
 impl ConversationService {
     pub(crate) async fn persist_send_failure_tip(

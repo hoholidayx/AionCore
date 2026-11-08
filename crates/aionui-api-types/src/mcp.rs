@@ -56,10 +56,22 @@ pub const ASYNC_IMAGE_TOOLS: [(&str, &[&str]); 3] = [
     ("image_result", &["task_id"]),
 ];
 
-pub fn async_image_schema_matches(name: &str, schema: &serde_json::Value) -> bool {
-    let Some((_, fields)) = ASYNC_IMAGE_TOOLS.iter().find(|(tool, _)| *tool == name) else {
-        return false;
-    };
+/// Check that the discovered tools expose the complete async image contract.
+pub fn supports_async_image_tools<'a>(tools: impl IntoIterator<Item = (&'a str, &'a serde_json::Value)>) -> bool {
+    let mut supported = [false; ASYNC_IMAGE_TOOLS.len()];
+    for (name, schema) in tools {
+        if let Some((index, (_, fields))) = ASYNC_IMAGE_TOOLS
+            .iter()
+            .enumerate()
+            .find(|(_, (tool, _))| *tool == name)
+        {
+            supported[index] |= async_image_schema_matches(fields, schema);
+        }
+    }
+    supported.into_iter().all(|matches| matches)
+}
+
+fn async_image_schema_matches(fields: &[&str], schema: &serde_json::Value) -> bool {
     schema["type"].as_str() == Some("object")
         && fields.iter().all(|field| {
             schema["properties"][field]["type"].as_str() == Some("string")

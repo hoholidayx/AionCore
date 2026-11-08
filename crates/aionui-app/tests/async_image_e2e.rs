@@ -5,7 +5,9 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use aionui_ai_agent::{RuntimeTokenScope, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
 use aionui_app::{AppConfig, AppServices, create_router};
+use aionui_auth::{RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER};
 use axum::extract::{Json, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -173,7 +175,16 @@ async fn model_receives_a_receipt_and_delayed_image_stays_in_its_original_conver
     )
     .await;
     let new_conversation = json!({
-        "type":"aionrs", "model":{"provider_id":provider["id"], "model":"stub"}, "extra":{"session_mode":"yolo"}
+        "type":"aionrs",
+        "model":{"provider_id":provider["id"], "model":"stub"},
+        "extra":{
+            "session_mode":"yolo",
+            "selected_session_mcp_servers":[{
+                "id":"inline-image-fixture",
+                "name":"image-fixture",
+                "transport":{"type":"http","url":"http://127.0.0.1:1/mcp"}
+            }]
+        }
     });
     let original = post_json(
         &app,
@@ -253,12 +264,40 @@ async fn model_receives_a_receipt_and_delayed_image_stays_in_its_original_conver
     .await
     .expect("worker completes image");
     assert_eq!(image.headers()[header::CONTENT_TYPE], "image/png");
+    assert_eq!(image.headers()[header::CACHE_CONTROL], "private, no-store");
     assert_eq!(
         image.into_body().collect().await.unwrap().to_bytes().as_ref(),
         base64::engine::general_purpose::STANDARD.decode(PNG).unwrap()
     );
     assert_eq!(
         app.clone().oneshot(get_request(&image_route)).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let user = services.user_repo.find_by_username("admin").await.unwrap().unwrap();
+    let helper = services.runtime_token_service.issue(
+        &user.id,
+        original,
+        TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+        [RuntimeTokenScope::ConversationHelper],
+    );
+    let helper_get = |path: &str| {
+        let mut request = get_request(path);
+        let headers = request.headers_mut();
+        headers.insert(RUNTIME_USER_ID_HEADER, user.id.parse().unwrap());
+        headers.insert(RUNTIME_CONVERSATION_ID_HEADER, original.parse().unwrap());
+        headers.insert(RUNTIME_TOKEN_HEADER, helper.token.parse().unwrap());
+        request
+    };
+    assert_eq!(
+        app.clone()
+            .oneshot(helper_get(&format!("/api/conversations/{original}")))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.clone().oneshot(helper_get(&image_route)).await.unwrap().status(),
         StatusCode::UNAUTHORIZED
     );
     let switched_image = format!("/api/conversations/{switched}/async-images/{task}");

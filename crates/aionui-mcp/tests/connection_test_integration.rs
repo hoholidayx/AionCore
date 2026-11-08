@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aionui_api_types::McpConnectionTestErrorCode;
 use aionui_mcp::McpConnectionTestService;
 use aionui_mcp::McpServerTransport;
 use aionui_realtime::BroadcastEventBus;
@@ -21,6 +22,67 @@ fn make_service() -> McpConnectionTestService {
 
 fn make_service_with_timeout(timeout: Duration) -> McpConnectionTestService {
     McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16))).with_timeout(timeout)
+}
+
+#[tokio::test]
+async fn async_image_connection_requires_matching_tool_schemas() {
+    use axum::extract::Path;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::{Json, Router, routing::post};
+    use serde_json::{Value, json};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = Router::new().route(
+        "/{mode}",
+        post(|Path(mode): Path<String>, Json(body): Json<Value>| async move {
+            let result = match body["method"].as_str().unwrap() {
+                "initialize" => json!({
+                    "protocolVersion": "2025-03-26", "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "image-fixture", "version": "1"}
+                }),
+                "notifications/initialized" => return StatusCode::ACCEPTED.into_response(),
+                "tools/list" => {
+                    let task_schema = json!({
+                        "type": "object", "properties": {"task_id": {"type": "string"}},
+                        "required": ["task_id"]
+                    });
+                    let mut status_schema = task_schema.clone();
+                    if mode == "incompatible" {
+                        status_schema["required"] = json!([]);
+                    }
+                    json!({"tools": [
+                        {"name": "image_submit", "inputSchema": {
+                            "type": "object", "properties": {"request_id": {"type": "string"}, "prompt": {"type": "string"}},
+                            "required": ["request_id", "prompt"]
+                        }},
+                        {"name": "image_status", "inputSchema": status_schema},
+                        {"name": "image_result", "inputSchema": task_schema}
+                    ]})
+                }
+                _ => panic!("Unexpected MCP request"),
+            };
+            Json(json!({"jsonrpc": "2.0", "id": body["id"], "result": result})).into_response()
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let service = make_service();
+    for mode in ["compatible", "incompatible"] {
+        let transport = McpServerTransport::Http {
+            url: format!("http://{addr}/{mode}"),
+            headers: HashMap::new(),
+        };
+        let result = service.test_async_image_connection("image-fixture", &transport).await;
+        assert_eq!(result.success, mode == "compatible");
+        assert_eq!(result.tools.as_ref().map(Vec::len), Some(3));
+        assert_eq!(
+            result.code,
+            (mode == "incompatible").then_some(McpConnectionTestErrorCode::ProtocolError)
+        );
+    }
+    server.abort();
 }
 
 // ---------------------------------------------------------------------------

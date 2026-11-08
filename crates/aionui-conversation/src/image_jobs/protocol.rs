@@ -6,7 +6,7 @@ use aion_config::config::{McpServerConfig, TransportType};
 use aion_mcp::manager::McpManager;
 use aion_mcp::protocol::{McpContent, McpToolResult};
 use aion_mcp::transport::McpError;
-use aionui_api_types::{ASYNC_IMAGE_TOOLS, async_image_schema_matches};
+use aionui_api_types::supports_async_image_tools;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde::Deserialize;
@@ -16,7 +16,6 @@ use sha2::{Digest, Sha256};
 pub(super) const CONTRACT: &str = "image_jobs_v1";
 pub(super) const MAX_REFERENCE: usize = 20 * 1024 * 1024;
 pub(super) const MAX_TOTAL: usize = 32 * 1024 * 1024;
-pub(super) const MAX_REFERENCES: usize = 10;
 pub(super) const MAX_REQUEST: usize = 48 * 1024 * 1024;
 pub(super) const MAX_RESULT: usize = 32 * 1024 * 1024;
 const SERVER: &str = "async_image";
@@ -55,15 +54,13 @@ impl ImageJobClient {
         let manager = McpManager::connect_pinned_http(SERVER, &config)
             .await
             .map_err(transport_error)?;
-        let tools = manager.all_tools();
-        for (name, _) in ASYNC_IMAGE_TOOLS {
-            let compatible = tools
-                .iter()
-                .any(|(_, tool)| tool.name == name && async_image_schema_matches(name, &tool.input_schema));
-            if !compatible {
-                manager.shutdown().await;
-                return Err(BackendError::InvalidContract);
-            }
+        let tools = manager
+            .all_tools()
+            .into_iter()
+            .map(|(_, tool)| (tool.name.as_str(), &tool.input_schema));
+        if !supports_async_image_tools(tools) {
+            manager.shutdown().await;
+            return Err(BackendError::InvalidContract);
         }
         Ok(Self(manager))
     }

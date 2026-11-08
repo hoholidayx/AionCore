@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use serde::Serialize;
 
-pub const TOOL_NAME: &str = "image_generate_async";
+pub(crate) const TOOL_NAME: &str = "image_generate_async";
+pub const MAX_IMAGE_REFERENCES: usize = 10;
+pub const IMAGE_REFERENCE_PREFIX: &str = "async-image:";
 
 #[derive(Clone)]
 pub struct AsyncImageEndpoint {

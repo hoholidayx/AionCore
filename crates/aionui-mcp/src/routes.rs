@@ -8,10 +8,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 
 use aionui_api_types::{
-    ASYNC_IMAGE_TOOLS, ApiResponse, BatchImportMcpServersRequest, CreateMcpServerRequest, DetectedMcpServerResponse,
-    ErrorResponse, McpConnectionTestErrorCode, McpServerPurpose, McpServerResponse, OAuthCheckStatusRequest,
-    OAuthLoginRequest, OAuthLoginResponse, OAuthLogoutRequest, OAuthStatusResponse, TestMcpConnectionRequest,
-    UpdateMcpServerRequest, async_image_schema_matches,
+    ApiResponse, BatchImportMcpServersRequest, CreateMcpServerRequest, DetectedMcpServerResponse, ErrorResponse,
+    McpConnectionTestErrorCode, McpServerPurpose, McpServerResponse, OAuthCheckStatusRequest, OAuthLoginRequest,
+    OAuthLoginResponse, OAuthLogoutRequest, OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -206,7 +205,7 @@ async fn test_connection(
         (None, None) => McpServerPurpose::General,
     };
     let transport = McpServerTransport::from(req.transport);
-    let mut result = if purpose == McpServerPurpose::AsyncImage {
+    let result = if purpose == McpServerPurpose::AsyncImage {
         state
             .connection_test_service
             .test_async_image_connection(&req.name, &transport)
@@ -222,22 +221,6 @@ async fn test_connection(
             )
             .await
     };
-    if purpose == McpServerPurpose::AsyncImage
-        && result.success
-        && !ASYNC_IMAGE_TOOLS.iter().all(|(name, _)| {
-            result.tools.iter().flatten().any(|tool| {
-                tool.name == *name
-                    && tool
-                        .input_schema
-                        .as_ref()
-                        .is_some_and(|schema| async_image_schema_matches(name, schema))
-            })
-        })
-    {
-        result.success = false;
-        result.error = Some("The server does not support the image_jobs_v1 contract".into());
-        result.code = Some(McpConnectionTestErrorCode::ProtocolError);
-    }
     if let Some(server_id) = req.id.as_deref() {
         state
             .config_service

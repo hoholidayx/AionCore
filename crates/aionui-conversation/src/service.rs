@@ -4246,24 +4246,12 @@ impl ConversationService {
             return;
         };
 
-        let msg_id = row.msg_id.clone().unwrap_or_else(|| row.id.clone());
-        let content_value: serde_json::Value =
-            serde_json::from_str(&row.content).unwrap_or_else(|_| serde_json::Value::String(row.content.clone()));
-        self.broadcaster.broadcast(WebSocketMessage::new(
-            "message.stream",
-            serde_json::json!({
-                "user_id": user_id,
-                "conversation_id": row.conversation_id,
-                "msg_id": msg_id,
-                "turn_id": turn_id,
-                "type": row.r#type,
-                "data": content_value,
-                "position": row.position,
-                "status": row.status,
-                "hidden": row.hidden,
-                "replace": true,
-            }),
-        ));
+        self.broadcaster
+            .broadcast(crate::message_persistence::persisted_message_stream(
+                user_id,
+                &row,
+                Some(turn_id),
+            ));
     }
 
     /// Insert a pre-built `MessageRow` into the conversation's message history
@@ -4276,22 +4264,8 @@ impl ConversationService {
     pub async fn insert_raw_message(&self, user_id: &str, row: &MessageRow) -> Result<(), ConversationError> {
         self.conversation_repo.insert_message(user_id, row).await?;
 
-        let msg_id = row.msg_id.clone().unwrap_or_else(|| row.id.clone());
-        let content_value: serde_json::Value =
-            serde_json::from_str(&row.content).unwrap_or_else(|_| serde_json::Value::String(row.content.clone()));
-        let payload = serde_json::json!({
-            "user_id": user_id,
-            "conversation_id": row.conversation_id,
-            "msg_id": msg_id,
-            "type": row.r#type,
-            "data": content_value,
-            "position": row.position,
-            "status": row.status,
-            "hidden": row.hidden,
-            "replace": true,
-        });
         self.broadcaster
-            .broadcast(WebSocketMessage::new("message.stream", payload));
+            .broadcast(crate::message_persistence::persisted_message_stream(user_id, row, None));
         Ok(())
     }
 

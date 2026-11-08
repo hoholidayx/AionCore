@@ -10,6 +10,7 @@ use aion_mcp::{manager::McpManager, transport::McpError};
 use aionui_api_types::{
     McpConnectionTestErrorCode, McpConnectionTestResult, McpToolResponse, RuntimeFailureKind, RuntimeResourceKind,
     RuntimeStatusPayload, RuntimeStatusPhase, RuntimeStatusScope, RuntimeStatusScopeKind, WebSocketMessage,
+    supports_async_image_tools,
 };
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::{
@@ -156,8 +157,13 @@ impl McpConnectionTestService {
                 );
             }
         };
-        let tools = manager
-            .all_tools()
+        let discovered = manager.all_tools();
+        let supported = supports_async_image_tools(
+            discovered
+                .iter()
+                .map(|(_, tool)| (tool.name.as_str(), &tool.input_schema)),
+        );
+        let tools = discovered
             .into_iter()
             .map(|(_, tool)| McpToolResponse {
                 name: tool.name.clone(),
@@ -166,7 +172,13 @@ impl McpConnectionTestService {
             })
             .collect();
         manager.shutdown().await;
-        protocol::discovered_tools_result(tools)
+        let mut result = protocol::discovered_tools_result(tools);
+        if !supported {
+            result.success = false;
+            result.error = Some("The server does not support the image_jobs_v1 contract".into());
+            result.code = Some(McpConnectionTestErrorCode::ProtocolError);
+        }
+        result
     }
 
     // -- Stdio transport --------------------------------------------------

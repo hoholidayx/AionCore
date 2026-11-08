@@ -138,7 +138,7 @@ pub use mcp::{
     DetectedMcpServerResponse, ImportMcpServerRequest, McpAuthMethod, McpConnectionTestErrorCode,
     McpConnectionTestResult, McpServerPurpose, McpServerResponse, McpToolResponse, McpTransport,
     OAuthCheckStatusRequest, OAuthLoginRequest, OAuthLoginResponse, OAuthLogoutRequest, OAuthStatusResponse,
-    TestMcpConnectionRequest, UpdateMcpServerRequest, async_image_schema_matches,
+    TestMcpConnectionRequest, UpdateMcpServerRequest, supports_async_image_tools,
 };
 pub use office::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DocumentConversionRequest, DocumentConversionResponse,
