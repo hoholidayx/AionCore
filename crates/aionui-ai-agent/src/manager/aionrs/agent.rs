@@ -551,10 +551,10 @@ impl IAgentTask for AionrsAgentManager {
             .send(AgentStreamEvent::BackendTurnBound(turn_anchor.clone()));
 
         let mut engine = self.engine.lock().await;
-        let _attachment_turn = self
-            .async_image
-            .as_ref()
-            .map(|tool| tool.begin_turn(&turn_anchor, &data.files, &mut content_blocks));
+        let _attachment_turn = match &self.async_image {
+            Some(tool) => Some(tool.begin_turn(&turn_anchor, &data.files, &mut content_blocks).await),
+            None => None,
+        };
         let mut engine_started = false;
         let result = tokio::select! {
             res = async {

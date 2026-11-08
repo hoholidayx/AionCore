@@ -1170,6 +1170,9 @@ fn aionrs_create_req() -> CreateConversationRequest {
 async fn fork_head_aionrs_uses_conversation_id_anchor_without_acp_row() {
     let (svc, repo, acp_repo) = setup_fork().await;
     let parent = svc.create(USER_ID, aionrs_create_req()).await.unwrap();
+    svc.update_extra(USER_ID, &parent.id, json!({"image_backend_id":"mcp-synthetic"}))
+        .await
+        .unwrap();
     // aionrs conversations own no acp_session row (create() only makes one
     // for ACP/antigravity) — the whole point of this path. The agent
     // identity resolves through the builtin binding ladder (agent_type
@@ -1182,6 +1185,7 @@ async fn fork_head_aionrs_uses_conversation_id_anchor_without_acp_row() {
 
     let fork = svc.fork(USER_ID, &parent.id, fork_req(&m2.id)).await.unwrap();
     assert_ne!(fork.id, parent.id);
+    assert!(fork.extra.get("image_backend_id").is_none());
     assert_eq!(
         fork.fork_capability,
         Some(aionui_api_types::ForkCapabilityView { at_turn: true }),

@@ -259,9 +259,12 @@ impl AppServices {
         // so the agent gets the operator's tools (ELECTRON-1JG fix).
         let mcp_server_repo: Arc<dyn IMcpServerRepository> =
             Arc::new(SqliteMcpServerRepository::new(database.pool().clone()));
+        let conversation_repo: Arc<dyn IConversationRepository> =
+            Arc::new(SqliteConversationRepository::new(database.pool().clone()));
         let async_image_jobs = Arc::new(AsyncImageJobs::new(
             Arc::new(SqliteAsyncImageJobRepository::new(database.pool().clone())),
             mcp_server_repo.clone(),
+            conversation_repo.clone(),
             event_bus.clone(),
         ));
 
@@ -280,8 +283,6 @@ impl AppServices {
             Arc::new(SqliteAcpSessionRepository::new(database.pool().clone()));
         let acp_agent_service = AcpSessionSyncService::new(acp_session_repo.clone());
 
-        let conversation_repo: Arc<dyn IConversationRepository> =
-            Arc::new(SqliteConversationRepository::new(database.pool().clone()));
         let skill_repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(database.pool().clone()));
 
         // Project-bind service (side branch). temp_root mirrors the existing

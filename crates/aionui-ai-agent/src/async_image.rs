@@ -1,6 +1,5 @@
 //! Host port for background image generation. The agent does not own task storage.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -9,14 +8,12 @@ use serde::Serialize;
 pub(crate) const TOOL_NAME: &str = "image_generate_async";
 pub const MAX_IMAGE_REFERENCES: usize = 10;
 pub const IMAGE_REFERENCE_PREFIX: &str = "async-image:";
+pub const IMAGE_BACKEND_OVERRIDE_KEY: &str = "image_backend_id";
 
-#[derive(Clone)]
-pub struct AsyncImageEndpoint {
+pub struct AsyncImageBackend {
     pub id: String,
     pub name: String,
-    pub url: String,
-    pub headers: HashMap<String, String>,
-    pub is_default: bool,
+    pub supports_edit: Option<bool>,
 }
 
 pub enum AsyncImageReference {
@@ -33,7 +30,6 @@ pub struct AsyncImageRequest {
     pub requested_server_id: Option<String>,
     pub size: Option<String>,
     pub preset: Option<String>,
-    pub available: Vec<AsyncImageEndpoint>,
     pub references: Vec<AsyncImageReference>,
 }
 
@@ -62,5 +58,6 @@ impl AsyncImageError {
 
 #[async_trait]
 pub trait AsyncImageQueue: Send + Sync {
+    async fn backends(&self, user_id: &str) -> Result<Vec<AsyncImageBackend>, AsyncImageError>;
     async fn enqueue(&self, request: AsyncImageRequest) -> Result<AsyncImageReceipt, AsyncImageError>;
 }

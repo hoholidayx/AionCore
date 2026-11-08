@@ -19,7 +19,6 @@ use serde_json::{Map, Value};
 use tracing::{debug, info, warn};
 
 use crate::agent_task::AgentInstance;
-use crate::async_image::AsyncImageEndpoint;
 use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
@@ -95,7 +94,7 @@ pub(super) async fn build(
     );
 
     let mut extra_mcp_servers = resolve_mcp_servers(&overrides);
-    let (servers, image_endpoints) = if let Some(repo) = deps.mcp_server_repo.as_ref() {
+    let (servers, image_server_names) = if let Some(repo) = deps.mcp_server_repo.as_ref() {
         load_user_mcp_servers(
             repo.as_ref(),
             overrides.mcp_server_ids.as_deref(),
@@ -107,11 +106,11 @@ pub(super) async fn build(
     } else {
         Default::default()
     };
-    let image_exclusions: HashMap<_, _> = image_endpoints
-        .iter()
-        .map(|endpoint| {
+    let image_exclusions: HashMap<_, _> = image_server_names
+        .into_iter()
+        .map(|name| {
             (
-                endpoint.name.clone(),
+                name,
                 ASYNC_IMAGE_TOOLS.into_iter().map(|(tool, _)| tool.to_owned()).collect(),
             )
         })
@@ -143,15 +142,7 @@ pub(super) async fn build(
     let async_image = deps
         .async_image_queue
         .as_ref()
-        .filter(|_| !image_endpoints.is_empty())
-        .map(|queue| {
-            AsyncImageTool::new(
-                queue.clone(),
-                ctx.user_id.clone(),
-                ctx.conversation_id.clone(),
-                image_endpoints,
-            )
-        });
+        .map(|queue| AsyncImageTool::new(queue.clone(), ctx.user_id.clone(), ctx.conversation_id.clone()));
 
     if !extra_mcp_servers.is_empty() {
         info!(
@@ -622,7 +613,7 @@ async fn load_user_mcp_servers(
     user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
-) -> (HashMap<String, McpServerConfig>, Vec<AsyncImageEndpoint>) {
+) -> (HashMap<String, McpServerConfig>, Vec<String>) {
     let rows_result = match selected_ids {
         Some(ids) => repo.list_by_ids_any(user_id, ids).await,
         None => repo.list(user_id).await,
@@ -640,7 +631,7 @@ async fn load_user_mcp_servers(
     };
 
     let mut servers = HashMap::new();
-    let mut image_endpoints = Vec::new();
+    let mut image_server_names = Vec::new();
     for row in rows {
         let selected = selected_ids
             .map(|ids| ids.iter().any(|id| id == &row.id))
@@ -658,16 +649,8 @@ async fn load_user_mcp_servers(
 
         match row_to_mcp_server_config(&row, user_id, conversation_id, broadcaster.clone()).await {
             Ok(mut config) => {
-                if row.purpose == "async_image"
-                    && let Some(url) = &config.url
-                {
-                    image_endpoints.push(AsyncImageEndpoint {
-                        id: row.id.clone(),
-                        name: row.name.clone(),
-                        url: url.clone(),
-                        headers: config.headers.clone().unwrap_or_default(),
-                        is_default: row.is_default,
-                    });
+                if row.purpose == "async_image" && config.url.is_some() {
+                    image_server_names.push(row.name.clone());
                     // Ordinary tools on this endpoint can still be discovered.
                     // An unavailable image backend should not hold up the chat.
                     config.startup_timeout_ms = Some(3_000);
@@ -686,7 +669,7 @@ async fn load_user_mcp_servers(
         }
     }
 
-    (servers, image_endpoints)
+    (servers, image_server_names)
 }
 
 async fn row_to_mcp_server_config(

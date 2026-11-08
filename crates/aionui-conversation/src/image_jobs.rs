@@ -7,15 +7,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aionui_ai_agent::async_image::{
-    AsyncImageEndpoint, AsyncImageError, AsyncImageQueue, AsyncImageReceipt, AsyncImageReference, AsyncImageRequest,
-    IMAGE_REFERENCE_PREFIX, MAX_IMAGE_REFERENCES,
+    AsyncImageBackend, AsyncImageError, AsyncImageQueue, AsyncImageReceipt, AsyncImageReference, AsyncImageRequest,
+    IMAGE_BACKEND_OVERRIDE_KEY, IMAGE_REFERENCE_PREFIX, MAX_IMAGE_REFERENCES,
 };
+use aionui_api_types::McpToolResponse;
 use aionui_common::{TimestampMs, now_ms};
 use aionui_db::models::{
-    AsyncImageJobKey, AsyncImageJobReceiptRow, AsyncImageJobState as State, ClaimedAsyncImageJob, MessageRow,
-    NewAsyncImageJob,
+    AsyncImageJobKey, AsyncImageJobReceiptRow, AsyncImageJobState as State, ClaimedAsyncImageJob, McpServerRow,
+    MessageRow, NewAsyncImageJob,
 };
-use aionui_db::{AsyncImageJobUpdate, DbError, IAsyncImageJobRepository, IMcpServerRepository};
+use aionui_db::{
+    AsyncImageJobUpdate, DbError, IAsyncImageJobRepository, IConversationRepository, IMcpServerRepository,
+};
 use aionui_realtime::EventBroadcaster;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -40,12 +43,12 @@ const CLAIM_WINDOW: TimestampMs = 120_000;
 
 pub struct AsyncImageAttachment {
     pub png: Vec<u8>,
-    pub server_id: String,
 }
 
 pub struct AsyncImageJobs {
     repo: Arc<dyn IAsyncImageJobRepository>,
     mcp_repo: Arc<dyn IMcpServerRepository>,
+    conversation_repo: Arc<dyn IConversationRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
     wake: Notify,
     clients: ImageJobClients,
@@ -63,11 +66,13 @@ impl AsyncImageJobs {
     pub fn new(
         repo: Arc<dyn IAsyncImageJobRepository>,
         mcp_repo: Arc<dyn IMcpServerRepository>,
+        conversation_repo: Arc<dyn IConversationRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
     ) -> Self {
         Self {
             repo,
             mcp_repo,
+            conversation_repo,
             broadcaster,
             wake: Notify::new(),
             clients: ImageJobClients::default(),
@@ -86,10 +91,7 @@ impl AsyncImageJobs {
             .await
             .map_err(database_error)?
             .ok_or_else(|| AsyncImageError::new("attachment_not_found", "Image attachment not found"))?;
-        Ok(AsyncImageAttachment {
-            png: row.png,
-            server_id: row.server_id,
-        })
+        Ok(AsyncImageAttachment { png: row.png })
     }
 
     pub async fn run(&self, shutdown: watch::Receiver<bool>) {
@@ -278,6 +280,32 @@ impl AsyncImageJobs {
 
 #[async_trait::async_trait]
 impl AsyncImageQueue for AsyncImageJobs {
+    async fn backends(&self, user_id: &str) -> Result<Vec<AsyncImageBackend>, AsyncImageError> {
+        let rows = self.mcp_repo.list(user_id).await.map_err(database_error)?;
+        Ok(rows
+            .into_iter()
+            .filter(McpServerRow::is_enabled_image_backend)
+            .map(|row| {
+                let supports_edit = row
+                    .tools
+                    .as_deref()
+                    .and_then(|tools| serde_json::from_str::<Vec<McpToolResponse>>(tools).ok())
+                    .and_then(|tools| tools.into_iter().find(|tool| tool.name == "image_submit"))
+                    .and_then(|tool| tool.input_schema)
+                    .and_then(|schema| {
+                        schema
+                            .get("properties")
+                            .map(|properties| properties.get("images").is_some())
+                    });
+                AsyncImageBackend {
+                    id: row.id,
+                    name: row.name,
+                    supports_edit,
+                }
+            })
+            .collect())
+    }
+
     async fn enqueue(&self, request: AsyncImageRequest) -> Result<AsyncImageReceipt, AsyncImageError> {
         let key = AsyncImageJobKey {
             user_id: request.user_id,
@@ -300,7 +328,18 @@ impl AsyncImageQueue for AsyncImageJobs {
                 format!("Use up to {MAX_IMAGE_REFERENCES} PNG references"),
             ));
         }
-        let mut source = None;
+        let conversation = self
+            .conversation_repo
+            .get(&key.user_id, &key.conversation_id)
+            .await
+            .map_err(database_error)?
+            .ok_or_else(|| AsyncImageError::new("conversation_not_found", "Image conversation not found"))?;
+        let extra = serde_json::from_str::<Value>(&conversation.extra).unwrap_or(Value::Null);
+        let saved_backend = extra.get(IMAGE_BACKEND_OVERRIDE_KEY).and_then(Value::as_str);
+        let available = self.mcp_repo.list(&key.user_id).await.map_err(database_error)?;
+        let backend = select_backend(&available, request.requested_server_id.as_deref().or(saved_backend))?;
+        let endpoint = serde_json::from_str::<EndpointConfig>(&backend.transport_config)
+            .map_err(|_| AsyncImageError::new("backend_unavailable", "The selected image backend is unavailable"))?;
         let mut images = Vec::with_capacity(request.references.len());
         let mut total = 0usize;
         let invalid_reference =
@@ -309,11 +348,7 @@ impl AsyncImageQueue for AsyncImageJobs {
             let png = match reference {
                 AsyncImageReference::AuthorizedPath(path) => read_reference(&path).await?,
                 AsyncImageReference::Generated(task_id) => {
-                    let image = self.read_image(&key.user_id, &key.conversation_id, &task_id).await?;
-                    if source.is_none() && request.available.iter().any(|server| server.id == image.server_id) {
-                        source = Some(image.server_id);
-                    }
-                    image.png
+                    self.read_image(&key.user_id, &key.conversation_id, &task_id).await?.png
                 }
             };
             total += png.len();
@@ -327,11 +362,6 @@ impl AsyncImageQueue for AsyncImageJobs {
                 .ok_or_else(invalid_reference)?;
             images.push(encoded);
         }
-        let endpoint = select_endpoint(
-            &request.available,
-            request.requested_server_id.as_deref(),
-            source.as_deref(),
-        )?;
         let task_id = Uuid::now_v7().to_string();
         let mut args = json!({ "request_id": task_id, "prompt": request.prompt });
         if let Some(size) = request.size {
@@ -355,7 +385,7 @@ impl AsyncImageQueue for AsyncImageJobs {
         let job = NewAsyncImageJob {
             key,
             task_id,
-            server_id: endpoint.id.clone(),
+            server_id: backend.id.clone(),
             endpoint_fingerprint: endpoint_fingerprint(&endpoint.url, &endpoint.headers),
             contract_version: CONTRACT.into(),
             request_body,
@@ -371,32 +401,25 @@ impl AsyncImageQueue for AsyncImageJobs {
     }
 }
 
-fn select_endpoint<'a>(
-    available: &'a [AsyncImageEndpoint],
+fn select_backend<'a>(
+    available: &'a [McpServerRow],
     explicit: Option<&str>,
-    source: Option<&str>,
-) -> Result<&'a AsyncImageEndpoint, AsyncImageError> {
+) -> Result<&'a McpServerRow, AsyncImageError> {
+    let mut enabled = available.iter().filter(|row| row.is_enabled_image_backend());
     if let Some(explicit) = explicit {
-        return available
-            .iter()
-            .find(|server| server.id == explicit)
-            .ok_or_else(|| AsyncImageError::new("backend_unavailable", "The selected image backend is unavailable"));
+        return enabled.find(|server| server.id == explicit).ok_or_else(|| {
+            AsyncImageError::new(
+                "backend_unavailable",
+                "The selected image backend is unavailable. Choose another backend.",
+            )
+        });
     }
-    available
-        .iter()
-        .find(|server| Some(server.id.as_str()) == source)
-        .or_else(|| available.iter().find(|server| server.is_default))
-        .or(match available {
-            [single] => Some(single),
-            _ => None,
-        })
-        .ok_or_else(|| {
-            if available.is_empty() {
-                AsyncImageError::new("backend_unavailable", "No asynchronous image backend is available")
-            } else {
-                AsyncImageError::new("backend_required", "Select an asynchronous image backend")
-            }
-        })
+    enabled.find(|server| server.is_default).ok_or_else(|| {
+        AsyncImageError::new(
+            "backend_required",
+            "Select an image backend or configure a global default.",
+        )
+    })
 }
 
 async fn read_reference(path: &Path) -> Result<Vec<u8>, AsyncImageError> {

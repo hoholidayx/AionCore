@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -147,8 +146,8 @@ async fn seed_database(db: &Database, url: &str) {
             .unwrap();
     }
     sqlx::query(
-        "INSERT INTO mcp_servers (id, user_id, name, transport_type, transport_config, purpose, created_at, updated_at)
-         VALUES (?, ?, 'Aggregate', 'http', ?, 'async_image', 0, 0)",
+        "INSERT INTO mcp_servers (id, user_id, name, transport_type, transport_config, purpose, is_default, enabled, created_at, updated_at)
+         VALUES (?, ?, 'Aggregate', 'http', ?, 'async_image', 1, 1, 0, 0)",
     )
     .bind(SERVER)
     .bind(USER)
@@ -162,21 +161,12 @@ fn jobs(db: &Database, events: Arc<BroadcastEventBus>) -> AsyncImageJobs {
     AsyncImageJobs::new(
         Arc::new(SqliteAsyncImageJobRepository::new(db.pool().clone())),
         Arc::new(SqliteMcpServerRepository::new(db.pool().clone())),
+        Arc::new(SqliteConversationRepository::new(db.pool().clone())),
         events,
     )
 }
 
-fn endpoint(id: &str, url: &str, is_default: bool) -> AsyncImageEndpoint {
-    AsyncImageEndpoint {
-        id: id.into(),
-        name: id.into(),
-        url: url.into(),
-        headers: HashMap::new(),
-        is_default,
-    }
-}
-
-fn request(url: &str) -> AsyncImageRequest {
+fn request() -> AsyncImageRequest {
     AsyncImageRequest {
         user_id: USER.into(),
         conversation_id: ORIGINAL.into(),
@@ -186,7 +176,6 @@ fn request(url: &str) -> AsyncImageRequest {
         requested_server_id: None,
         size: None,
         preset: None,
-        available: vec![endpoint(SERVER, url, true)],
         references: Vec::new(),
     }
 }
@@ -215,8 +204,8 @@ async fn lost_reply_restarts_and_delivers_one_card_only_to_original_conversation
     let events = Arc::new(BroadcastEventBus::new(16));
     let mut messages = events.subscribe();
     let service = jobs(&db, events.clone());
-    let receipt = service.enqueue(request(&url)).await.unwrap();
-    assert_eq!(service.enqueue(request(&url)).await.unwrap().task_id, receipt.task_id);
+    let receipt = service.enqueue(request()).await.unwrap();
+    assert_eq!(service.enqueue(request()).await.unwrap().task_id, receipt.task_id);
     assert_eq!(receipt.attachment_id, format!("async-image:{}", receipt.task_id));
     assert_eq!(messages.try_recv().unwrap().data["conversation_id"], ORIGINAL);
     backend.lost_reply.store(true, Ordering::SeqCst);
@@ -265,7 +254,7 @@ async fn lost_reply_restarts_and_delivers_one_card_only_to_original_conversation
             .code,
         "attachment_not_found"
     );
-    assert_eq!(restarted.enqueue(request(&url)).await.unwrap().state, "completed");
+    assert_eq!(restarted.enqueue(request()).await.unwrap().state, "completed");
     assert_eq!(backend.requests.lock().unwrap().len(), 1);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE type = 'acp_tool_call'")
         .fetch_one(db.pool())
@@ -310,13 +299,13 @@ async fn endpoint_change_stops_the_original_job_and_foreign_scope_cannot_enqueue
     let events = Arc::new(BroadcastEventBus::new(16));
     let mut messages = events.subscribe();
     let service = jobs(&db, events);
-    let mut foreign = request(&url);
+    let mut foreign = request();
     foreign.user_id = OTHER_USER.into();
     assert_eq!(
         service.enqueue(foreign).await.err().unwrap().code,
         "conversation_not_found"
     );
-    service.enqueue(request(&url)).await.unwrap();
+    service.enqueue(request()).await.unwrap();
     messages.try_recv().unwrap();
     sqlx::query("UPDATE mcp_servers SET transport_config = ?")
         .bind(json!({ "url": url, "headers": { "X-Synthetic-Backend": "switched" } }).to_string())
@@ -340,13 +329,13 @@ async fn resetting_the_conversation_removes_completed_and_claimed_jobs() {
     let events = Arc::new(BroadcastEventBus::new(16));
     let mut messages = events.subscribe();
     let service = jobs(&db, events);
-    let completed = service.enqueue(request(&url)).await.unwrap();
+    let completed = service.enqueue(request()).await.unwrap();
     backend.complete.store(true, Ordering::SeqCst);
     tick(&service, &db).await;
     tick(&service, &db).await;
     assert!(service.read_image(USER, ORIGINAL, &completed.task_id).await.is_ok());
 
-    let mut next = request(&url);
+    let mut next = request();
     next.tool_call_id = "other-call".into();
     service.enqueue(next).await.unwrap();
     let mut claim = service
@@ -396,7 +385,7 @@ async fn matching_metadata_with_invalid_pixels_fails_without_an_attachment() {
     let events = Arc::new(BroadcastEventBus::new(16));
     let mut messages = events.subscribe();
     let service = jobs(&db, events);
-    let receipt = service.enqueue(request(&url)).await.unwrap();
+    let receipt = service.enqueue(request()).await.unwrap();
     backend.complete.store(true, Ordering::SeqCst);
     backend.invalid_pixels.store(true, Ordering::SeqCst);
     tick(&service, &db).await;
@@ -428,18 +417,95 @@ async fn matching_metadata_with_invalid_pixels_fails_without_an_attachment() {
     server.abort();
 }
 
-#[test]
-fn multiple_endpoints_use_explicit_then_source_then_default() {
-    let available = [
-        endpoint("first", "http://first/mcp", true),
-        endpoint("second", "http://second/mcp", false),
-    ];
+#[tokio::test]
+async fn routes_new_jobs_by_explicit_choice_then_live_global_default() {
+    let (url, backend, server) = serve_backend().await;
+    let db = database(&url).await;
+    let service = jobs(&db, Arc::new(BroadcastEventBus::new(16)));
+    let original = service.enqueue(request()).await.unwrap();
+    backend.complete.store(true, Ordering::SeqCst);
+    tick(&service, &db).await;
+    tick(&service, &db).await;
+    sqlx::query(
+        "INSERT INTO mcp_servers (id, user_id, name, transport_type, transport_config, purpose, enabled, created_at, updated_at)
+         VALUES ('second', ?, 'Second', 'http', ?, 'async_image', 1, 1, 1),
+                ('foreign', ?, 'Foreign', 'http', ?, 'async_image', 1, 1, 1)",
+    )
+    .bind(USER)
+    .bind(json!({"url": url}).to_string())
+    .bind(OTHER_USER)
+    .bind(json!({"url": url}).to_string())
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(service.backends(USER).await.unwrap().len(), 2);
+
+    let enqueue = |call: &'static str, explicit: Option<&'static str>| {
+        let mut input = request();
+        input.tool_call_id = call.into();
+        input.requested_server_id = explicit.map(str::to_owned);
+        service.enqueue(input)
+    };
+    let selected_backend = |task_id: String| {
+        let pool = db.pool().clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT server_id FROM async_image_jobs WHERE task_id = ?")
+                .bind(task_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    sqlx::query("UPDATE conversations SET extra = '{\"image_backend_id\":\"second\"}' WHERE id = ?")
+        .bind(ORIGINAL)
+        .execute(db.pool())
+        .await
+        .unwrap();
     assert_eq!(
-        select_endpoint(&available, Some("first"), Some("second")).unwrap().id,
-        "first"
+        selected_backend(enqueue("saved", None).await.unwrap().task_id).await,
+        "second"
     );
-    assert_eq!(select_endpoint(&available, None, Some("second")).unwrap().id, "second");
-    assert_eq!(select_endpoint(&available, None, None).unwrap().id, "first");
-    let missing = select_endpoint(&available, Some("missing"), None);
-    assert_eq!(missing.err().unwrap().code, "backend_unavailable");
+    assert_eq!(
+        selected_backend(enqueue("once", Some(SERVER)).await.unwrap().task_id).await,
+        SERVER
+    );
+    assert_eq!(
+        enqueue("foreign", Some("foreign")).await.err().unwrap().code,
+        "backend_unavailable"
+    );
+
+    sqlx::query("UPDATE mcp_servers SET enabled = 0 WHERE id = 'second'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        enqueue("disabled", None).await.err().unwrap().code,
+        "backend_unavailable"
+    );
+    assert_eq!(service.backends(USER).await.unwrap().len(), 1);
+
+    sqlx::query("UPDATE conversations SET extra = '{}' WHERE id = ?")
+        .bind(ORIGINAL)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE mcp_servers SET is_default = 0 WHERE id = ?")
+        .bind(SERVER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(enqueue("singleton", None).await.err().unwrap().code, "backend_required");
+
+    sqlx::query("UPDATE mcp_servers SET enabled = 1, is_default = 1 WHERE id = 'second'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let mut edit = request();
+    edit.tool_call_id = "edit".into();
+    edit.references.push(AsyncImageReference::Generated(original.task_id));
+    assert_eq!(
+        selected_backend(service.enqueue(edit).await.unwrap().task_id).await,
+        "second"
+    );
+    server.abort();
 }

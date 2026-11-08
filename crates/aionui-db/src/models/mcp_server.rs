@@ -38,3 +38,13 @@ pub struct McpServerRow {
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
+
+impl McpServerRow {
+    pub fn is_enabled_image_backend(&self) -> bool {
+        self.enabled
+            && !self.builtin
+            && self.deleted_at.is_none()
+            && self.purpose == "async_image"
+            && matches!(self.transport_type.as_str(), "http" | "streamable_http")
+    }
+}

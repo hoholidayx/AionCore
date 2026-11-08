@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
+use aionui_ai_agent::async_image::IMAGE_BACKEND_OVERRIDE_KEY;
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{
@@ -1088,6 +1089,8 @@ impl ConversationService {
                 reason: DEPRECATED_AGENT_TYPE_MESSAGE.into(),
             });
         }
+        self.validate_image_backend_override(user_id, &effective_type, &extra)
+            .await?;
 
         // Type-aware rule: top-level `model` is aionrs-only. Other agent types
         // carry model/mode via `extra` (see spec 2026-05-12). Reject early so
@@ -2335,6 +2338,8 @@ impl ConversationService {
         // Merge extra if provided. For aionrs, strip `extra.model` post-merge
         // so the row keeps a single canonical model source (top-level column).
         let merged_extra = if let Some(new_extra) = &req.extra {
+            self.validate_image_backend_override(user_id, &existing_type, new_extra)
+                .await?;
             let mut existing_extra: serde_json::Value =
                 serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
             merge_json(&mut existing_extra, new_extra);
@@ -2444,6 +2449,45 @@ impl ConversationService {
         self.broadcast_list_changed(user_id, id, "updated", response.source.as_ref());
 
         Ok(response)
+    }
+
+    async fn validate_image_backend_override(
+        &self,
+        user_id: &str,
+        agent_type: &AgentType,
+        extra: &serde_json::Value,
+    ) -> Result<(), ConversationError> {
+        let Some(value) = extra.get(IMAGE_BACKEND_OVERRIDE_KEY).filter(|value| !value.is_null()) else {
+            return Ok(());
+        };
+        if *agent_type != AgentType::Aionrs {
+            return Err(ConversationError::BadRequest {
+                reason: "extra.image_backend_id is only accepted for aionrs conversations".into(),
+            });
+        }
+        let id = value
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| ConversationError::BadRequest {
+                reason: "extra.image_backend_id must be a nonempty backend ID or null".into(),
+            })?;
+        let repo = self
+            .mcp_server_repo
+            .read()
+            .map_err(|_| ConversationError::internal("MCP server repository lock is poisoned"))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| ConversationError::internal("MCP server repository is unavailable"))?;
+        if !repo
+            .find_by_id(user_id, id)
+            .await?
+            .is_some_and(|row| row.is_enabled_image_backend())
+        {
+            return Err(ConversationError::BadRequest {
+                reason: "The selected image backend is unavailable".into(),
+            });
+        }
+        Ok(())
     }
 
     /// Merge a JSON patch into `conversation.extra` without touching model,
@@ -2838,6 +2882,7 @@ impl ConversationService {
         let mut extra: serde_json::Value = serde_json::from_str(&parent.extra)
             .map_err(|e| ConversationError::internal(format!("Invalid parent extra JSON: {e}")))?;
         if let Some(obj) = extra.as_object_mut() {
+            obj.remove(IMAGE_BACKEND_OVERRIDE_KEY);
             obj.insert(
                 "fork".to_owned(),
                 serde_json::to_value(aionui_api_types::ForkSpec {

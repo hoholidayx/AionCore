@@ -194,7 +194,10 @@ async fn model_receives_a_receipt_and_delayed_image_stays_in_its_original_conver
         StatusCode::CREATED,
     )
     .await;
-    let switched = post_json(&app, "/api/conversations", new_conversation, auth, StatusCode::CREATED).await;
+    let mut switched_request = new_conversation;
+    switched_request["extra"]["image_backend_id"] = json!(server_id);
+    let switched = post_json(&app, "/api/conversations", switched_request, auth, StatusCode::CREATED).await;
+    assert_eq!(switched["extra"]["image_backend_id"], server_id);
     let original = original["id"].as_str().unwrap();
     let switched = switched["id"].as_str().unwrap();
     post_json(
@@ -333,6 +336,54 @@ async fn model_receives_a_receipt_and_delayed_image_stays_in_its_original_conver
         &[json!({"request_id":task, "prompt":"Draw a small square"})]
     );
 
+    let second = post_json(
+        &app,
+        "/api/mcp/servers",
+        json!({"name":"another-image-fixture", "purpose":"async_image",
+               "transport":{"type":"http", "url":format!("{base_url}/mcp")}}),
+        auth,
+        StatusCode::CREATED,
+    )
+    .await;
+    let second_id = second["id"].as_str().unwrap();
+    let update_path = format!("/api/conversations/{original}");
+    let save_backend = |choice: Value| {
+        app.clone().oneshot(json_with_token(
+            "PATCH",
+            &update_path,
+            json!({"extra":{"image_backend_id":choice}}),
+            auth.0,
+            auth.1,
+        ))
+    };
+    let disabled = save_backend(json!(second_id)).await.unwrap();
+    assert_eq!(disabled.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        body_json(disabled)
+            .await
+            .to_string()
+            .contains("selected image backend is unavailable")
+    );
+    let invalid = save_backend(json!(true)).await.unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        body_json(invalid)
+            .await
+            .to_string()
+            .contains("must be a nonempty backend ID or null")
+    );
+    post_json(
+        &app,
+        &format!("/api/mcp/servers/{second_id}/toggle"),
+        json!({}),
+        auth,
+        StatusCode::OK,
+    )
+    .await;
+    let saved = save_backend(json!(second_id)).await.unwrap();
+    assert_eq!(saved.status(), StatusCode::OK);
+    assert_eq!(body_json(saved).await["data"]["extra"]["image_backend_id"], second_id);
+
     post_json(
         &app,
         &format!("/api/conversations/{original}/messages"),
@@ -355,6 +406,24 @@ async fn model_receives_a_receipt_and_delayed_image_stays_in_its_original_conver
     assert_eq!(edit["prompt"], "Make the square darker");
     assert_eq!(edit["images"], json!([PNG]));
     assert_ne!(edit["request_id"], task);
+    let edit_backend = sqlx::query_scalar::<_, String>("SELECT server_id FROM async_image_jobs WHERE task_id = ?")
+        .bind(edit["request_id"].as_str().unwrap())
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(edit_backend, second_id);
+    assert!(
+        upstream
+            .model_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(2)
+            .any(|request| request["tools"].to_string().contains(second_id))
+    );
+    let cleared = save_backend(Value::Null).await.unwrap();
+    assert_eq!(cleared.status(), StatusCode::OK);
+    assert!(body_json(cleared).await["data"]["extra"]["image_backend_id"].is_null());
     assert!(
         upstream
             .model_requests

@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::async_image::{
-    AsyncImageEndpoint, AsyncImageError, AsyncImageQueue, AsyncImageReference, AsyncImageRequest,
+    AsyncImageBackend, AsyncImageError, AsyncImageQueue, AsyncImageReference, AsyncImageRequest,
     IMAGE_REFERENCE_PREFIX, MAX_IMAGE_REFERENCES, TOOL_NAME,
 };
 
@@ -18,13 +18,13 @@ pub(crate) struct AsyncImageTool {
     queue: Arc<dyn AsyncImageQueue>,
     user_id: String,
     conversation_id: String,
-    endpoints: Vec<AsyncImageEndpoint>,
     turn: Arc<Mutex<Option<AttachmentTurn>>>,
 }
 
 struct AttachmentTurn {
     id: String,
     files: Vec<String>,
+    backends: Vec<AsyncImageBackend>,
 }
 
 pub(super) struct AttachmentTurnGuard(Arc<Mutex<Option<AttachmentTurn>>>);
@@ -49,29 +49,37 @@ struct GenerateArgs {
 }
 
 impl AsyncImageTool {
-    pub(crate) fn new(
-        queue: Arc<dyn AsyncImageQueue>,
-        user_id: String,
-        conversation_id: String,
-        endpoints: Vec<AsyncImageEndpoint>,
-    ) -> Self {
+    pub(crate) fn new(queue: Arc<dyn AsyncImageQueue>, user_id: String, conversation_id: String) -> Self {
         Self {
             queue,
             user_id,
             conversation_id,
-            endpoints,
             turn: Arc::new(Mutex::new(None)),
         }
     }
 
-    pub(super) fn begin_turn(&self, id: &str, files: &[String], blocks: &mut Vec<ContentBlock>) -> AttachmentTurnGuard {
+    pub(super) async fn begin_turn(
+        &self,
+        id: &str,
+        files: &[String],
+        blocks: &mut Vec<ContentBlock>,
+    ) -> AttachmentTurnGuard {
+        let backends = match self.queue.backends(&self.user_id).await {
+            Ok(backends) => backends,
+            Err(error) => {
+                tracing::warn!(conversation_id = %self.conversation_id, code = error.code, "Could not load image backends");
+                Vec::new()
+            }
+        };
+        let has_backends = !backends.is_empty();
         if let Ok(mut turn) = self.turn.lock() {
             *turn = Some(AttachmentTurn {
                 id: id.to_owned(),
                 files: files.to_vec(),
+                backends,
             });
         }
-        if !files.is_empty() {
+        if has_backends && !files.is_empty() {
             let labels = files
                 .iter()
                 .enumerate()
@@ -135,7 +143,6 @@ impl AsyncImageTool {
             requested_server_id: args.backend,
             size: args.size,
             preset: args.preset,
-            available: self.endpoints.clone(),
             references,
         })
     }
@@ -153,10 +160,26 @@ impl Tool for AsyncImageTool {
 
     fn input_schema(&self) -> JsonSchema {
         let endpoints = self
-            .endpoints
-            .iter()
-            .map(|entry| format!("{}: {}", entry.id, entry.name))
-            .collect::<Vec<_>>();
+            .turn
+            .lock()
+            .ok()
+            .and_then(|turn| {
+                turn.as_ref().map(|turn| {
+                    turn.backends
+                        .iter()
+                        .map(|entry| {
+                            let editing = match entry.supports_edit {
+                                Some(true) => " (supports editing)",
+                                Some(false) => " (generation only)",
+                                None => "",
+                            };
+                            format!("{}: {}{editing}", entry.id, entry.name)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+            })
+            .unwrap_or_default();
         json!({
             "type": "object",
             "required": ["prompt"],
@@ -167,7 +190,7 @@ impl Tool for AsyncImageTool {
                 "preset": {"type": "string", "enum": ["fast", "quality"], "description": "Optional speed or quality preference."},
                 "references": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_IMAGE_REFERENCES,
                                "description": "Ordered attachment references from this turn or a previous image receipt."},
-                "backend": {"type": "string", "description": format!("Optional image endpoint ID. Available endpoints: {}", endpoints.join(", "))}
+                "backend": {"type": "string", "description": format!("Image backend ID. Set only when the user explicitly names a backend for this task; otherwise omit to use the conversation or account selection. Available backends: {endpoints}")}
             }
         })
     }
