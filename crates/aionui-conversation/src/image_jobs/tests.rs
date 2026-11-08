@@ -29,6 +29,7 @@ struct MockBackend {
     lost_reply: AtomicBool,
     complete: AtomicBool,
     invalid_pixels: AtomicBool,
+    provider_quota: AtomicBool,
     requests: Mutex<Vec<Value>>,
 }
 
@@ -79,7 +80,15 @@ async fn mcp(AxumState(state): AxumState<Arc<MockBackend>>, Json(body): Json<Val
                         .unwrap()
                         .iter()
                         .any(|request| request["request_id"] == args["task_id"]);
-                    if received {
+                    if received && state.provider_quota.load(Ordering::SeqCst) {
+                        structured(
+                            json!({
+                                "task_id": args["task_id"], "state": "failed", "error_code": "provider_quota",
+                                "message": "raw private provider error"
+                            }),
+                            false,
+                        )
+                    } else if received {
                         let status = if state.complete.load(Ordering::SeqCst) {
                             "completed"
                         } else {
@@ -414,6 +423,40 @@ async fn matching_metadata_with_invalid_pixels_fails_without_an_attachment() {
             .code,
         "attachment_not_found"
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn provider_failure_reason_reaches_the_original_conversation_without_the_raw_message() {
+    let (url, backend, server) = serve_backend().await;
+    let db = database(&url).await;
+    let events = Arc::new(BroadcastEventBus::new(16));
+    let mut messages = events.subscribe();
+    let service = jobs(&db, events);
+    service.enqueue(request()).await.unwrap();
+    backend.provider_quota.store(true, Ordering::SeqCst);
+    tick(&service, &db).await;
+    tick(&service, &db).await;
+
+    let content: String =
+        sqlx::query_scalar("SELECT content FROM messages WHERE conversation_id = ? AND type = 'acp_tool_call'")
+            .bind(ORIGINAL)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(!content.contains("raw private provider error"));
+    let content: Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(content["update"]["status"], "failed");
+    assert_eq!(
+        content["update"]["raw_output"]["async_image"]["error_code"],
+        "provider_quota"
+    );
+    let mut last = messages.try_recv().unwrap();
+    while let Ok(message) = messages.try_recv() {
+        last = message;
+    }
+    assert_eq!(last.data["conversation_id"], ORIGINAL);
+    assert_eq!(last.data["data"]["update"], content["update"]);
     server.abort();
 }
 

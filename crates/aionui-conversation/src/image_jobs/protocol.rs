@@ -118,13 +118,8 @@ impl ImageJobClient {
             return Err(match code {
                 Some("task_not_found") => BackendError::TaskNotFound,
                 Some("result_not_ready") => BackendError::ResultNotReady,
-                Some("result_expired") => BackendError::Rejected("result_expired"),
-                Some("request_conflict") => BackendError::Rejected("request_conflict"),
-                Some("invalid_request") => BackendError::Rejected("invalid_request"),
-                Some("queue_full") => BackendError::Rejected("queue_full"),
-                Some("backend_unavailable") => BackendError::Rejected("backend_unavailable"),
                 Some("worker_unavailable") => BackendError::Transient,
-                _ => BackendError::Rejected("backend_rejected"),
+                _ => BackendError::Rejected(known_failure_code(code).unwrap_or("backend_rejected")),
             });
         }
         Ok(result)
@@ -134,6 +129,7 @@ impl ImageJobClient {
 fn transport_error(error: McpError) -> BackendError {
     match error {
         McpError::HttpStatus { status: 300..=399, .. } => BackendError::Rejected("backend_redirected"),
+        McpError::HttpStatus { status: 401 | 403, .. } => BackendError::Rejected("backend_auth"),
         _ => BackendError::Transient,
     }
 }
@@ -157,16 +153,36 @@ fn read_state(result: McpToolResult, expected_id: &str) -> Result<RemoteState, B
         Some("completed") => Ok(RemoteState::Completed),
         Some("expired") => Ok(RemoteState::Failed("result_expired")),
         Some("failed") => Ok(RemoteState::Failed(
-            match fields.get("error_code").and_then(Value::as_str) {
-                Some("backend_unavailable") => "backend_unavailable",
-                Some("output_unavailable") => "output_unavailable",
-                Some("output_invalid") => "output_invalid",
-                Some("interrupted_by_restart") => "interrupted_by_restart",
-                _ => "generation_failed",
-            },
+            known_failure_code(fields.get("error_code").and_then(Value::as_str)).unwrap_or("generation_failed"),
         )),
         _ => Err(BackendError::InvalidResult),
     }
+}
+
+fn known_failure_code(code: Option<&str>) -> Option<&'static str> {
+    const CODES: &[&str] = &[
+        "backend_redirected",
+        "backend_unavailable",
+        "edit_unsupported",
+        "generation_failed",
+        "interrupted_by_restart",
+        "invalid_request",
+        "invalid_size",
+        "output_invalid",
+        "output_source_denied",
+        "output_unavailable",
+        "provider_auth",
+        "provider_model_unavailable",
+        "provider_policy",
+        "provider_quota",
+        "provider_rate_limited",
+        "provider_request_rejected",
+        "queue_full",
+        "request_conflict",
+        "result_expired",
+    ];
+    let code = code?;
+    CODES.iter().copied().find(|known| *known == code)
 }
 
 fn verified_image(result: McpToolResult, expected_id: &str) -> Result<Vec<u8>, BackendError> {
