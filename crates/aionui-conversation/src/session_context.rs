@@ -10,7 +10,7 @@ use aionui_ai_agent::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, Pe
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra, TeamSessionBinding};
 use aionui_common::{AgentType, WorkspacePathValidationError, validate_workspace_path_availability};
-use aionui_db::models::ConversationRow;
+use aionui_db::models::{ConversationAssistantSnapshotRow, ConversationRow};
 use aionui_db::{IAcpSessionRepository, IAgentMetadataRepository};
 use chrono::Datelike;
 use tracing::{debug, info, warn};
@@ -21,6 +21,23 @@ use crate::task_options::provider_model_from_conversation_row;
 
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
+
+/// Prefer the persisted binding, falling back to the identity of older conversations.
+pub(crate) fn conversation_assistant_id<'a>(
+    snapshot: Option<&'a ConversationAssistantSnapshotRow>,
+    extra: &'a serde_json::Value,
+) -> Option<&'a str> {
+    snapshot.map(|row| row.assistant_id.as_str()).or_else(|| {
+        [
+            extra.pointer("/assistant_snapshot/assistant_id"),
+            extra.get("assistant_id"),
+            extra.get("preset_assistant_id"),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(serde_json::Value::as_str)
+    })
+}
 
 pub(crate) struct SessionContextBuilder<'a> {
     workspace_root: &'a Path,

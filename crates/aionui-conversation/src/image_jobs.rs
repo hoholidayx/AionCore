@@ -13,8 +13,8 @@ use aionui_ai_agent::async_image::{
 use aionui_api_types::McpToolResponse;
 use aionui_common::{TimestampMs, now_ms};
 use aionui_db::models::{
-    AsyncImageJobKey, AsyncImageJobReceiptRow, AsyncImageJobState as State, ClaimedAsyncImageJob,
-    ConversationAssistantSnapshotRow, ConversationRow, McpServerRow, MessageRow, NewAsyncImageJob,
+    AsyncImageJobKey, AsyncImageJobReceiptRow, AsyncImageJobState as State, ClaimedAsyncImageJob, ConversationRow,
+    McpServerRow, MessageRow, NewAsyncImageJob,
 };
 use aionui_db::{
     AsyncImageJobUpdate, DbError, IAssistantDefinitionRepository, IAsyncImageJobRepository, IConversationRepository,
@@ -29,6 +29,7 @@ use tokio::sync::{Notify, watch};
 use uuid::Uuid;
 
 use crate::message_persistence::persisted_message_stream;
+use crate::session_context::conversation_assistant_id;
 
 use self::clients::{EndpointKey, ImageJobClients};
 use self::protocol::{
@@ -96,7 +97,7 @@ impl AsyncImageJobs {
         let allowed = image_backend_ids_for_assistant(
             Some(self.assistant_repo.as_ref()),
             &conversation.user_id,
-            image_assistant_id(snapshot.as_ref(), extra),
+            conversation_assistant_id(snapshot.as_ref(), extra),
         )
         .await
         .map_err(database_error)?;
@@ -439,22 +440,6 @@ impl AsyncImageQueue for AsyncImageJobs {
     }
 }
 
-pub(crate) fn image_assistant_id<'a>(
-    snapshot: Option<&'a ConversationAssistantSnapshotRow>,
-    extra: &'a Value,
-) -> Option<&'a str> {
-    snapshot.map(|row| row.assistant_id.as_str()).or_else(|| {
-        [
-            extra.pointer("/assistant_snapshot/assistant_id"),
-            extra.get("assistant_id"),
-            extra.get("preset_assistant_id"),
-        ]
-        .into_iter()
-        .flatten()
-        .find_map(Value::as_str)
-    })
-}
-
 /// Absent IDs inherit the account catalog. An empty list permits no image backend.
 pub(crate) async fn image_backend_ids_for_assistant(
     repo: Option<&dyn IAssistantDefinitionRepository>,
@@ -465,7 +450,9 @@ pub(crate) async fn image_backend_ids_for_assistant(
         return Ok(None);
     };
     let Some(definition) = repo.get_by_assistant_id_for_user(user_id, assistant_id).await? else {
-        return Ok(None);
+        // A conversation bound to a removed assistant must not gain access to
+        // backends that the assistant may have previously excluded.
+        return Ok(Some(Vec::new()));
     };
     if !definition.async_image_enabled {
         return Ok(Some(Vec::new()));
@@ -483,23 +470,26 @@ pub(crate) fn image_backend_allowed(row: &McpServerRow, allowed: Option<&[String
 }
 
 fn select_backend<'a>(
-    available: &'a [McpServerRow],
+    allowed: &'a [McpServerRow],
     explicit: Option<&str>,
 ) -> Result<&'a McpServerRow, AsyncImageError> {
-    let mut enabled = available.iter().filter(|row| row.is_enabled_image_backend());
     if let Some(explicit) = explicit {
-        return enabled.find(|server| server.id == explicit).ok_or_else(|| {
+        return allowed.iter().find(|server| server.id == explicit).ok_or_else(|| {
             AsyncImageError::new(
                 "backend_unavailable",
                 "The selected image backend is unavailable. Choose another backend.",
             )
         });
     }
-    enabled.find(|server| server.is_default).ok_or_else(|| {
-        AsyncImageError::new(
-            "backend_required",
-            "Select an image backend or configure a global default.",
-        )
+    allowed.iter().find(|server| server.is_default).ok_or_else(|| {
+        if allowed.is_empty() {
+            AsyncImageError::new("backend_unavailable", "No asynchronous image backend is available")
+        } else {
+            AsyncImageError::new(
+                "backend_required",
+                "Select an image backend or configure a global default.",
+            )
+        }
     })
 }
 

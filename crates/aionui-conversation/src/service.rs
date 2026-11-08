@@ -11,7 +11,7 @@ use aionui_ai_agent::{
     RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
 };
 
-use crate::image_jobs::{image_assistant_id, image_backend_allowed, image_backend_ids_for_assistant};
+use crate::image_jobs::{image_backend_allowed, image_backend_ids_for_assistant};
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
 use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
@@ -60,7 +60,7 @@ use crate::convert::{
     row_to_message_response_compact, row_to_response, row_to_response_with_extra, search_row_to_item, string_to_enum,
 };
 use crate::error::ConversationError;
-use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder};
+use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder, conversation_assistant_id};
 use crate::session_mentions;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
@@ -1094,7 +1094,9 @@ impl ConversationService {
             user_id,
             &effective_type,
             &extra,
-            assistant_id.as_deref().or_else(|| image_assistant_id(None, &extra)),
+            assistant_id
+                .as_deref()
+                .or_else(|| conversation_assistant_id(None, &extra)),
         )
         .await?;
 
@@ -2036,26 +2038,11 @@ impl ConversationService {
                 .map_err(|e| {
                     ConversationError::internal(format!("Invalid assistant snapshot for preference sync: {e}"))
                 })?;
-            let assistant_id = legacy_snapshot
-                .as_ref()
-                .map(|value| value.assistant_id.clone())
-                .or_else(|| {
-                    extra
-                        .get("assistant_id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToOwned::to_owned)
-                })
-                .or_else(|| {
-                    extra
-                        .get("preset_assistant_id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToOwned::to_owned)
-                });
-            let Some(assistant_id) = assistant_id else {
+            let Some(assistant_id) = conversation_assistant_id(None, &extra) else {
                 return Ok(());
             };
             let Some(definition) = definition_repo
-                .get_by_assistant_id_for_user(user_id, &assistant_id)
+                .get_by_assistant_id_for_user(user_id, assistant_id)
                 .await
                 .map_err(|e| ConversationError::internal(format!("assistant definition lookup failed: {e}")))?
             else {
@@ -2346,20 +2333,30 @@ impl ConversationService {
         let merged_extra = if let Some(new_extra) = &req.extra {
             let mut existing_extra: serde_json::Value =
                 serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
-            if new_extra
-                .get(IMAGE_BACKEND_OVERRIDE_KEY)
-                .is_some_and(|value| !value.is_null())
-            {
-                let snapshot = self.conversation_repo.get_assistant_snapshot(user_id, id).await?;
-                self.validate_image_backend_override(
-                    user_id,
-                    &existing_type,
-                    new_extra,
-                    image_assistant_id(snapshot.as_ref(), &existing_extra),
-                )
-                .await?;
-            }
+            let previous_assistant = conversation_assistant_id(None, &existing_extra).map(str::to_owned);
             merge_json(&mut existing_extra, new_extra);
+            let assistant_changed = existing_type == AgentType::Aionrs
+                && previous_assistant.as_deref() != conversation_assistant_id(None, &existing_extra);
+            let selects_image_backend = new_extra
+                .get(IMAGE_BACKEND_OVERRIDE_KEY)
+                .is_some_and(|value| !value.is_null());
+            if assistant_changed || selects_image_backend {
+                let snapshot = self.conversation_repo.get_assistant_snapshot(user_id, id).await?;
+                if assistant_changed && snapshot.is_none() {
+                    return Err(ConversationError::BadRequest {
+                        reason: "The conversation's assistant binding cannot be changed".into(),
+                    });
+                }
+                if selects_image_backend {
+                    self.validate_image_backend_override(
+                        user_id,
+                        &existing_type,
+                        new_extra,
+                        conversation_assistant_id(snapshot.as_ref(), &existing_extra),
+                    )
+                    .await?;
+                }
+            }
             strip_request_owner_user_id(&mut existing_extra);
             if existing_type == AgentType::Aionrs
                 && let Some(obj) = existing_extra.as_object_mut()
@@ -4858,7 +4855,7 @@ impl ConversationService {
         let allowed = image_backend_ids_for_assistant(
             self.assistant_definition_repo().as_deref(),
             &row.user_id,
-            image_assistant_id(snapshot, &extra),
+            conversation_assistant_id(snapshot, &extra),
         )
         .await?;
         if allowed.as_ref().is_some_and(Vec::is_empty) {

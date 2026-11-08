@@ -531,3 +531,122 @@ async fn model_receives_a_receipt_and_delayed_image_stays_in_its_original_conver
     worker.await.unwrap();
     upstream_task.abort();
 }
+
+#[tokio::test]
+async fn legacy_conversation_cannot_gain_image_backends_by_changing_or_deleting_its_assistant() {
+    let (mut app, services) = common::build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let auth = (token.as_str(), csrf.as_str());
+    let backends = post_json(
+        &app,
+        "/api/mcp/servers/import",
+        json!({"servers":[{
+            "name":"image-fixture","purpose":"async_image","enabled":true,
+            "transport":{"type":"http","url":"https://image.example.test/mcp"}
+        }]}),
+        auth,
+        StatusCode::OK,
+    )
+    .await;
+    let backend_id = backends[0]["id"].as_str().unwrap();
+    let assistant = post_json(
+        &app,
+        "/api/assistants",
+        json!({
+            "id":"legacy-image-assistant", "name":"Restricted assistant", "agent_id":"632f31d2",
+            "defaults":{"async_image_backend_ids":[]}
+        }),
+        auth,
+        StatusCode::CREATED,
+    )
+    .await;
+    let assistant_id = assistant["id"].as_str().unwrap();
+    let conversation = post_json(
+        &app,
+        "/api/conversations",
+        json!({"type":"aionrs","name":"Legacy image test","extra":{}}),
+        auth,
+        StatusCode::CREATED,
+    )
+    .await;
+    let conversation_id = conversation["id"].as_str().unwrap();
+    let conversation_path = format!("/api/conversations/{conversation_id}");
+    let user = services.user_repo.find_by_username("admin").await.unwrap().unwrap();
+    assert_eq!(
+        services
+            .async_image_jobs
+            .backends(&user.id, conversation_id)
+            .await
+            .unwrap()[0]
+            .id,
+        backend_id,
+    );
+
+    // Simulate a historical row created before assistants had a dedicated snapshot.
+    sqlx::query("UPDATE conversations SET extra = json_set(extra, '$.preset_assistant_id', ?) WHERE id = ?")
+        .bind(assistant_id)
+        .bind(conversation_id)
+        .execute(services.database.pool())
+        .await
+        .unwrap();
+    for patch in [
+        json!({"preset_assistant_id":null}),
+        json!({"assistant_id":"different-assistant"}),
+        json!({"assistant_snapshot":{"assistant_id":"different-assistant"}}),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_with_token(
+                "PATCH",
+                &conversation_path,
+                json!({"extra":patch}),
+                auth.0,
+                auth.1,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(response).await["error"],
+            "The conversation's assistant binding cannot be changed"
+        );
+    }
+
+    let delete_assistant = app
+        .clone()
+        .oneshot(json_with_token(
+            "DELETE",
+            &format!("/api/assistants/{assistant_id}"),
+            Value::Null,
+            auth.0,
+            auth.1,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_assistant.status(), StatusCode::OK);
+    assert!(
+        services
+            .async_image_jobs
+            .backends(&user.id, conversation_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let denied = services
+        .async_image_jobs
+        .enqueue(AsyncImageRequest {
+            user_id: user.id,
+            conversation_id: conversation_id.into(),
+            turn_id: "legacy-image-turn".into(),
+            tool_call_id: "legacy-image-call".into(),
+            prompt: "Draw a small square.".into(),
+            requested_server_id: Some(backend_id.into()),
+            size: None,
+            preset: None,
+            references: Vec::new(),
+        })
+        .await
+        .err()
+        .expect("an orphaned assistant binding cannot authorize image generation");
+    assert_eq!(denied.code, "backend_unavailable");
+}
