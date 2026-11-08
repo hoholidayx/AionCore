@@ -5,9 +5,11 @@ use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aion_config::config::{McpServerConfig, TransportType};
+use aion_mcp::{manager::McpManager, transport::McpError};
 use aionui_api_types::{
-    McpConnectionTestErrorCode, McpConnectionTestResult, RuntimeFailureKind, RuntimeResourceKind, RuntimeStatusPayload,
-    RuntimeStatusPhase, RuntimeStatusScope, RuntimeStatusScopeKind, WebSocketMessage,
+    McpConnectionTestErrorCode, McpConnectionTestResult, McpToolResponse, RuntimeFailureKind, RuntimeResourceKind,
+    RuntimeStatusPayload, RuntimeStatusPhase, RuntimeStatusScope, RuntimeStatusScopeKind, WebSocketMessage,
 };
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::{
@@ -92,6 +94,79 @@ impl McpConnectionTestService {
         };
         log_mcp_transport_result(mcp_server_id, transport_type, &result);
         result
+    }
+
+    /// Use the worker's pinned discovery for async image configuration checks.
+    pub async fn test_async_image_connection(
+        &self,
+        name: &str,
+        transport: &McpServerTransport,
+    ) -> McpConnectionTestResult {
+        let McpServerTransport::Http { url, headers } = transport else {
+            return error_result(
+                McpConnectionTestErrorCode::ProtocolError,
+                "Asynchronous image generation requires Streamable HTTP".into(),
+                None,
+            );
+        };
+        let config = McpServerConfig {
+            transport: TransportType::StreamableHttp,
+            command: None,
+            args: None,
+            env: None,
+            url: Some(url.clone()),
+            headers: Some(headers.clone()),
+            deferred: None,
+            // The outer timeout provides the Settings-specific diagnostic.
+            startup_timeout_ms: Some((self.timeout + Duration::from_secs(1)).as_millis() as u64),
+        };
+        let manager = match tokio::time::timeout(self.timeout, McpManager::connect_pinned_http(name, &config)).await {
+            Ok(Ok(manager)) => manager,
+            Err(_) => return timeout_result(self.timeout),
+            Ok(Err(McpError::HttpStatus {
+                status: 401,
+                www_authenticate,
+            })) => {
+                let mut headers = reqwest::header::HeaderMap::new();
+                if let Some(value) = www_authenticate.and_then(|value| value.parse().ok()) {
+                    headers.insert(reqwest::header::WWW_AUTHENTICATE, value);
+                }
+                return protocol::auth_result(&headers);
+            }
+            Ok(Err(McpError::HttpStatus { status, .. })) => {
+                let message = if (300..400).contains(&status) {
+                    "The asynchronous image endpoint returned a redirect. Use its final URL.".into()
+                } else {
+                    format!("HTTP {status} from asynchronous image endpoint")
+                };
+                return error_result(McpConnectionTestErrorCode::HttpError, message, None);
+            }
+            Ok(Err(McpError::InitFailed(_) | McpError::JsonRpc { .. })) => {
+                return error_result(
+                    McpConnectionTestErrorCode::ProtocolError,
+                    "The asynchronous image endpoint could not complete tool discovery".into(),
+                    None,
+                );
+            }
+            Ok(Err(_)) => {
+                return error_result(
+                    McpConnectionTestErrorCode::ConnectionFailed,
+                    "Could not connect to the asynchronous image endpoint".into(),
+                    None,
+                );
+            }
+        };
+        let tools = manager
+            .all_tools()
+            .into_iter()
+            .map(|(_, tool)| McpToolResponse {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                input_schema: Some(tool.input_schema.clone()),
+            })
+            .collect();
+        manager.shutdown().await;
+        protocol::discovered_tools_result(tools)
     }
 
     // -- Stdio transport --------------------------------------------------

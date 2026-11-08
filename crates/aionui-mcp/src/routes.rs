@@ -206,27 +206,33 @@ async fn test_connection(
         (None, None) => McpServerPurpose::General,
     };
     let transport = McpServerTransport::from(req.transport);
-    let mut result = state
-        .connection_test_service
-        .test_connection_with_runtime_scope(
-            &req.name,
-            &transport,
-            Some(&user.id),
-            req.runtime_scope_id.as_deref().or(req.id.as_deref()),
-        )
-        .await;
+    let mut result = if purpose == McpServerPurpose::AsyncImage {
+        state
+            .connection_test_service
+            .test_async_image_connection(&req.name, &transport)
+            .await
+    } else {
+        state
+            .connection_test_service
+            .test_connection_with_runtime_scope(
+                &req.name,
+                &transport,
+                Some(&user.id),
+                req.runtime_scope_id.as_deref().or(req.id.as_deref()),
+            )
+            .await
+    };
     if purpose == McpServerPurpose::AsyncImage
         && result.success
-        && (transport.transport_type() != "http"
-            || !ASYNC_IMAGE_TOOLS.iter().all(|(name, _)| {
-                result.tools.iter().flatten().any(|tool| {
-                    tool.name == *name
-                        && tool
-                            .input_schema
-                            .as_ref()
-                            .is_some_and(|schema| async_image_schema_matches(name, schema))
-                })
-            }))
+        && !ASYNC_IMAGE_TOOLS.iter().all(|(name, _)| {
+            result.tools.iter().flatten().any(|tool| {
+                tool.name == *name
+                    && tool
+                        .input_schema
+                        .as_ref()
+                        .is_some_and(|schema| async_image_schema_matches(name, schema))
+            })
+        })
     {
         result.success = false;
         result.error = Some("The server does not support the image_jobs_v1 contract".into());

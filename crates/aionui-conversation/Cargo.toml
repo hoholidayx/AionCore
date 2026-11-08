@@ -20,6 +20,8 @@ axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
 crc32fast.workspace = true
+futures-util.workspace = true
+png.workspace = true
 regex.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -43,5 +45,4 @@ aionui-ai-agent = { workspace = true, features = ["test-support"] }
 # `AgentInstance::Session` over a fake `SessionBackend`, so they need the session
 # crate's trait + test doubles. Dev-only; never shipped.
 aionui-session = { workspace = true, features = ["test-support"] }
-futures-util = { workspace = true }
 async-trait.workspace = true

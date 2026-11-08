@@ -262,6 +262,7 @@ impl AionrsAgentManager {
 
         let mut bootstrap = AgentBootstrap::new(config, &workspace, sink)
             .runtime_env(runtime_env)
+            .pin_mcp_http_servers(image_exclusions.keys().cloned().collect())
             .exclude_mcp_tools(image_exclusions);
         if let Some(tool) = &async_image {
             bootstrap = bootstrap.host_tool(Box::new(tool.clone()));

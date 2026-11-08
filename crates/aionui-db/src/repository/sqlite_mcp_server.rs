@@ -177,6 +177,9 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
             .await?
             .ok_or_else(|| DbError::NotFound(format!("MCP server '{id}' not found")))?;
 
+        let changes_image_purpose = params.purpose.is_some_and(|purpose| {
+            purpose != existing.purpose && (purpose == "async_image" || existing.purpose == "async_image")
+        });
         let merged = merge_update(existing, params);
         if merged.is_default {
             clear_default(&mut tx, user_id, id).await?;
@@ -212,27 +215,35 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
             _ => DbError::Query(e),
         })?;
 
+        if changes_image_purpose {
+            remove_image_snapshots(&mut tx, user_id, id).await?;
+        }
         tx.commit().await?;
         Ok(merged)
     }
 
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
         let now = aionui_common::now_ms();
-        let result = sqlx::query(
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let purpose = sqlx::query_scalar::<_, String>(
             "UPDATE mcp_servers SET enabled = 0, is_default = 0, deleted_at = ?, updated_at = ? \
-             WHERE user_id = ? AND id = ? AND deleted_at IS NULL",
+             WHERE user_id = ? AND id = ? AND deleted_at IS NULL RETURNING purpose",
         )
         .bind(now)
         .bind(now)
         .bind(user_id)
         .bind(id)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
 
-        if result.rows_affected() == 0 {
+        let Some(purpose) = purpose else {
             return Err(DbError::NotFound(format!("MCP server '{id}' not found")));
+        };
+        if purpose == "async_image" {
+            remove_image_snapshots(&mut tx, user_id, id).await?;
         }
 
+        tx.commit().await?;
         Ok(())
     }
 
@@ -325,6 +336,38 @@ async fn clear_default(connection: &mut sqlx::SqliteConnection, user_id: &str, i
         .bind(id)
         .execute(connection)
         .await?;
+    Ok(())
+}
+
+async fn remove_image_snapshots(
+    connection: &mut sqlx::SqliteConnection,
+    user_id: &str,
+    id: &str,
+) -> Result<(), DbError> {
+    // Older clients saved raw connections alongside IDs. Remove only this
+    // server's copied configuration so an upsert under a new purpose cannot
+    // make its previous address or credentials active again.
+    sqlx::query(
+        "UPDATE conversations
+         SET extra = json_set(extra, '$.session_mcp_servers', (
+             SELECT json_group_array(json(conversations.extra -> snapshot.fullkey))
+             FROM json_each(conversations.extra, '$.session_mcp_servers') AS snapshot
+             WHERE json_extract(conversations.extra, snapshot.fullkey || '.id') IS NOT ?
+         ))
+         WHERE user_id = ?
+           AND CASE WHEN json_valid(extra) THEN json_type(extra, '$.session_mcp_servers') = 'array' ELSE 0 END
+           AND EXISTS (
+               SELECT 1 FROM json_each(
+                   CASE WHEN json_valid(extra) THEN extra ELSE '{}' END, '$.session_mcp_servers'
+               ) AS snapshot
+               WHERE json_extract(conversations.extra, snapshot.fullkey || '.id') = ?
+           )",
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(id)
+    .execute(connection)
+    .await?;
     Ok(())
 }
 
@@ -474,6 +517,62 @@ mod tests {
             .await
             .unwrap();
         assert!(!demoted.is_default);
+    }
+
+    #[tokio::test]
+    async fn deleting_async_endpoint_strips_its_saved_transport_before_reuse_as_general() {
+        let (repo, db) = setup().await;
+        let server = repo
+            .create(CreateMcpServerParams {
+                purpose: Some("async_image"),
+                ..http_params()
+            })
+            .await
+            .unwrap();
+        let ordinary = serde_json::json!({
+            "id":"ordinary", "name":"ordinary",
+            "transport":{"type":"http", "url":"https://ordinary.example/mcp"}
+        });
+        let extra = serde_json::json!({
+            "mcp_server_ids":[server.id],
+            "session_mcp_servers":[ordinary, {"id":server.id,"transport":{"url":"https://previous.example/mcp"}}],
+            "workspace":"/example"
+        });
+        sqlx::query(
+            "INSERT INTO conversations (id,user_id,name,type,extra,created_at,updated_at)
+             VALUES ('old-conversation',?,'Example','aionrs',?,0,0)",
+        )
+        .bind(USER_A)
+        .bind(extra.to_string())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        repo.delete(USER_A, &server.id).await.unwrap();
+        let saved: String = sqlx::query_scalar("SELECT extra FROM conversations WHERE id = 'old-conversation'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(saved["session_mcp_servers"], serde_json::json!([ordinary]));
+        assert_eq!(saved["mcp_server_ids"], serde_json::json!([server.id]));
+        assert_eq!(saved["workspace"], "/example");
+
+        let revived = repo
+            .update(
+                USER_A,
+                &server.id,
+                UpdateMcpServerParams {
+                    purpose: Some("general"),
+                    transport_config: Some(r#"{"url":"https://replacement.example/mcp"}"#),
+                    deleted_at: Some(None),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(revived.id, server.id);
+        assert_eq!(revived.purpose, "general");
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@
 //! wire shape. Same row-walking + selection + stdio-launch-resolution logic as
 //! the legacy ACP path, but vendor-neutral.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use aionui_api_types::{SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME};
@@ -20,6 +21,37 @@ use aionui_db::models::McpServerRow;
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::ensure_runtime_command;
 use tracing::{info, warn};
+
+/// Keep host-managed servers out of inline snapshots, including snapshots
+/// saved before the host began storing only their repository IDs.
+pub async fn filter_inline_mcp_servers<'a>(
+    repo: Option<&dyn IMcpServerRepository>,
+    user_id: &str,
+    snapshots: &'a [SessionMcpServer],
+) -> Vec<&'a SessionMcpServer> {
+    let Some(repo) = repo.filter(|_| !snapshots.is_empty()) else {
+        return snapshots.iter().collect();
+    };
+    let ids = snapshots.iter().map(|server| server.id.clone()).collect::<Vec<_>>();
+    // Include tombstones so removing a server cannot revive its old credentials
+    // or make its host-managed protocol tools available as ordinary tools.
+    let rows = match repo.list_by_ids_any(user_id, &ids).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            warn!(%user_id, %error, "MCP snapshot validation failed; skipping inline MCP servers");
+            return Vec::new();
+        }
+    };
+    let host_managed = rows
+        .iter()
+        .filter(|row| row.purpose == "async_image")
+        .map(|row| row.id.as_str())
+        .collect::<HashSet<_>>();
+    snapshots
+        .iter()
+        .filter(|server| !host_managed.contains(server.id.as_str()))
+        .collect()
+}
 
 /// Resolve a conversation's user-configured MCP servers into neutral
 /// [`SessionMcpServer`]s. `selected_ids = Some` → that frozen snapshot defines the
@@ -284,6 +316,34 @@ mod tests {
 
     fn test_broadcaster() -> Arc<dyn EventBroadcaster> {
         Arc::new(aionui_realtime::BroadcastEventBus::new(16))
+    }
+
+    #[tokio::test]
+    async fn inline_snapshots_cannot_restore_active_or_deleted_host_managed_servers() {
+        let active = McpServerRow {
+            purpose: "async_image".into(),
+            ..make_row("active", true)
+        };
+        let deleted = McpServerRow {
+            purpose: "async_image".into(),
+            deleted_at: Some(1),
+            ..make_row("deleted", false)
+        };
+        let ordinary = make_row("ordinary", true);
+        let snapshots = [&active, &deleted, &ordinary].map(|row| SessionMcpServer {
+            id: row.id.clone(),
+            name: format!("snapshot-{}", row.name),
+            transport: SessionMcpTransport::Http {
+                url: "https://example.test/mcp".into(),
+                headers: Default::default(),
+            },
+        });
+        let repo = MockRepo {
+            rows: vec![active, deleted, ordinary],
+            fail: false,
+        };
+        let result = filter_inline_mcp_servers(Some(&repo), TEST_USER_ID, &snapshots).await;
+        assert_eq!(result, [&snapshots[2]]);
     }
 
     #[tokio::test]

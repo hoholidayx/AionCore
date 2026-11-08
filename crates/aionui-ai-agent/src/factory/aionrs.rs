@@ -116,9 +116,15 @@ pub(super) async fn build(
         }
         image_endpoints = endpoints;
     }
+    let session_snapshots = crate::mcp_resolve::filter_inline_mcp_servers(
+        deps.mcp_server_repo.as_deref(),
+        &ctx.user_id,
+        &overrides.session_mcp_servers,
+    )
+    .await;
     merge_session_snapshot_mcp_servers(
         &mut extra_mcp_servers,
-        &overrides.session_mcp_servers,
+        session_snapshots,
         &ctx.user_id,
         &ctx.conversation_id,
         deps.broadcaster.clone(),
@@ -857,9 +863,9 @@ async fn session_server_to_mcp_server_config(
     }
 }
 
-async fn merge_session_snapshot_mcp_servers(
+async fn merge_session_snapshot_mcp_servers<'a>(
     extra_mcp_servers: &mut HashMap<String, McpServerConfig>,
-    session_mcp_servers: &[SessionMcpServer],
+    session_mcp_servers: impl IntoIterator<Item = &'a SessionMcpServer>,
     user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,

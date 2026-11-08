@@ -49,7 +49,7 @@ const WORKER_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_KEEP_AWAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
-const SHUTDOWN_ASYNC_IMAGE_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+const SHUTDOWN_ASYNC_IMAGE_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
 const SHUTDOWN_DB_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(30);
 

@@ -232,7 +232,13 @@ pub(super) async fn build(
         None => Vec::new(),
     };
     let mut session_mcp_servers = user_mcp_servers;
-    for server in &config.session_mcp_servers {
+    for server in crate::mcp_resolve::filter_inline_mcp_servers(
+        deps.mcp_server_repo.as_deref(),
+        &ctx.user_id,
+        &config.session_mcp_servers,
+    )
+    .await
+    {
         // Reserved name defense: the team coordination MCP must win.
         if server.name == TEAM_MCP_SERVER_NAME {
             warn!(

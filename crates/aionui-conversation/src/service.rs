@@ -5329,7 +5329,7 @@ impl ConversationService {
             .read()
             .ok()
             .and_then(|guard| guard.as_ref().cloned());
-        if let Some(repo) = repo {
+        if let Some(repo) = &repo {
             let rows = match selected_ids {
                 Some(ids) => repo
                     .list_by_ids_any(user_id, ids)
@@ -5361,7 +5361,9 @@ impl ConversationService {
             }
         }
         let mut selected_session_servers = Vec::with_capacity(session_servers.len());
-        for server in session_servers {
+        for server in
+            aionui_ai_agent::mcp_resolve::filter_inline_mcp_servers(repo.as_deref(), user_id, session_servers).await
+        {
             if server.name == TEAM_MCP_SERVER_NAME {
                 continue;
             }

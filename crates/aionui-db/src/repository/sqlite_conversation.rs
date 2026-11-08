@@ -1073,10 +1073,18 @@ impl IConversationRepository for SqliteConversationRepository {
                 }
             }
 
+            // Image jobs and their attachments belong to the original conversation.
+            // Keep the fork cursor inclusive even when it points to a skipped card.
             let rows = sqlx::query_as::<_, MessageRow>(
                 "SELECT m.* FROM messages m \
                  WHERE m.conversation_id = ? \
                    AND (m.created_at < ? OR (m.created_at = ? AND m.id <= ?)) \
+                   AND NOT CASE \
+                     WHEN m.type = 'acp_tool_call' AND m.msg_id GLOB 'async-image:*' AND json_valid(m.content) \
+                     THEN COALESCE(json_type(m.content, '$.update.raw_output.async_image') = 'object' \
+                                   AND json_extract(m.content, '$.update.tool_call_id') = m.msg_id, 0) \
+                     ELSE 0 \
+                   END \
                  ORDER BY m.created_at ASC, m.id ASC",
             )
             .bind(source_conversation_id)

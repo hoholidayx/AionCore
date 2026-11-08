@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+aion-config.workspace = true
+aion-mcp.workspace = true
 aionui-runtime.workspace = true
 aionui-common.workspace = true
 aionui-db.workspace = true

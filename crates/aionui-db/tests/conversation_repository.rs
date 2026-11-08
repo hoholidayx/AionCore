@@ -1307,6 +1307,31 @@ fn make_message_at(conv_id: &str, content: &str, created_at: i64, backend_turn_i
     }
 }
 
+fn make_async_image_card(conv_id: &str, task_id: &str, created_at: i64, completed: bool) -> MessageRow {
+    let id = format!("async-image:{task_id}");
+    let (status, attachment) = if completed {
+        ("finish", serde_json::json!({ "attachment_id": task_id }))
+    } else {
+        ("work", serde_json::json!({}))
+    };
+    MessageRow {
+        id: id.clone(),
+        conversation_id: conv_id.into(),
+        msg_id: Some(id.clone()),
+        r#type: "acp_tool_call".into(),
+        content: serde_json::json!({
+            "session_id": conv_id,
+            "update": { "tool_call_id": id, "raw_output": { "async_image": attachment } },
+        })
+        .to_string(),
+        position: Some("left".into()),
+        status: Some(status.into()),
+        hidden: false,
+        created_at,
+        backend_turn_id: Some("image-turn".into()),
+    }
+}
+
 #[tokio::test]
 async fn copy_messages_up_to_is_inclusive_reminted_and_order_preserving() {
     let (repo, _db) = setup().await;
@@ -1375,6 +1400,118 @@ async fn copy_messages_up_to_is_inclusive_reminted_and_order_preserving() {
             "source turn anchors must not leak into the fork"
         );
     }
+}
+
+#[tokio::test]
+async fn fork_skips_pending_and_completed_images_at_head_and_at_a_card_anchor() {
+    let (repo, _db) = setup().await;
+    let source = make_conversation("fork-images-source");
+    repo.create(&source).await.unwrap();
+    let normal = make_message_at(&source.id, "one", 1000, Some("turn-a"));
+    let pending = make_async_image_card(&source.id, "pending", 2000, false);
+    let complete = make_async_image_card(&source.id, "complete", 3000, true);
+    let mut ordinary_tool = make_message_at(&source.id, "ordinary tool", 4000, Some("turn-b"));
+    ordinary_tool.r#type = "acp_tool_call".into();
+    ordinary_tool.msg_id = Some("async-image:ordinary-tool-id".into());
+    for message in [&normal, &pending, &complete, &ordinary_tool] {
+        repo.insert_message(USER_ID, message).await.unwrap();
+    }
+
+    for (anchor, expected) in [
+        (&complete, vec![&normal]),
+        (&ordinary_tool, vec![&normal, &ordinary_tool]),
+    ] {
+        let target = make_conversation("fork-images-target");
+        repo.create(&target).await.unwrap();
+        let copied = repo
+            .copy_messages_up_to(USER_ID, &source.id, &target.id, (anchor.created_at, &anchor.id))
+            .await
+            .unwrap();
+        assert_eq!(copied as usize, expected.len());
+        let page = repo
+            .list_messages_page(
+                USER_ID,
+                &target.id,
+                &MessagePageParams {
+                    limit: 50,
+                    direction: MessagePageDirection::InitialLatest,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items.iter().map(|row| &row.msg_id).collect::<Vec<_>>(),
+            expected.iter().map(|row| &row.msg_id).collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(
+        repo.resolve_backend_turn_anchor(USER_ID, &source.id, (complete.created_at, &complete.id))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("image-turn")
+    );
+}
+
+#[tokio::test]
+async fn fork_image_card_cleanup_removes_only_legacy_copies_without_jobs() {
+    let (repo, db) = setup().await;
+    let source = make_conversation("old-fork-source");
+    let target = make_conversation("old-fork-target");
+    repo.create(&source).await.unwrap();
+    repo.create(&target).await.unwrap();
+
+    let original = make_async_image_card(&source.id, "original-job", 1000, true);
+    let mut legacy_copy = original.clone();
+    legacy_copy.id = "legacy-copy".into();
+    legacy_copy.conversation_id = target.id.clone();
+    let mut owned = make_async_image_card(&target.id, "owned-job", 2000, false);
+    owned.id = "owned-card".into();
+    let mut ordinary_tool = make_message_at(&target.id, "legacy ordinary tool", 3000, None);
+    ordinary_tool.r#type = "acp_tool_call".into();
+    ordinary_tool.msg_id = Some("async-image:ordinary-tool-id".into());
+    for message in [&original, &legacy_copy, &owned, &ordinary_tool] {
+        repo.insert_message(USER_ID, message).await.unwrap();
+    }
+    for (task_id, card) in [("original-job", &original), ("owned-job", &owned)] {
+        sqlx::query(
+            "INSERT INTO async_image_jobs (task_id, user_id, conversation_id, card_id, turn_id, tool_call_id, \
+               server_id, endpoint_fingerprint, contract_version, state, next_check_at, created_at) \
+             VALUES (?, ?, ?, ?, 'image-turn', 'call', 'server', 'fingerprint', 'image_jobs_v1', 'pending', 0, 0)",
+        )
+        .bind(task_id)
+        .bind(USER_ID)
+        .bind(&card.conversation_id)
+        .bind(&card.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+
+    sqlx::raw_sql(include_str!("../migrations/047_remove_forked_async_image_cards.sql"))
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    assert!(
+        repo.get_message(USER_ID, &target.id, &legacy_copy.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for card in [&original, &owned, &ordinary_tool] {
+        assert!(
+            repo.get_message(USER_ID, &card.conversation_id, &card.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+    let job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM async_image_jobs")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(job_count, 2);
 }
 
 #[tokio::test]

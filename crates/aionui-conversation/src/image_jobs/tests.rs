@@ -21,11 +21,15 @@ const ORIGINAL: &str = "original-conversation";
 const SWITCHED: &str = "switched-conversation";
 const SERVER: &str = "image-backend";
 const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGOoBwAAgQCA05RTSgAAAABJRU5ErkJggg==";
+// A synthetic 1×1 PNG with correct chunk CRCs and invalid zlib data in IDAT.
+const INVALID_PIXELS_PNG: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAAEUlEQVRub3QgYSB6bGliIHN0cmVhbUUA3FEAAAAASUVORK5CYII=";
 
 #[derive(Default)]
 struct MockBackend {
     lost_reply: AtomicBool,
     complete: AtomicBool,
+    invalid_pixels: AtomicBool,
     requests: Mutex<Vec<Value>>,
 }
 
@@ -87,14 +91,21 @@ async fn mcp(AxumState(state): AxumState<Arc<MockBackend>>, Json(body): Json<Val
                         structured(json!({ "error_code": "task_not_found" }), true)
                     }
                 }
-                "image_result" => json!({
-                    "structuredContent": {
-                        "task_id": args["task_id"], "width": 1, "height": 1,
-                        "sha256": fingerprint(&STANDARD.decode(PNG).unwrap())
-                    },
-                    "content": [{ "type": "image", "mimeType": "image/png", "data": PNG }],
-                    "isError": false
-                }),
+                "image_result" => {
+                    let png = if state.invalid_pixels.load(Ordering::SeqCst) {
+                        INVALID_PIXELS_PNG
+                    } else {
+                        PNG
+                    };
+                    json!({
+                        "structuredContent": {
+                            "task_id": args["task_id"], "width": 1, "height": 1,
+                            "sha256": fingerprint(&STANDARD.decode(png).unwrap())
+                        },
+                        "content": [{ "type": "image", "mimeType": "image/png", "data": png }],
+                        "isError": false
+                    })
+                }
                 _ => panic!("Unexpected mock tool"),
             }
         }
@@ -367,6 +378,54 @@ fn validates_png_chunk_checksums() {
     assert_eq!(png_dimensions(&png), Some((1, 1)));
     png[43] ^= 1;
     assert_eq!(png_dimensions(&png), None);
+}
+
+#[test]
+fn decodes_an_interlaced_sixteen_bit_png() {
+    // A synthetic 2×2 RGBA image with 16-bit samples and Adam7 interlacing.
+    let png = STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACEAYAAAFVIeHxAAAAGElEQVR4nGP4/58BCMAkiIBwgRSUAWQBAPgqDfPtoYDoAAAAAElFTkSuQmCC")
+        .unwrap();
+    assert_eq!(png_dimensions(&png), Some((2, 2)));
+}
+
+#[tokio::test]
+async fn matching_metadata_with_invalid_pixels_fails_without_an_attachment() {
+    let (url, backend, server) = serve_backend().await;
+    let db = database(&url).await;
+    let events = Arc::new(BroadcastEventBus::new(16));
+    let mut messages = events.subscribe();
+    let service = jobs(&db, events);
+    let receipt = service.enqueue(request(&url)).await.unwrap();
+    backend.complete.store(true, Ordering::SeqCst);
+    backend.invalid_pixels.store(true, Ordering::SeqCst);
+    tick(&service, &db).await;
+    tick(&service, &db).await;
+
+    let state: String = sqlx::query_scalar("SELECT state FROM async_image_jobs WHERE task_id = ?")
+        .bind(&receipt.task_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(state, "failed");
+    let mut last = messages.try_recv().unwrap();
+    while let Ok(message) = messages.try_recv() {
+        last = message;
+    }
+    assert_eq!(
+        last.data["data"]["update"]["raw_output"]["async_image"]["error_code"],
+        "invalid_backend_result"
+    );
+    assert_eq!(
+        service
+            .read_image(USER, ORIGINAL, &receipt.task_id)
+            .await
+            .err()
+            .unwrap()
+            .code,
+        "attachment_not_found"
+    );
+    server.abort();
 }
 
 #[test]

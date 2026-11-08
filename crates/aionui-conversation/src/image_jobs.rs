@@ -1,4 +1,5 @@
 //! Server-owned asynchronous image jobs and their durable conversation cards.
+mod clients;
 mod protocol;
 
 use std::path::Path;
@@ -23,6 +24,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{Notify, watch};
 use uuid::Uuid;
 
+use self::clients::{EndpointKey, ImageJobClients};
 use self::protocol::{
     BackendError, CONTRACT, EndpointConfig, ImageJobClient, MAX_REFERENCE, MAX_REFERENCES, MAX_REQUEST, MAX_TOTAL,
     RemoteState, endpoint_fingerprint, png_dimensions,
@@ -44,6 +46,7 @@ pub struct AsyncImageJobs {
     mcp_repo: Arc<dyn IMcpServerRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
     wake: Notify,
+    clients: ImageJobClients,
 }
 
 enum Step {
@@ -65,6 +68,7 @@ impl AsyncImageJobs {
             mcp_repo,
             broadcaster,
             wake: Notify::new(),
+            clients: ImageJobClients::default(),
         }
     }
 
@@ -88,6 +92,7 @@ impl AsyncImageJobs {
 
     pub async fn run(&self, shutdown: watch::Receiver<bool>) {
         tokio::join!(self.run_worker(shutdown.clone()), self.run_worker(shutdown));
+        self.clients.close().await;
     }
 
     async fn run_worker(&self, mut shutdown: watch::Receiver<bool>) {
@@ -112,6 +117,7 @@ impl AsyncImageJobs {
                     }
                 }
                 Ok(None) => {
+                    self.clients.prune().await;
                     tokio::select! {
                         _ = shutdown.changed() => return,
                         _ = self.wake.notified() => (),
@@ -196,14 +202,32 @@ impl AsyncImageJobs {
         if endpoint_fingerprint(&endpoint.url, &endpoint.headers) != job.endpoint_fingerprint {
             return Ok(Step::Failed("backend_changed"));
         }
-        let client = match ImageJobClient::connect(endpoint).await {
+        let key = EndpointKey {
+            user_id: job.user_id.clone(),
+            server_id: job.server_id.clone(),
+            fingerprint: job.endpoint_fingerprint.clone(),
+        };
+        let slot = self.clients.slot(&key).await;
+        let client = match ImageJobClients::connect(&slot, endpoint).await {
             Ok(client) => client,
             Err(error) => return Ok(backend_failure(error)),
         };
+        let step = self.advance_connected(job, client).await;
+        if matches!(step, Ok(Step::Retry("backend_status_unavailable"))) {
+            self.clients.invalidate(&key, &slot).await;
+        }
+        step
+    }
+
+    async fn advance_connected(
+        &self,
+        job: &mut ClaimedAsyncImageJob,
+        client: &ImageJobClient,
+    ) -> Result<Step, DbError> {
         let status = match job.state {
-            State::Pending => self.submit(job, &client).await?,
+            State::Pending => self.submit(job, client).await?,
             State::Submitting => match client.status(&job.task_id).await {
-                Err(BackendError::TaskNotFound) => self.submit(job, &client).await?,
+                Err(BackendError::TaskNotFound) => self.submit(job, client).await?,
                 result => Some(result),
             },
             State::Polling => Some(client.status(&job.task_id).await),
@@ -293,6 +317,8 @@ impl AsyncImageQueue for AsyncImageJobs {
         let mut source = None;
         let mut images = Vec::with_capacity(request.references.len());
         let mut total = 0usize;
+        let invalid_reference =
+            || AsyncImageError::new("invalid_reference", "Use valid PNG references within the size limits");
         for reference in request.references {
             let png = match reference {
                 AsyncImageReference::AuthorizedPath(path) => read_reference(&path).await?,
@@ -305,13 +331,15 @@ impl AsyncImageQueue for AsyncImageJobs {
                 }
             };
             total += png.len();
-            if total > MAX_TOTAL || png.len() > MAX_REFERENCE || png_dimensions(&png).is_none() {
-                return Err(AsyncImageError::new(
-                    "invalid_reference",
-                    "Use valid PNG references within the size limits",
-                ));
+            if total > MAX_TOTAL || png.len() > MAX_REFERENCE {
+                return Err(invalid_reference());
             }
-            images.push(STANDARD.encode(png));
+            let encoded = tokio::task::spawn_blocking(move || png_dimensions(&png).map(|_| STANDARD.encode(png)))
+                .await
+                .ok()
+                .flatten()
+                .ok_or_else(invalid_reference)?;
+            images.push(encoded);
         }
         let endpoint = select_endpoint(
             &request.available,

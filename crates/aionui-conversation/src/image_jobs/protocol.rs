@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
+use std::io::Cursor;
 use std::time::Duration;
 
 use aion_config::config::{McpServerConfig, TransportType};
 use aion_mcp::manager::McpManager;
 use aion_mcp::protocol::{McpContent, McpToolResult};
+use aion_mcp::transport::McpError;
 use aionui_api_types::{ASYNC_IMAGE_TOOLS, async_image_schema_matches};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -50,22 +52,24 @@ impl ImageJobClient {
             deferred: None,
             startup_timeout_ms: Some(Duration::from_secs(6).as_millis() as u64),
         };
-        let manager = McpManager::connect_all(&HashMap::from([(SERVER.to_owned(), config)]))
+        let manager = McpManager::connect_pinned_http(SERVER, &config)
             .await
-            .map_err(|_| BackendError::Transient)?;
+            .map_err(transport_error)?;
         let tools = manager.all_tools();
-        if manager.server_names().is_empty() {
-            return Err(BackendError::Transient);
-        }
         for (name, _) in ASYNC_IMAGE_TOOLS {
             let compatible = tools
                 .iter()
                 .any(|(_, tool)| tool.name == name && async_image_schema_matches(name, &tool.input_schema));
             if !compatible {
+                manager.shutdown().await;
                 return Err(BackendError::InvalidContract);
             }
         }
         Ok(Self(manager))
+    }
+
+    pub async fn close(&self) {
+        self.0.shutdown().await;
     }
 
     pub async fn submit(&self, args: Value, task_id: &str) -> Result<RemoteState, BackendError> {
@@ -96,7 +100,10 @@ impl ImageJobClient {
         let result = self
             .call("image_result", serde_json::json!({ "task_id": task_id }))
             .await?;
-        verified_image(result, task_id)
+        let task_id = task_id.to_owned();
+        tokio::task::spawn_blocking(move || verified_image(result, &task_id))
+            .await
+            .map_err(|_| BackendError::InvalidResult)?
     }
 
     async fn call(&self, name: &str, args: Value) -> Result<McpToolResult, BackendError> {
@@ -104,7 +111,7 @@ impl ImageJobClient {
             .0
             .call_tool_structured(SERVER, name, args)
             .await
-            .map_err(|_| BackendError::Transient)?;
+            .map_err(transport_error)?;
         if result.is_error {
             let code = result
                 .structured_content
@@ -124,6 +131,13 @@ impl ImageJobClient {
             });
         }
         Ok(result)
+    }
+}
+
+fn transport_error(error: McpError) -> BackendError {
+    match error {
+        McpError::HttpStatus { status: 300..=399, .. } => BackendError::Rejected("backend_redirected"),
+        _ => BackendError::Transient,
     }
 }
 
@@ -175,8 +189,7 @@ fn verified_image(result: McpToolResult, expected_id: &str) -> Result<Vec<u8>, B
     let png = STANDARD.decode(encoded).map_err(|_| BackendError::InvalidResult)?;
     let (width, height) = png_dimensions(&png).ok_or(BackendError::InvalidResult)?;
     let sha256 = fingerprint(&png);
-    if png.len() > MAX_RESULT
-        || fields.get("sha256").and_then(Value::as_str) != Some(sha256.as_str())
+    if fields.get("sha256").and_then(Value::as_str) != Some(sha256.as_str())
         || fields.get("width").and_then(Value::as_u64) != Some(width.into())
         || fields.get("height").and_then(Value::as_u64) != Some(height.into())
     {
@@ -196,7 +209,7 @@ pub(super) fn endpoint_fingerprint(url: &str, headers: &HashMap<String, String>)
 
 pub(super) fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
     const HEADER: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR";
-    if !png.starts_with(HEADER) {
+    if png.len() > MAX_RESULT || !png.starts_with(HEADER) {
         return None;
     }
     let width = u32::from_be_bytes(png.get(16..20)?.try_into().ok()?);
@@ -206,7 +219,7 @@ pub(super) fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
     }
     let mut chunks = png.get(8..)?;
     let mut has_data = false;
-    while !chunks.is_empty() {
+    loop {
         let length = u32::from_be_bytes(chunks.get(..4)?.try_into().ok()?) as usize;
         let end = 8usize.checked_add(length)?;
         let crc_end = end.checked_add(4)?;
@@ -216,11 +229,25 @@ pub(super) fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
         }
         match chunks.get(4..8)? {
             b"IDAT" => has_data |= length > 0,
-            b"IEND" => return (has_data && length == 0 && chunks.len() == crc_end).then_some((width, height)),
+            b"IEND" if has_data && length == 0 && chunks.len() == crc_end => break,
+            b"IEND" => return None,
             b"acTL" | b"fdAT" | b"fcTL" => return None,
             _ => (),
         }
         chunks = chunks.get(crc_end..)?;
     }
-    None
+
+    // Decode scanlines, including interlaced passes, without allocating a full
+    // raster. Unneeded metadata can itself contain compressed payloads.
+    let mut options = png::DecodeOptions::default();
+    options.set_ignore_adler32(false);
+    options.set_ignore_crc(true); // Already checked for every chunk above.
+    options.set_ignore_iccp_chunk(true);
+    options.set_ignore_text_chunk(true);
+    let mut reader = png::Decoder::new_with_options(Cursor::new(png), options)
+        .read_info()
+        .ok()?;
+    while reader.next_row().ok()?.is_some() {}
+    reader.finish().ok()?;
+    Some((width, height))
 }

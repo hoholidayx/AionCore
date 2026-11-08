@@ -187,13 +187,14 @@ pub trait IConversationRepository: Send + Sync {
     /// Deletes all messages belonging to a conversation.
     async fn delete_messages_by_conversation(&self, user_id: &str, conv_id: &str) -> Result<(), DbError>;
 
-    /// Copies every source message at or before the fork point — `(created_at,
+    /// Copies source messages at or before the fork point — `(created_at,
     /// id)` cursor, endpoint inclusive — into the target conversation inside a
     /// single transaction, reminting primary keys with time-ordered ids so the
     /// copies keep their relative `(created_at, id)` display order. `msg_id`
     /// and `created_at` are preserved verbatim; `backend_turn_id` is dropped
     /// (it anchors the SOURCE conversation's backend thread and would poison
-    /// fork-point resolution in the copy). Returns the number of copied rows.
+    /// fork-point resolution in the copy). Async image cards are skipped because
+    /// the original conversation owns the jobs and attachments. Returns the number of copied rows.
     ///
     /// Both conversations must belong to `user_id`. Default is unsupported so
     /// test doubles that never fork don't have to implement it.

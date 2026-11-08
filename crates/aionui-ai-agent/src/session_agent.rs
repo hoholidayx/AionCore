@@ -1795,7 +1795,16 @@ pub async fn build_antigravity_instance(
         }
         None => Vec::new(),
     };
-    neutral.extend(config.session_mcp_servers.iter().cloned());
+    neutral.extend(
+        crate::mcp_resolve::filter_inline_mcp_servers(
+            mcp_server_repo.map(Arc::as_ref),
+            &user_id,
+            &config.session_mcp_servers,
+        )
+        .await
+        .into_iter()
+        .cloned(),
+    );
     let mut mcp_servers: Vec<McpServerSpec> = neutral.iter().map(session_server_to_spec).collect();
     if let Some(cfg) = config.team_mcp_stdio_config.as_ref() {
         let mut coordination = vec![team_mcp_server_spec(cfg)];
@@ -1929,11 +1938,15 @@ pub async fn build_session_instance(
     };
     neutral.retain(|server| server.name != TEAM_MCP_SERVER_NAME);
     neutral.extend(
-        config
-            .session_mcp_servers
-            .iter()
-            .filter(|server| server.name != TEAM_MCP_SERVER_NAME)
-            .cloned(),
+        crate::mcp_resolve::filter_inline_mcp_servers(
+            mcp_server_repo.map(Arc::as_ref),
+            &user_id,
+            &config.session_mcp_servers,
+        )
+        .await
+        .into_iter()
+        .filter(|server| server.name != TEAM_MCP_SERVER_NAME)
+        .cloned(),
     );
     let mut mcp_servers: Vec<McpServerSpec> = neutral.iter().map(session_server_to_spec).collect();
     if let Some(cfg) = config.team_mcp_stdio_config.as_ref() {

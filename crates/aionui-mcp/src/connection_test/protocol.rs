@@ -376,6 +376,10 @@ pub(super) fn success_result(tools_value: Option<serde_json::Value>) -> McpConne
         })
         .unwrap_or_default();
 
+    discovered_tools_result(tools)
+}
+
+pub(super) fn discovered_tools_result(tools: Vec<McpToolResponse>) -> McpConnectionTestResult {
     McpConnectionTestResult {
         success: true,
         tools: Some(tools),
