@@ -187,7 +187,16 @@ async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> 
     let model = context.model.clone();
     match context.kind {
         AgentSessionKind::Acp(acp_context) => acp::build(deps, *acp_context, ctx).await,
-        AgentSessionKind::Aionrs(aionrs_context) => aionrs::build(deps, *aionrs_context, model, ctx).await,
+        AgentSessionKind::Aionrs(aionrs_context) => {
+            aionrs::build(
+                deps,
+                *aionrs_context,
+                model,
+                ctx,
+                options.runtime_capabilities.async_image_enabled.unwrap_or(true),
+            )
+            .await
+        }
         AgentSessionKind::Antigravity(agy_context) => antigravity::build(deps, *agy_context, ctx).await,
     }
 }

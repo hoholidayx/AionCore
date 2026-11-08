@@ -52,6 +52,7 @@ pub(super) async fn build(
     build_context: AionrsSessionBuildContext,
     model: ProviderWithModel,
     ctx: FactoryContext,
+    async_image_enabled: bool,
 ) -> Result<AgentInstance, AgentError> {
     let mut overrides = build_context.config;
     let resolved_skills = overrides.skills.clone();
@@ -142,6 +143,7 @@ pub(super) async fn build(
     let async_image = deps
         .async_image_queue
         .as_ref()
+        .filter(|_| async_image_enabled)
         .map(|queue| AsyncImageTool::new(queue.clone(), ctx.user_id.clone(), ctx.conversation_id.clone()));
 
     if !extra_mcp_servers.is_empty() {

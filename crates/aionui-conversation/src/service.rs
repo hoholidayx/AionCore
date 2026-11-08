@@ -4788,60 +4788,77 @@ pub(crate) fn agent_error_top_level_code(error: &AgentError) -> &'static str {
 }
 
 impl ConversationService {
-    /// Loads the persisted runtime permission gate inputs for an aionrs
-    /// rebuild. Returns `None` for non-aionrs conversations and for aionrs
-    /// conversations without a persisted assistant snapshot (assistant-less
-    /// sessions are out of scope — spec §5). This is the only place a
-    /// `conversation_repo` handle is needed, so the seed is computed here and
-    /// threaded into `SessionContextBuilder` (spec §7.3, A-2).
-    async fn load_aionrs_permission_seed(
-        &self,
-        row: &aionui_db::models::ConversationRow,
-    ) -> Result<Option<AionrsRuntimePermissionSeed>, ConversationError> {
-        if row.r#type != AgentType::Aionrs.serde_name() {
-            return Ok(None);
-        }
-        let snapshot = self
-            .conversation_repo
-            .get_assistant_snapshot(&row.user_id, &row.id)
-            .await
-            .map_err(|e| {
-                ConversationError::internal(format!(
-                    "Failed to load assistant snapshot for aionrs permission seed: {e}"
-                ))
-            })?;
-        Ok(snapshot.map(|snapshot| AionrsRuntimePermissionSeed {
-            default_permission_mode: snapshot.default_permission_mode,
-            resolved_permission_value: snapshot.resolved_permission_value,
-        }))
-    }
-
     /// Build typed agent runtime context from a conversation database row.
     ///
-    /// Raw `conversation.extra` parsing lives in [`SessionContextBuilder`]
-    /// so the task manager and concrete agent factories consume typed
-    /// session context instead of the DB envelope.
+    /// Raw runtime configuration lives in [`SessionContextBuilder`] so the
+    /// concrete agent factories consume typed session context.
     pub(crate) async fn build_task_options(
         &self,
-        row: &aionui_db::models::ConversationRow,
+        row: &ConversationRow,
     ) -> Result<BuildTaskOptions, ConversationError> {
-        reject_deprecated_runtime_row(row)?;
-        let seed = self.load_aionrs_permission_seed(row).await?;
-        SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options(row, seed)
-            .await
+        self.build_task_options_for_runtime(row, None).await
     }
 
     pub async fn build_task_options_for_runtime(
         &self,
-        row: &aionui_db::models::ConversationRow,
+        row: &ConversationRow,
         workspace_override: Option<&str>,
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
-        let seed = self.load_aionrs_permission_seed(row).await?;
-        SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options_with_workspace_override(row, workspace_override, seed)
-            .await
+        let is_aionrs = row.r#type == AgentType::Aionrs.serde_name();
+        let snapshot = if is_aionrs {
+            self.conversation_repo
+                .get_assistant_snapshot(&row.user_id, &row.id)
+                .await?
+        } else {
+            None
+        };
+        let seed = snapshot.as_ref().map(|snapshot| AionrsRuntimePermissionSeed {
+            default_permission_mode: snapshot.default_permission_mode.clone(),
+            resolved_permission_value: snapshot.resolved_permission_value.clone(),
+        });
+        let mut options =
+            SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
+                .build_options_with_workspace_override(row, workspace_override, seed)
+                .await?;
+        if is_aionrs {
+            options.runtime_capabilities.async_image_enabled =
+                Some(self.resolve_async_image_enabled(row, snapshot.as_ref()).await?);
+        }
+        Ok(options)
+    }
+
+    /// Tool visibility follows the current assistant across existing and forked conversations.
+    async fn resolve_async_image_enabled(
+        &self,
+        row: &ConversationRow,
+        snapshot: Option<&ConversationAssistantSnapshotRow>,
+    ) -> Result<bool, ConversationError> {
+        let Some(definition_repo) = self.assistant_definition_repo() else {
+            return Ok(true);
+        };
+        let legacy_extra: serde_json::Value;
+        let assistant_id = if let Some(snapshot) = snapshot {
+            Some(snapshot.assistant_id.as_str())
+        } else {
+            legacy_extra = serde_json::from_str(&row.extra)
+                .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
+            [
+                legacy_extra.pointer("/assistant_snapshot/assistant_id"),
+                legacy_extra.get("assistant_id"),
+                legacy_extra.get("preset_assistant_id"),
+            ]
+            .into_iter()
+            .flatten()
+            .find_map(serde_json::Value::as_str)
+        };
+        let Some(assistant_id) = assistant_id else {
+            return Ok(true);
+        };
+        let definition = definition_repo
+            .get_by_assistant_id_for_user(&row.user_id, assistant_id)
+            .await?;
+        Ok(definition.is_none_or(|definition| definition.async_image_enabled))
     }
 
     /// Re-read the persisted resume anchor into a turn's `BuildTaskOptions`

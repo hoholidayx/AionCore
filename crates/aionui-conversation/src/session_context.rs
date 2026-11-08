@@ -41,16 +41,6 @@ impl<'a> SessionContextBuilder<'a> {
         }
     }
 
-    pub(crate) async fn build_options(
-        &self,
-        row: &ConversationRow,
-        seed: Option<AionrsRuntimePermissionSeed>,
-    ) -> Result<BuildTaskOptions, ConversationError> {
-        Ok(BuildTaskOptions::new(
-            self.build_with_workspace_override(row, None, seed).await?,
-        ))
-    }
-
     pub(crate) async fn build_options_with_workspace_override(
         &self,
         row: &ConversationRow,
@@ -64,7 +54,7 @@ impl<'a> SessionContextBuilder<'a> {
     }
 
     /// Test-only convenience wrapper. Production entry points thread a real
-    /// permission seed via `build_options*`; tests exercise the default
+    /// permission seed via `build_options_with_workspace_override`; tests exercise the default
     /// (no-seed) path.
     #[cfg(test)]
     async fn build(&self, row: &ConversationRow) -> Result<AgentSessionContext, ConversationError> {
@@ -1479,7 +1469,11 @@ mod tests {
             .update_session_id_for_user("user-1", "conv-1", "dead-anchor")
             .await
             .unwrap();
-        let mut options = repos.builder().build_options(&row, None).await.unwrap();
+        let mut options = repos
+            .builder()
+            .build_options_with_workspace_override(&row, None, None)
+            .await
+            .unwrap();
 
         // The dead-anchor self-heal (session layer) clears the anchor mid-turn.
         repos
@@ -1532,7 +1526,11 @@ mod tests {
             .update_session_id_for_user("user-1", "conv-1", "live-anchor")
             .await
             .unwrap();
-        let mut options = repos.builder().build_options(&row, None).await.unwrap();
+        let mut options = repos
+            .builder()
+            .build_options_with_workspace_override(&row, None, None)
+            .await
+            .unwrap();
 
         repos
             .builder()

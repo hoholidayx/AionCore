@@ -1345,6 +1345,7 @@ mod tests {
             default_disabled_builtin_skill_ids: "[]",
             default_mcps_mode: "auto",
             default_mcp_ids: "[]",
+            async_image_enabled: None,
         }
     }
 

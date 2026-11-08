@@ -4,7 +4,7 @@ use aionui_common::{
     AgentKillReason, AgentType, ConversationStatus, ErrorChain, OnConversationDelete, TimestampMs, now_ms,
 };
 use async_trait::async_trait;
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use futures_util::future::{BoxFuture, join_all};
 use tokio::sync::OnceCell;
 use tracing::{debug, info, warn};
@@ -78,7 +78,6 @@ pub trait IWorkerTaskManager: Send + Sync {
     fn collect_idle(&self, idle_threshold_ms: TimestampMs) -> Vec<String>;
 }
 
-#[derive(Clone)]
 struct ManagedAgentTask {
     agent: AgentInstance,
     runtime_capabilities: RuntimeCapabilities,
@@ -124,10 +123,6 @@ impl WorkerTaskManagerImpl {
             .and_then(|slot| slot.get().map(|managed| managed.agent.clone()))
     }
 
-    fn initialised_managed_task(&self, conversation_id: &str) -> Option<ManagedAgentTask> {
-        self.tasks.get(conversation_id).and_then(|slot| slot.get().cloned())
-    }
-
     fn invalidate_runtime_tokens(&self, conversation_id: &str) {
         if let Some(service) = &self.runtime_token_service {
             service.invalidate_conversation_id(conversation_id);
@@ -171,43 +166,42 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         conversation_id: &str,
         mut options: BuildTaskOptions,
     ) -> Result<AgentInstance, AgentError> {
-        if let Some(existing) = self.initialised_managed_task(conversation_id)
-            && !existing.runtime_capabilities.satisfies(&options.runtime_capabilities)
-        {
-            info!(
-                conversation_id,
-                "Rebuilding agent task because runtime capabilities changed"
-            );
-            self.kill(conversation_id, Some(AgentKillReason::RuntimeCapabilityChanged))?;
+        loop {
+            // Concurrent builds share a slot. Check the capabilities after waiting,
+            // since a warmup can still be initializing with the previous assistant setting.
+            let slot = self
+                .tasks
+                .entry(conversation_id.to_owned())
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone();
+            let managed = slot
+                .get_or_try_init(|| async {
+                    let agent = (self.factory)(options.clone()).await?;
+                    Ok::<ManagedAgentTask, AgentError>(ManagedAgentTask {
+                        agent,
+                        runtime_capabilities: options.runtime_capabilities.clone(),
+                    })
+                })
+                .await?;
+            if managed.runtime_capabilities.satisfies(&options.runtime_capabilities) {
+                return Ok(managed.agent.clone());
+            }
+
+            // Invalidate only the slot we checked. Another caller may already have
+            // rebuilt it while this one was waiting for initialization.
+            if let Entry::Occupied(entry) = self.tasks.entry(conversation_id.to_owned())
+                && Arc::ptr_eq(entry.get(), &slot)
+            {
+                info!(
+                    conversation_id,
+                    "Rebuilding agent task because runtime capabilities changed"
+                );
+                self.invalidate_runtime_tokens(conversation_id);
+                entry.remove();
+                managed.agent.kill(Some(AgentKillReason::RuntimeCapabilityChanged))?;
+            }
             self.refresh_runtime_token_for_new_task(&mut options);
         }
-
-        // Atomically obtain the per-conversation slot. `DashMap::entry` is
-        // synchronous and side-effect-free — only an empty OnceCell is
-        // allocated on the miss path, so concurrent callers for the same id
-        // all end up holding the same `Arc<OnceCell>`.
-        let slot: TaskSlot = self
-            .tasks
-            .entry(conversation_id.to_owned())
-            .or_insert_with(|| Arc::new(OnceCell::new()))
-            .clone();
-
-        // `OnceCell::get_or_try_init` serialises concurrent initialisers:
-        // the first caller to reach it runs the factory, every other caller
-        // awaits the same future and ends up with the same instance. On
-        // failure the cell stays empty so a later caller can retry.
-        let factory = self.factory.clone();
-        let runtime_capabilities = options.runtime_capabilities.clone();
-        let managed = slot
-            .get_or_try_init(|| async move {
-                let agent = factory(options).await?;
-                Ok::<ManagedAgentTask, AgentError>(ManagedAgentTask {
-                    agent,
-                    runtime_capabilities,
-                })
-            })
-            .await?;
-        Ok(managed.agent.clone())
     }
 
     fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
@@ -649,6 +643,49 @@ mod tests {
         let h2 = mgr.get_or_build_task("conv-1", options).await.unwrap();
 
         assert!(!same_mock(&h1, &h2));
+        assert_eq!(mgr.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn changing_async_image_visibility_rebuilds_even_during_warmup() {
+        let finish_enabled_build = Arc::new(tokio::sync::Notify::new());
+        let factory: AgentFactory = Arc::new({
+            let finish_enabled_build = Arc::clone(&finish_enabled_build);
+            move |options| {
+                let finish_enabled_build = Arc::clone(&finish_enabled_build);
+                async move {
+                    if options.runtime_capabilities.async_image_enabled != Some(false) {
+                        finish_enabled_build.notified().await;
+                    }
+                    Ok(mock_instance(MockAgent::new(options.conversation_id(), None)))
+                }
+                .boxed()
+            }
+        });
+        let mgr = WorkerTaskManagerImpl::new(factory);
+
+        let warmup = mgr.get_or_build_task("conv-1", make_options("conv-1"));
+        futures_util::pin_mut!(warmup);
+        assert!(futures_util::poll!(warmup.as_mut()).is_pending());
+
+        let mut disabled = make_options("conv-1");
+        disabled.runtime_capabilities.async_image_enabled = Some(false);
+        let after_disable = mgr.get_or_build_task("conv-1", disabled.clone());
+        futures_util::pin_mut!(after_disable);
+        assert!(futures_util::poll!(after_disable.as_mut()).is_pending());
+
+        finish_enabled_build.notify_one();
+        let enabled_agent = warmup.await.unwrap();
+        let disabled_agent = after_disable.await.unwrap();
+        assert!(!same_mock(&enabled_agent, &disabled_agent));
+        let still_disabled = mgr.get_or_build_task("conv-1", disabled).await.unwrap();
+        assert!(same_mock(&disabled_agent, &still_disabled));
+
+        finish_enabled_build.notify_one();
+        let mut enabled = make_options("conv-1");
+        enabled.runtime_capabilities.async_image_enabled = Some(true);
+        let reenabled_agent = mgr.get_or_build_task("conv-1", enabled).await.unwrap();
+        assert!(!same_mock(&disabled_agent, &reenabled_agent));
         assert_eq!(mgr.active_count(), 1);
     }
 

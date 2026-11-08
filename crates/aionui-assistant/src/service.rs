@@ -338,6 +338,7 @@ impl AssistantService {
                     default_disabled_builtin_skill_ids: &default_disabled_builtin_skill_ids,
                     default_mcps_mode: "auto",
                     default_mcp_ids: "[]",
+                    async_image_enabled: None,
                 })
                 .await
                 .map_err(|e| AssistantError::Internal(format!("upsert builtin definition: {e}")))?;
@@ -665,6 +666,7 @@ impl AssistantService {
                     default_disabled_builtin_skill_ids: "[]".into(),
                     default_mcps_mode: "auto".into(),
                     default_mcp_ids: "[]".into(),
+                    async_image_enabled: true,
                     created_at: 0,
                     updated_at: 0,
                     deleted_at: None,
@@ -785,6 +787,7 @@ impl AssistantService {
                     default_disabled_builtin_skill_ids: &default_disabled_builtin_skill_ids,
                     default_mcps_mode: "auto",
                     default_mcp_ids: "[]",
+                    async_image_enabled: None,
                 },
             )
             .await
@@ -821,7 +824,13 @@ impl AssistantService {
         apply_detail_patch_to_definition(&mut patched, &overrides, reset_model_and_permission);
 
         self.definition_repo
-            .upsert_for_user(user_id, &upsert_params_from_definition(&patched))
+            .upsert_for_user(
+                user_id,
+                &UpsertAssistantDefinitionParams {
+                    async_image_enabled: overrides.async_image_enabled,
+                    ..upsert_params_from_definition(&patched)
+                },
+            )
             .await
             .map_err(|e| AssistantError::Internal(format!("upsert patched assistant definition: {e}")))?;
 
@@ -1211,8 +1220,8 @@ impl AssistantService {
 
                 // Built-in rows are sourced from the embedded bundle and can't
                 // be mutated. Users may still override `agent_id`, and
-                // product-defined governance allows model/permission/thought
-                // defaults to vary per built-in assistant. Any other field on the
+                // product-defined governance allows selected defaults to vary
+                // per built-in assistant. Any other field on the
                 // request is rejected so callers don't silently lose data.
                 if req.name.is_some()
                     || req.description.is_some()
@@ -1230,7 +1239,7 @@ impl AssistantService {
                     || builtin_defaults_forbidden
                 {
                     return Err(AssistantError::Forbidden(
-                        "Only 'agent_id', 'defaults.model', 'defaults.permission', and 'defaults.thought_level' can be overridden on built-in assistants".into(),
+                        "Only 'agent_id', 'defaults.model', 'defaults.permission', 'defaults.thought_level', and 'defaults.async_image_enabled' can be overridden on built-in assistants".into(),
                     ));
                 }
 
@@ -1339,7 +1348,13 @@ impl AssistantService {
 
                 let patched = self
                     .definition_repo
-                    .upsert_for_user(user_id, &upsert_params_from_definition(&patched))
+                    .upsert_for_user(
+                        user_id,
+                        &UpsertAssistantDefinitionParams {
+                            async_image_enabled: detail_overrides.async_image_enabled,
+                            ..upsert_params_from_definition(&patched)
+                        },
+                    )
                     .await
                     .map_err(|e| AssistantError::Internal(format!("upsert generated assistant definition: {e}")))?;
                 self.sync_preferences_from_defaults_request_for_user(
@@ -2706,6 +2721,7 @@ impl AssistantService {
                     mode: definition.default_mcps_mode.clone(),
                     value: default_mcp_ids,
                 },
+                async_image_enabled: definition.async_image_enabled,
             },
             capabilities: AssistantCapabilitiesResponse {
                 default_skill_ids,
@@ -2990,6 +3006,7 @@ struct SerializedDetailOverrides {
     default_skill_ids: Option<String>,
     default_mcps_mode: Option<String>,
     default_mcp_ids: Option<String>,
+    async_image_enabled: Option<bool>,
 }
 
 impl SerializedDetailOverrides {
@@ -3023,6 +3040,7 @@ impl SerializedDetailOverrides {
         };
 
         if let Some(defaults) = defaults {
+            result.async_image_enabled = defaults.async_image_enabled;
             if let Some(model) = defaults.model.as_ref() {
                 let (mode, value) = validate_scalar_default(model, "defaults.model")?;
                 result.default_model_mode = Some(mode);
@@ -3066,6 +3084,7 @@ impl SerializedDetailOverrides {
             || self.default_skill_ids.is_some()
             || self.default_mcps_mode.is_some()
             || self.default_mcp_ids.is_some()
+            || self.async_image_enabled.is_some()
     }
 }
 
@@ -3150,6 +3169,7 @@ fn upsert_params_from_definition(definition: &AssistantDefinitionRow) -> UpsertA
         default_disabled_builtin_skill_ids: &definition.default_disabled_builtin_skill_ids,
         default_mcps_mode: &definition.default_mcps_mode,
         default_mcp_ids: &definition.default_mcp_ids,
+        async_image_enabled: None,
     }
 }
 
@@ -3915,6 +3935,7 @@ mod tests {
                 default_disabled_builtin_skill_ids: "[]",
                 default_mcps_mode: "auto",
                 default_mcp_ids: "[]",
+                async_image_enabled: None,
             })
             .await
             .unwrap();
@@ -3970,6 +3991,7 @@ mod tests {
                 default_disabled_builtin_skill_ids: "[]",
                 default_mcps_mode: "auto",
                 default_mcp_ids: "[]",
+                async_image_enabled: None,
             })
             .await
             .unwrap();
@@ -4135,6 +4157,7 @@ mod tests {
                 default_disabled_builtin_skill_ids: "[]",
                 default_mcps_mode: "auto",
                 default_mcp_ids: "[]",
+                async_image_enabled: None,
             })
             .await
             .unwrap();
@@ -4277,6 +4300,7 @@ mod tests {
                 default_disabled_builtin_skill_ids: "[]",
                 default_mcps_mode: "auto",
                 default_mcp_ids: "[]",
+                async_image_enabled: None,
             })
             .await
             .unwrap();
@@ -5528,6 +5552,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn async_image_default_is_enabled_and_can_be_overridden_per_assistant() {
+        let fx = fixture_with_builtins(vec![mk_builtin("builtin-office", "Office")]).await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("u1".into()),
+                name: "Planner".into(),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+
+        let visibility = async |id: &str| {
+            fx.service
+                .get_detail(id, None)
+                .await
+                .unwrap()
+                .defaults
+                .async_image_enabled
+        };
+        assert!(visibility("builtin-office").await);
+        assert!(visibility("u1").await);
+
+        let set_visibility = |async_image_enabled| UpdateAssistantRequest {
+            defaults: Some(AssistantDefaultsRequest {
+                async_image_enabled: Some(async_image_enabled),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        fx.service.update("u1", set_visibility(false)).await.unwrap();
+        // A legacy client omitting the new field must preserve the saved choice.
+        fx.service
+            .update(
+                "u1",
+                UpdateAssistantRequest {
+                    name: Some("Renamed".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!visibility("u1").await);
+        assert!(visibility("builtin-office").await);
+
+        fx.service
+            .update("builtin-office", set_visibility(false))
+            .await
+            .unwrap();
+        fx.service.update("u1", set_visibility(true)).await.unwrap();
+        assert!(visibility("u1").await);
+        assert!(!visibility("builtin-office").await);
+    }
+
+    #[tokio::test]
     async fn update_builtin_agent_id_writes_override() {
         let fx = fixture_with_builtins(vec![mk_builtin("builtin-office", "Office")]).await;
         let updated = fx
@@ -5691,6 +5769,7 @@ mod tests {
                             mode: "fixed".into(),
                             value: vec!["mcp-a".into()],
                         }),
+                        async_image_enabled: None,
                     }),
                     ..Default::default()
                 },
@@ -5995,6 +6074,7 @@ mod tests {
                         mode: "fixed".into(),
                         value: vec!["mcp-a".into()],
                     }),
+                    async_image_enabled: None,
                 }),
                 ..req_default()
             })
@@ -6095,6 +6175,7 @@ mod tests {
                             mode: "auto".into(),
                             value: vec![],
                         }),
+                        async_image_enabled: None,
                     }),
                     ..Default::default()
                 },
@@ -6148,6 +6229,7 @@ mod tests {
                             mode: "fixed".into(),
                             value: vec!["mcp-z".into()],
                         }),
+                        async_image_enabled: None,
                     }),
                     ..Default::default()
                 },
@@ -6188,6 +6270,7 @@ mod tests {
                         mode: "fixed".into(),
                         value: vec!["mcp-z".into()],
                     }),
+                    async_image_enabled: None,
                 }),
                 ..req_default()
             })
@@ -6216,6 +6299,7 @@ mod tests {
                             mode: "auto".into(),
                             value: vec![],
                         }),
+                        async_image_enabled: None,
                     }),
                     ..Default::default()
                 },

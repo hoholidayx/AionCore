@@ -1583,6 +1583,7 @@ async fn upsert_test_assistant_definition_with_thought_level(
         default_disabled_builtin_skill_ids: "[]",
         default_mcps_mode: "auto",
         default_mcp_ids: "[]",
+        async_image_enabled: None,
     })
     .await
     .unwrap();
@@ -7752,6 +7753,7 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
             default_disabled_builtin_skill_ids: "[]",
             default_mcps_mode: "auto",
             default_mcp_ids: "[]",
+            async_image_enabled: None,
         })
         .await
         .unwrap();
@@ -7924,6 +7926,7 @@ async fn existing_conversation_reads_current_assistant_identity() {
                 default_disabled_builtin_skill_ids: "[]",
                 default_mcps_mode: "auto",
                 default_mcp_ids: "[]",
+                async_image_enabled: None,
             },
         )
         .await
@@ -7986,6 +7989,7 @@ async fn existing_conversation_reads_current_assistant_identity() {
                 default_disabled_builtin_skill_ids: "[]",
                 default_mcps_mode: "auto",
                 default_mcp_ids: "[]",
+                async_image_enabled: None,
             },
         )
         .await
@@ -8060,6 +8064,7 @@ async fn create_routes_asset_avatar_in_assistant_identity_through_backend() {
                 default_disabled_builtin_skill_ids: "[]",
                 default_mcps_mode: "auto",
                 default_mcp_ids: "[]",
+                async_image_enabled: None,
             },
         )
         .await
@@ -8226,6 +8231,7 @@ async fn create_prefers_assistant_snapshot_over_legacy_runtime_seed_fields() {
             default_disabled_builtin_skill_ids: "[]",
             default_mcps_mode: "auto",
             default_mcp_ids: "[]",
+            async_image_enabled: None,
         })
         .await
         .unwrap();
@@ -8397,6 +8403,7 @@ async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
             default_disabled_builtin_skill_ids: r#"["todo-tracker"]"#,
             default_mcps_mode: "fixed",
             default_mcp_ids: r#"["mcp-fixed"]"#,
+            async_image_enabled: None,
         })
         .await
         .unwrap();
@@ -8505,6 +8512,7 @@ async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_va
             default_disabled_builtin_skill_ids: "[]",
             default_mcps_mode: "auto",
             default_mcp_ids: "[]",
+            async_image_enabled: None,
         })
         .await
         .unwrap();

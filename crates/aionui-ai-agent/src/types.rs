@@ -105,10 +105,18 @@ pub const CONVERSATION_RUNTIME_CONTEXT_VERSION: u32 = 2;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeCapabilities {
     pub conversation_runtime_context_version: Option<u32>,
+    /// Assistant setting for the host image tool. Unspecified builds default to enabled.
+    pub async_image_enabled: Option<bool>,
 }
 
 impl RuntimeCapabilities {
     pub fn satisfies(&self, requested: &Self) -> bool {
+        if requested
+            .async_image_enabled
+            .is_some_and(|enabled| self.async_image_enabled.unwrap_or(true) != enabled)
+        {
+            return false;
+        }
         match requested.conversation_runtime_context_version {
             Some(version) => self
                 .conversation_runtime_context_version

@@ -850,6 +850,7 @@ mod tests {
             default_disabled_builtin_skill_ids: "[]".to_owned(),
             default_mcps_mode: "auto".to_owned(),
             default_mcp_ids: "[]".to_owned(),
+            async_image_enabled: true,
             created_at: 0,
             updated_at: 0,
             deleted_at: None,

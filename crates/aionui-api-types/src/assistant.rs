@@ -171,6 +171,8 @@ pub struct AssistantDefaultsRequest {
     pub skills: Option<AssistantDefaultListRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcps: Option<AssistantDefaultListRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub async_image_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +182,12 @@ pub struct AssistantDefaultsResponse {
     pub thought_level: AssistantDefaultScalarResponse,
     pub skills: AssistantDefaultListResponse,
     pub mcps: AssistantDefaultListResponse,
+    #[serde(default = "default_true")]
+    pub async_image_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

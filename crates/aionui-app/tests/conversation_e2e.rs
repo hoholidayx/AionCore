@@ -187,6 +187,7 @@ async fn t1_3b_create_persists_available_locale_fallback_rule_in_assistant_snaps
             default_disabled_builtin_skill_ids: r#"[]"#,
             default_mcps_mode: "auto",
             default_mcp_ids: r#"[]"#,
+            async_image_enabled: None,
         })
         .await
         .unwrap();
