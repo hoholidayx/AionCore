@@ -185,6 +185,7 @@ impl From<McpTool> for McpToolResponse {
 pub struct McpServer {
     pub id: String,
     pub name: String,
+    pub backend_alias: Option<String>,
     pub description: Option<String>,
     pub enabled: bool,
     pub transport: McpServerTransport,
@@ -217,6 +218,7 @@ impl McpServer {
         Ok(Self {
             id: row.id,
             name: row.name,
+            backend_alias: row.backend_alias,
             description: row.description,
             enabled: row.enabled,
             transport,
@@ -247,6 +249,7 @@ impl McpServer {
         McpServerResponse {
             id: self.id,
             name: self.name,
+            backend_alias: self.backend_alias,
             description: self.description,
             enabled: self.enabled,
             transport: self.transport.into(),
@@ -456,6 +459,7 @@ mod tests {
             id: "mcp_123".into(),
             user_id: "user-1".into(),
             name: "test-server".into(),
+            backend_alias: None,
             description: Some("A test server".into()),
             enabled: true,
             transport_type: transport_type.into(),
@@ -556,6 +560,7 @@ mod tests {
             is_default: false,
             id: "mcp_1".into(),
             name: "test".into(),
+            backend_alias: None,
             description: None,
             enabled: true,
             transport: McpServerTransport::Stdio {
@@ -588,6 +593,7 @@ mod tests {
             is_default: false,
             id: "mcp_2".into(),
             name: "test".into(),
+            backend_alias: None,
             description: Some("desc".into()),
             enabled: false,
             transport: McpServerTransport::Http {

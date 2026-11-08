@@ -109,6 +109,8 @@ pub struct CreateMcpServerRequest {
     #[serde(default)]
     pub purpose: Option<McpServerPurpose>,
     pub name: String,
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub backend_alias: Option<Option<String>>,
     #[serde(default)]
     pub description: Option<String>,
     pub transport: McpTransport,
@@ -128,6 +130,8 @@ pub struct ImportMcpServerRequest {
     #[serde(default)]
     pub purpose: Option<McpServerPurpose>,
     pub name: String,
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub backend_alias: Option<Option<String>>,
     #[serde(default)]
     pub description: Option<String>,
     pub transport: McpTransport,
@@ -146,6 +150,8 @@ pub struct UpdateMcpServerRequest {
     pub purpose: Option<McpServerPurpose>,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub backend_alias: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     pub description: Option<Option<String>>,
     #[serde(default)]
@@ -183,6 +189,8 @@ pub struct McpServerResponse {
     pub is_default: bool,
     pub id: String,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_alias: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub enabled: bool,
@@ -466,6 +474,7 @@ mod tests {
         let req: UpdateMcpServerRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.name.as_deref(), Some("new-name"));
         assert!(req.description.is_none()); // absent → keep
+        assert!(req.backend_alias.is_none());
         assert!(req.transport.is_none());
     }
 
@@ -484,6 +493,13 @@ mod tests {
         assert_eq!(req.description, Some(Some("new desc".into())));
     }
 
+    #[test]
+    fn test_update_backend_alias_must_be_string_or_null() {
+        let req: UpdateMcpServerRequest = serde_json::from_value(serde_json::json!({ "backend_alias": null })).unwrap();
+        assert_eq!(req.backend_alias, Some(None));
+        assert!(serde_json::from_value::<UpdateMcpServerRequest>(serde_json::json!({ "backend_alias": 42 })).is_err());
+    }
+
     // -- McpServerResponse ----------------------------------------------------
 
     #[test]
@@ -493,6 +509,7 @@ mod tests {
             is_default: false,
             id: "mcp_123".into(),
             name: "test".into(),
+            backend_alias: None,
             description: None,
             enabled: true,
             transport: McpTransport::Stdio {
@@ -512,6 +529,7 @@ mod tests {
         assert_eq!(json["id"], "mcp_123");
         assert_eq!(json["enabled"], true);
         assert_eq!(json["last_test_status"], "disconnected");
+        assert!(json.get("backend_alias").is_none());
         assert!(json.get("description").is_none()); // None skipped
         assert!(json.get("tools").is_none());
     }
@@ -662,6 +680,7 @@ mod tests {
                 is_default: false,
                 id: "detected_test".into(),
                 name: "test".into(),
+                backend_alias: None,
                 description: None,
                 enabled: false,
                 transport: McpTransport::Http {

@@ -808,6 +808,7 @@ async fn setting_image_default_requires_authentication_and_an_enabled_owned_imag
         .create(CreateMcpServerParams {
             user_id: &foreign.id,
             name: "foreign-image",
+            backend_alias: None,
             description: None,
             enabled: true,
             transport_type: "http",

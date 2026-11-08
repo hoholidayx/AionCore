@@ -22,6 +22,7 @@ fn row(transport_type: &str, transport_config: &str, tools: Option<&str>, status
         user_id: TEST_USER_ID.to_string(),
         id: "mcp_integration".into(),
         name: "integration-test".into(),
+        backend_alias: None,
         description: Some("Integration test server".into()),
         enabled: true,
         transport_type: transport_type.into(),

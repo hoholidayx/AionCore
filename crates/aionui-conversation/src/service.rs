@@ -6347,6 +6347,7 @@ mod tests {
             id: "mcp-disabled".into(),
             user_id: "user-1".into(),
             name: "selected-disabled".into(),
+            backend_alias: None,
             description: None,
             enabled: false,
             transport_type: "stdio".into(),

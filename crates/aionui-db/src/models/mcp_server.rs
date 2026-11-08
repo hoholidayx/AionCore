@@ -14,6 +14,7 @@ pub struct McpServerRow {
     pub user_id: String,
     /// Unique server name (used as identifier when syncing to Agent CLIs).
     pub name: String,
+    pub backend_alias: Option<String>,
     pub description: Option<String>,
     /// Whether this server is synced to Agent CLIs.
     pub enabled: bool,
@@ -40,6 +41,10 @@ pub struct McpServerRow {
 }
 
 impl McpServerRow {
+    pub fn image_backend_selector(&self) -> &str {
+        self.backend_alias.as_deref().unwrap_or(&self.name)
+    }
+
     pub fn is_enabled_image_backend(&self) -> bool {
         self.enabled
             && !self.builtin

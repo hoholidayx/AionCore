@@ -42,11 +42,11 @@ pub trait IMcpServerRepository: Send + Sync {
     }
 
     /// Creates a new MCP server and returns the inserted row.
-    /// Returns `DbError::Conflict` if the name already exists.
+    /// Returns `DbError::Conflict` if the name or image backend selector already exists.
     async fn create(&self, params: CreateMcpServerParams<'_>) -> Result<McpServerRow, DbError>;
 
     /// Updates an existing MCP server. Returns `DbError::NotFound` if the ID
-    /// doesn't exist, `DbError::Conflict` if the new name collides with another.
+    /// doesn't exist, `DbError::Conflict` if the new name or image backend selector collides.
     async fn update(&self, user_id: &str, id: &str, params: UpdateMcpServerParams<'_>)
     -> Result<McpServerRow, DbError>;
 
@@ -87,6 +87,7 @@ pub trait IMcpServerRepository: Send + Sync {
 pub struct CreateMcpServerParams<'a> {
     pub user_id: &'a str,
     pub name: &'a str,
+    pub backend_alias: Option<&'a str>,
     pub description: Option<&'a str>,
     pub enabled: bool,
     pub transport_type: &'a str,
@@ -105,6 +106,7 @@ pub struct CreateMcpServerParams<'a> {
 #[derive(Debug, Default)]
 pub struct UpdateMcpServerParams<'a> {
     pub name: Option<&'a str>,
+    pub backend_alias: Option<Option<&'a str>>,
     pub description: Option<Option<&'a str>>,
     pub enabled: Option<bool>,
     pub transport_type: Option<&'a str>,

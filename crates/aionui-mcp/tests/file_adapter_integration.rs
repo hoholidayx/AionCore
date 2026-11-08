@@ -119,6 +119,7 @@ mod aionui {
             user_id: TEST_USER_ID.to_string(),
             id: format!("mcp_{name}"),
             name: name.to_owned(),
+            backend_alias: None,
             description: None,
             enabled: true,
             transport_type: t_type.into(),

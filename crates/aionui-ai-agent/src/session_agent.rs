@@ -4980,6 +4980,7 @@ mod build_mapping_tests {
             id: id.into(),
             user_id: "user-1".into(),
             name: name.into(),
+            backend_alias: None,
             description: None,
             enabled: true,
             transport_type: "http".into(),

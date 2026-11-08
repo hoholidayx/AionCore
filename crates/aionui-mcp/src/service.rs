@@ -34,6 +34,7 @@ pub struct McpConfigService {
 struct UpsertMcpServer<'a> {
     user_id: &'a str,
     name: &'a str,
+    backend_alias: Option<Option<String>>,
     description: Option<&'a str>,
     transport: &'a McpServerTransport,
     original_json: Option<&'a str>,
@@ -75,6 +76,7 @@ impl McpConfigService {
         self.upsert_server(UpsertMcpServer {
             user_id,
             name: &req.name,
+            backend_alias: req.backend_alias,
             description: req.description.as_deref(),
             transport: &transport,
             original_json: req.original_json.as_deref(),
@@ -130,18 +132,21 @@ impl McpConfigService {
         let config_json = transport.as_ref().map(McpServerTransport::to_config_json).transpose()?;
 
         let purpose = req.purpose.map(McpServerPurpose::as_str);
+        let effective_purpose = purpose.unwrap_or(&existing_server.purpose);
         let transport_type = match transport.as_ref() {
             Some(transport) => transport.transport_type(),
             None => existing_server.transport_type.as_str(),
         };
         validate_purpose(
-            purpose.unwrap_or(&existing_server.purpose),
+            effective_purpose,
             transport_type,
             req.builtin.unwrap_or(existing_server.builtin),
         )?;
+        let backend_alias = normalize_backend_alias(req.backend_alias, effective_purpose)?;
         let params = UpdateMcpServerParams {
             purpose,
             name: req.name.as_deref(),
+            backend_alias: backend_alias.as_ref().map(Option::as_deref),
             description: req.description.as_ref().map(|opt| opt.as_deref()),
             transport_type: transport.as_ref().map(McpServerTransport::transport_type),
             transport_config: config_json.as_deref(),
@@ -150,7 +155,7 @@ impl McpConfigService {
             ..Default::default()
         };
 
-        let row = self.repo.update(user_id, id, params).await.map_err(map_update_error)?;
+        let row = self.repo.update(user_id, id, params).await.map_err(map_repo_error)?;
         let server = McpServer::from_row(row)?;
         Ok(server.into_response())
     }
@@ -198,7 +203,7 @@ impl McpConfigService {
             .repo
             .set_image_default(user_id, server_id)
             .await
-            .map_err(map_update_error)?;
+            .map_err(map_repo_error)?;
         if !updated {
             return Err(McpError::InvalidEdit(
                 "The default must be an enabled asynchronous image MCP server".into(),
@@ -236,6 +241,7 @@ impl McpConfigService {
                 .upsert_server(UpsertMcpServer {
                     user_id,
                     name: &server_req.name,
+                    backend_alias: server_req.backend_alias,
                     description: server_req.description.as_deref(),
                     transport: &transport,
                     original_json: server_req.original_json.as_deref(),
@@ -276,6 +282,7 @@ impl McpConfigService {
         let UpsertMcpServer {
             user_id,
             name,
+            backend_alias,
             description,
             transport,
             original_json,
@@ -286,20 +293,22 @@ impl McpConfigService {
         let purpose = purpose.map(McpServerPurpose::as_str);
         let config_json = transport.to_config_json()?;
 
-        if let Some(existing) = self.repo.find_by_name_any(user_id, name).await? {
-            if existing.builtin {
-                return Err(McpError::Conflict(format!(
-                    "Builtin MCP server name '{name}' is reserved"
-                )));
-            }
+        let existing = self.repo.find_by_name_any(user_id, name).await?;
+        if existing.as_ref().is_some_and(|server| server.builtin) {
+            return Err(McpError::Conflict(format!(
+                "Builtin MCP server name '{name}' is reserved"
+            )));
+        }
+        let effective_purpose = purpose
+            .or_else(|| existing.as_ref().map(|server| server.purpose.as_str()))
+            .unwrap_or("general");
+        validate_purpose(effective_purpose, transport.transport_type(), builtin)?;
+        let backend_alias = normalize_backend_alias(backend_alias, effective_purpose)?;
 
-            validate_purpose(
-                purpose.unwrap_or(&existing.purpose),
-                transport.transport_type(),
-                builtin,
-            )?;
+        if let Some(existing) = existing {
             let params = UpdateMcpServerParams {
                 purpose,
+                backend_alias: backend_alias.as_ref().map(Option::as_deref),
                 description: Some(description),
                 enabled: existing.deleted_at.is_some().then_some(enabled),
                 transport_type: Some(transport.transport_type()),
@@ -313,16 +322,16 @@ impl McpConfigService {
                 .repo
                 .update(user_id, &existing.id, params)
                 .await
-                .map_err(map_update_error)?;
+                .map_err(map_repo_error)?;
             let server = McpServer::from_row(updated)?;
             return Ok(server.into_response());
         }
 
-        validate_purpose(purpose.unwrap_or("general"), transport.transport_type(), builtin)?;
         let params = CreateMcpServerParams {
             purpose,
             user_id,
             name,
+            backend_alias: backend_alias.as_ref().and_then(Option::as_deref),
             description,
             enabled,
             transport_type: transport.transport_type(),
@@ -331,13 +340,13 @@ impl McpConfigService {
             original_json,
             builtin,
         };
-        let row = self.repo.create(params).await?;
+        let row = self.repo.create(params).await.map_err(map_repo_error)?;
         let server = McpServer::from_row(row)?;
         Ok(server.into_response())
     }
 }
 
-fn map_update_error(error: DbError) -> McpError {
+fn map_repo_error(error: DbError) -> McpError {
     match error {
         DbError::NotFound(message) => McpError::NotFound(message),
         DbError::Conflict(message) => McpError::Conflict(message),
@@ -352,6 +361,29 @@ fn validate_purpose(purpose: &str, transport_type: &str, builtin: bool) -> Resul
         ));
     }
     Ok(())
+}
+
+fn normalize_backend_alias(alias: Option<Option<String>>, purpose: &str) -> Result<Option<Option<String>>, McpError> {
+    let Some(Some(alias)) = alias else {
+        return Ok(alias);
+    };
+    if purpose != "async_image" {
+        return Err(McpError::InvalidEdit(
+            "Backend aliases are only available for asynchronous image MCP servers".into(),
+        ));
+    }
+    let alias = alias.trim().to_ascii_lowercase();
+    if alias.len() > 32
+        || !alias
+            .split('-')
+            .all(|part| !part.is_empty() && part.bytes().all(|ch| ch.is_ascii_alphanumeric()))
+    {
+        return Err(McpError::InvalidEdit(
+            "Image backend aliases must contain 1–32 ASCII letters or digits, with optional single hyphens between segments"
+                .into(),
+        ));
+    }
+    Ok(Some(Some(alias)))
 }
 
 fn normalize_transport(transport: McpServerTransport) -> Result<McpServerTransport, McpError> {
@@ -541,6 +573,7 @@ mod tests {
                 id: self.next_id(),
                 user_id: params.user_id.to_owned(),
                 name: params.name.to_owned(),
+                backend_alias: None,
                 description: params.description.map(String::from),
                 enabled: params.enabled,
                 transport_type: params.transport_type.to_owned(),
@@ -653,6 +686,7 @@ mod tests {
                         id: self.next_id(),
                         user_id: params.user_id.to_owned(),
                         name: params.name.to_owned(),
+                        backend_alias: None,
                         description: params.description.map(String::from),
                         enabled: params.enabled,
                         transport_type: params.transport_type.to_owned(),
@@ -711,6 +745,7 @@ mod tests {
         CreateMcpServerRequest {
             purpose: None,
             name: name.to_owned(),
+            backend_alias: None,
             description: Some("test server".to_owned()),
             transport: McpTransport::Stdio {
                 command: "npx".into(),
@@ -726,6 +761,7 @@ mod tests {
         CreateMcpServerRequest {
             purpose: None,
             name: name.to_owned(),
+            backend_alias: None,
             description: None,
             transport: McpTransport::Http {
                 url: "https://example.com/mcp".into(),
@@ -740,6 +776,7 @@ mod tests {
         ImportMcpServerRequest {
             purpose: None,
             name: name.to_owned(),
+            backend_alias: None,
             description: Some("test server".to_owned()),
             transport: McpTransport::Stdio {
                 command: "npx".into(),
@@ -756,6 +793,7 @@ mod tests {
         ImportMcpServerRequest {
             purpose: None,
             name: name.to_owned(),
+            backend_alias: None,
             description: None,
             transport: McpTransport::Http {
                 url: "https://example.com/mcp".into(),
@@ -848,6 +886,7 @@ mod tests {
                 CreateMcpServerRequest {
                     purpose: None,
                     name: "stdio-full".into(),
+                    backend_alias: None,
                     description: Some("full stdio".into()),
                     transport: McpTransport::Stdio {
                         command: "node".into(),
@@ -881,6 +920,7 @@ mod tests {
                 UpdateMcpServerRequest {
                     purpose: None,
                     name: Some("new-name".into()),
+                    backend_alias: None,
                     description: None,
                     transport: None,
                     original_json: None,
@@ -903,6 +943,7 @@ mod tests {
                 UpdateMcpServerRequest {
                     purpose: None,
                     name: None,
+                    backend_alias: None,
                     description: None,
                     transport: Some(McpTransport::Http {
                         url: "https://new.url".into(),
@@ -933,6 +974,7 @@ mod tests {
                 UpdateMcpServerRequest {
                     purpose: None,
                     name: None,
+                    backend_alias: None,
                     description: Some(None), // clear
                     transport: None,
                     original_json: None,
@@ -954,6 +996,7 @@ mod tests {
                 UpdateMcpServerRequest {
                     purpose: None,
                     name: Some("x".into()),
+                    backend_alias: None,
                     description: None,
                     transport: None,
                     original_json: None,
@@ -980,6 +1023,7 @@ mod tests {
                 TEST_USER_ID,
                 &b.id,
                 UpdateMcpServerRequest {
+                    backend_alias: None,
                     purpose: None,
                     name: Some("server-a".into()), // conflict
                     description: None,
@@ -1008,6 +1052,7 @@ mod tests {
                 UpdateMcpServerRequest {
                     purpose: None,
                     name: Some("server-a".into()),
+                    backend_alias: None,
                     description: None,
                     transport: None,
                     original_json: None,
@@ -1034,6 +1079,7 @@ mod tests {
                 UpdateMcpServerRequest {
                     purpose: None,
                     name: None,
+                    backend_alias: None,
                     description: None,
                     transport: None,
                     original_json: None,
@@ -1160,6 +1206,7 @@ mod tests {
             CreateMcpServerRequest {
                 purpose: None,
                 name: "chrome-devtools".into(),
+                backend_alias: None,
                 description: Some("builtin".into()),
                 transport: McpTransport::Stdio {
                     command: "npx".into(),
@@ -1188,6 +1235,7 @@ mod tests {
             CreateMcpServerRequest {
                 purpose: None,
                 name: "chrome-devtools".into(),
+                backend_alias: None,
                 description: Some("builtin".into()),
                 transport: McpTransport::Stdio {
                     command: "npx".into(),
@@ -1207,6 +1255,7 @@ mod tests {
                 CreateMcpServerRequest {
                     purpose: None,
                     name: "chrome-devtools".into(),
+                    backend_alias: None,
                     description: Some("malicious override".into()),
                     transport: McpTransport::Http {
                         url: "https://example.com/mcp".into(),
@@ -1229,6 +1278,7 @@ mod tests {
             CreateMcpServerRequest {
                 purpose: None,
                 name: "chrome-devtools".into(),
+                backend_alias: None,
                 description: Some("builtin".into()),
                 transport: McpTransport::Stdio {
                     command: "npx".into(),
@@ -1250,6 +1300,7 @@ mod tests {
                         ImportMcpServerRequest {
                             purpose: None,
                             name: "chrome-devtools".into(),
+                            backend_alias: None,
                             description: Some("imported".into()),
                             transport: McpTransport::Http {
                                 url: "https://example.com/mcp".into(),
@@ -1262,6 +1313,7 @@ mod tests {
                         ImportMcpServerRequest {
                             purpose: None,
                             name: "playwright".into(),
+                            backend_alias: None,
                             description: Some("imported".into()),
                             transport: McpTransport::Stdio {
                                 command: "npx".into(),
@@ -1291,6 +1343,7 @@ mod tests {
                 CreateMcpServerRequest {
                     purpose: None,
                     name: "sentry".into(),
+                    backend_alias: None,
                     description: None,
                     transport: McpTransport::Stdio {
                         command: "npx @sentry/mcp-server@latest --organization-slug=demo".into(),

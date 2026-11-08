@@ -181,6 +181,7 @@ mod tests {
             id: format!("mcp_{name}"),
             user_id: "user-1".into(),
             name: name.to_owned(),
+            backend_alias: None,
             description: None,
             enabled: true,
             transport_type: transport_type.into(),

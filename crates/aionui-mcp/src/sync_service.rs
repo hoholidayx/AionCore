@@ -87,6 +87,7 @@ fn detected_to_response(detected: DetectedServer) -> DetectedMcpServerEntry {
             is_default: false,
             id: format!("detected_{}", detected.name),
             name: detected.name,
+            backend_alias: None,
             description: None,
             enabled: false,
             transport: detected.transport.into(),

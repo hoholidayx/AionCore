@@ -255,6 +255,7 @@ mod tests {
             is_default: false,
             id: format!("mcp_{name}"),
             name: name.into(),
+            backend_alias: None,
             description: None,
             enabled,
             transport,

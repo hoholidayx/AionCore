@@ -9,7 +9,8 @@ const TEST_USER_ID: &str = "system_default_user";
 const OTHER_USERNAME: &str = "user-2";
 
 use aionui_api_types::{
-    BatchImportMcpServersRequest, CreateMcpServerRequest, ImportMcpServerRequest, McpTransport, UpdateMcpServerRequest,
+    BatchImportMcpServersRequest, CreateMcpServerRequest, ImportMcpServerRequest, McpServerPurpose, McpTransport,
+    UpdateMcpServerRequest,
 };
 use aionui_db::{IUserRepository, SqliteMcpServerRepository, SqliteUserRepository};
 use aionui_mcp::{McpConfigService, McpError};
@@ -30,6 +31,7 @@ fn stdio_req(name: &str) -> CreateMcpServerRequest {
     CreateMcpServerRequest {
         purpose: None,
         name: name.to_owned(),
+        backend_alias: None,
         description: Some("test".to_owned()),
         transport: McpTransport::Stdio {
             command: "npx".into(),
@@ -45,6 +47,7 @@ fn http_req(name: &str) -> CreateMcpServerRequest {
     CreateMcpServerRequest {
         purpose: None,
         name: name.to_owned(),
+        backend_alias: None,
         description: None,
         transport: McpTransport::Http {
             url: "https://example.com/mcp".into(),
@@ -59,6 +62,7 @@ fn stdio_import_req(name: &str) -> ImportMcpServerRequest {
     ImportMcpServerRequest {
         purpose: None,
         name: name.to_owned(),
+        backend_alias: None,
         description: Some("test".to_owned()),
         transport: McpTransport::Stdio {
             command: "npx".into(),
@@ -75,6 +79,7 @@ fn http_import_req(name: &str) -> ImportMcpServerRequest {
     ImportMcpServerRequest {
         purpose: None,
         name: name.to_owned(),
+        backend_alias: None,
         description: None,
         transport: McpTransport::Http {
             url: "https://example.com/mcp".into(),
@@ -84,6 +89,121 @@ fn http_import_req(name: &str) -> ImportMcpServerRequest {
         builtin: false,
         enabled: None,
     }
+}
+
+#[tokio::test]
+async fn image_backend_alias_survives_omission_and_clears_with_null() {
+    let svc = make_service().await;
+    let name = "Example Image Backend";
+    let mut server = http_import_req(name);
+    server.purpose = Some(McpServerPurpose::AsyncImage);
+    server.enabled = Some(true);
+    let imported = svc
+        .batch_import(TEST_USER_ID, BatchImportMcpServersRequest { servers: vec![server] })
+        .await
+        .unwrap();
+    let legacy = &imported[0];
+    assert!(legacy.backend_alias.is_none());
+    svc.set_image_default(TEST_USER_ID, Some(&legacy.id)).await.unwrap();
+
+    let edit = serde_json::from_value(serde_json::json!({ "backend_alias": "  Example-Fast-2  " })).unwrap();
+    let updated = svc.edit_server(TEST_USER_ID, &legacy.id, edit).await.unwrap();
+    assert_eq!(updated.backend_alias.as_deref(), Some("example-fast-2"));
+
+    let omitted = BatchImportMcpServersRequest {
+        servers: vec![http_import_req(name)],
+    };
+    let updated = svc.batch_import(TEST_USER_ID, omitted).await.unwrap();
+    assert_eq!(updated[0].id, legacy.id);
+    assert_eq!(updated[0].backend_alias.as_deref(), Some("example-fast-2"));
+    assert!(updated[0].is_default);
+
+    let cleared = serde_json::from_value(serde_json::json!({
+        "servers": [{
+            "name": name,
+            "backend_alias": null,
+            "transport": { "type": "http", "url": "https://example.com/mcp" }
+        }]
+    }))
+    .unwrap();
+    let updated = svc.batch_import(TEST_USER_ID, cleared).await.unwrap();
+    assert_eq!(updated[0].name, name);
+    assert!(updated[0].backend_alias.is_none());
+    assert!(updated[0].is_default);
+    let stored = svc.get_server(TEST_USER_ID, &legacy.id).await.unwrap();
+    assert!(stored.backend_alias.is_none());
+}
+
+#[tokio::test]
+async fn image_backend_aliases_cannot_collide_with_account_selectors() {
+    let (svc, other_user) = make_service_with_other_user().await;
+    let mut server = http_req("legacy-image");
+    server.purpose = Some(McpServerPurpose::AsyncImage);
+    let legacy = svc.add_server(TEST_USER_ID, server).await.unwrap();
+
+    let mut conflicting = http_import_req("Provider Image");
+    conflicting.purpose = Some(McpServerPurpose::AsyncImage);
+    conflicting.backend_alias = Some(Some(" Legacy-Image ".into()));
+    let error = svc
+        .batch_import(
+            TEST_USER_ID,
+            BatchImportMcpServersRequest {
+                servers: vec![conflicting],
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, McpError::Conflict(message) if message == "Image backend selector 'legacy-image' already exists")
+    );
+
+    for user in [TEST_USER_ID, &other_user] {
+        let mut server = http_req("Provider Image");
+        server.purpose = Some(McpServerPurpose::AsyncImage);
+        server.backend_alias = Some(Some("provider-image".into()));
+        let created = svc.add_server(user, server).await.unwrap();
+        assert_eq!(created.backend_alias.as_deref(), Some("provider-image"));
+    }
+
+    let edit = serde_json::from_value(serde_json::json!({ "backend_alias": "provider-image" })).unwrap();
+    let error = svc.edit_server(TEST_USER_ID, &legacy.id, edit).await.unwrap_err();
+    assert!(
+        matches!(error, McpError::Conflict(message) if message == "Image backend selector 'provider-image' already exists")
+    );
+    assert!(
+        svc.get_server(TEST_USER_ID, &legacy.id)
+            .await
+            .unwrap()
+            .backend_alias
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn image_backend_alias_validation_applies_on_create() {
+    let svc = make_service().await;
+    for alias in [
+        "",
+        "extra--hyphen",
+        "space here",
+        "图",
+        "123456789012345678901234567890123",
+    ] {
+        let mut server = http_req("Invalid Image Alias");
+        server.purpose = Some(McpServerPurpose::AsyncImage);
+        server.backend_alias = Some(Some(alias.into()));
+        let error = svc.add_server(TEST_USER_ID, server).await.unwrap_err();
+        assert!(
+            matches!(error, McpError::InvalidEdit(message) if message.starts_with("Image backend aliases must contain"))
+        );
+    }
+
+    let mut server = http_req("General MCP");
+    server.backend_alias = Some(Some("general-alias".into()));
+    let error = svc.add_server(TEST_USER_ID, server).await.unwrap_err();
+    assert!(
+        matches!(error, McpError::InvalidEdit(message) if message == "Backend aliases are only available for asynchronous image MCP servers")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +297,7 @@ async fn servers_are_scoped_by_current_user() {
             UpdateMcpServerRequest {
                 purpose: None,
                 name: None,
+                backend_alias: None,
                 description: Some(Some("forged".into())),
                 transport: None,
                 original_json: None,
@@ -215,6 +336,7 @@ async fn edit_name_is_rejected() {
             UpdateMcpServerRequest {
                 purpose: None,
                 name: Some("new".into()),
+                backend_alias: None,
                 description: None,
                 transport: None,
                 original_json: None,
@@ -238,6 +360,7 @@ async fn edit_transport() {
             UpdateMcpServerRequest {
                 purpose: None,
                 name: None,
+                backend_alias: None,
                 description: None,
                 transport: Some(McpTransport::Sse {
                     url: "https://new.url".into(),
@@ -268,6 +391,7 @@ async fn edit_clears_description() {
             UpdateMcpServerRequest {
                 purpose: None,
                 name: None,
+                backend_alias: None,
                 description: Some(None),
                 transport: None,
                 original_json: None,
@@ -289,6 +413,7 @@ async fn edit_not_found() {
             UpdateMcpServerRequest {
                 purpose: None,
                 name: Some("x".into()),
+                backend_alias: None,
                 description: None,
                 transport: None,
                 original_json: None,
@@ -313,6 +438,7 @@ async fn edit_name_conflict() {
             UpdateMcpServerRequest {
                 purpose: None,
                 name: Some("a".into()),
+                backend_alias: None,
                 description: None,
                 transport: None,
                 original_json: None,

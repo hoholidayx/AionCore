@@ -107,8 +107,8 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
             "INSERT INTO mcp_servers \
                 (id, user_id, name, description, enabled, transport_type, transport_config, \
                  tools, last_test_status, last_connected, original_json, builtin, \
-                 deleted_at, created_at, updated_at, purpose) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 deleted_at, created_at, updated_at, purpose, backend_alias) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(params.user_id)
@@ -126,19 +126,16 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
         .bind(now)
         .bind(now)
         .bind(purpose)
+        .bind(params.backend_alias)
         .execute(&self.pool)
         .await
-        .map_err(|e| match &e {
-            sqlx::Error::Database(db_err) if is_unique_violation(db_err.as_ref()) => {
-                DbError::Conflict(format!("MCP server name '{}' already exists", params.name))
-            }
-            _ => DbError::Query(e),
-        })?;
+        .map_err(|err| map_write_error(err, params.name, params.backend_alias.unwrap_or(params.name)))?;
 
         Ok(McpServerRow {
             id,
             user_id: params.user_id.to_string(),
             name: params.name.to_string(),
+            backend_alias: params.backend_alias.map(String::from),
             description: params.description.map(String::from),
             enabled: params.enabled,
             transport_type: params.transport_type.to_string(),
@@ -185,7 +182,7 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
             "UPDATE mcp_servers SET \
                 name = ?, description = ?, enabled = ?, transport_type = ?, \
                 transport_config = ?, tools = ?, original_json = ?, \
-                builtin = ?, deleted_at = ?, updated_at = ?, purpose = ?, is_default = ? \
+                builtin = ?, deleted_at = ?, updated_at = ?, purpose = ?, is_default = ?, backend_alias = ? \
              WHERE user_id = ? AND id = ?",
         )
         .bind(&merged.name)
@@ -200,16 +197,12 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
         .bind(merged.updated_at)
         .bind(&merged.purpose)
         .bind(merged.is_default)
+        .bind(&merged.backend_alias)
         .bind(user_id)
         .bind(id)
         .execute(&mut *tx)
         .await
-        .map_err(|e| match &e {
-            sqlx::Error::Database(db_err) if is_unique_violation(db_err.as_ref()) => {
-                DbError::Conflict(format!("MCP server name '{}' already exists", merged.name))
-            }
-            _ => DbError::Query(e),
-        })?;
+        .map_err(|err| map_write_error(err, &merged.name, merged.image_backend_selector()))?;
 
         if changes_image_purpose {
             remove_image_snapshots(&mut tx, user_id, id).await?;
@@ -284,6 +277,7 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
             let row = match self.find_by_name(user_id, params.name).await? {
                 Some(existing) => {
                     let update_params = UpdateMcpServerParams {
+                        backend_alias: params.backend_alias.map(Some),
                         description: Some(params.description),
                         enabled: Some(params.enabled),
                         transport_type: Some(params.transport_type),
@@ -391,10 +385,16 @@ async fn remove_image_snapshots(
 fn merge_update(existing: McpServerRow, params: UpdateMcpServerParams<'_>) -> McpServerRow {
     let now = aionui_common::now_ms();
     let purpose = params.purpose.unwrap_or(&existing.purpose).to_owned();
+    let backend_alias = match params.backend_alias {
+        Some(alias) => alias.map(String::from),
+        None if purpose == "async_image" => existing.backend_alias,
+        None => None,
+    };
     McpServerRow {
         id: existing.id,
         user_id: existing.user_id,
         name: params.name.unwrap_or(&existing.name).to_string(),
+        backend_alias,
         description: params.description.map_or(existing.description, |v| v.map(String::from)),
         enabled: params.enabled.unwrap_or(existing.enabled),
         transport_type: params.transport_type.unwrap_or(&existing.transport_type).to_string(),
@@ -417,8 +417,17 @@ fn merge_update(existing: McpServerRow, params: UpdateMcpServerParams<'_>) -> Mc
     }
 }
 
-fn is_unique_violation(err: &dyn sqlx::error::DatabaseError) -> bool {
-    err.code().is_some_and(|c| c == "2067")
+fn map_write_error(err: sqlx::Error, name: &str, selector: &str) -> DbError {
+    match &err {
+        sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
+            if db_err.message().contains("mcp_servers_image_backend_selector") {
+                DbError::Conflict(format!("Image backend selector '{selector}' already exists"))
+            } else {
+                DbError::Conflict(format!("MCP server name '{name}' already exists"))
+            }
+        }
+        _ => DbError::Query(err),
+    }
 }
 
 #[cfg(test)]
@@ -449,6 +458,7 @@ mod tests {
             purpose: None,
             user_id: USER_A,
             name: "test-mcp",
+            backend_alias: None,
             description: Some("A test MCP server"),
             enabled: false,
             transport_type: "stdio",
@@ -464,6 +474,7 @@ mod tests {
             purpose: None,
             user_id: USER_A,
             name: "http-mcp",
+            backend_alias: None,
             description: None,
             enabled: true,
             transport_type: "http",
