@@ -209,6 +209,7 @@ fn bare_assistant_definition_params<'a>(
         default_mcps_mode: "auto",
         default_mcp_ids: "[]",
         async_image_enabled: None,
+        async_image_backend_ids: None,
     }
 }
 

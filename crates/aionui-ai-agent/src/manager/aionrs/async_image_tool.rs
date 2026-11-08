@@ -64,7 +64,7 @@ impl AsyncImageTool {
         files: &[String],
         blocks: &mut Vec<ContentBlock>,
     ) -> AttachmentTurnGuard {
-        let backends = match self.queue.backends(&self.user_id).await {
+        let backends = match self.queue.backends(&self.user_id, &self.conversation_id).await {
             Ok(backends) => backends,
             Err(error) => {
                 tracing::warn!(conversation_id = %self.conversation_id, code = error.code, "Could not load image backends");

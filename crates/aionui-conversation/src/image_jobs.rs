@@ -13,11 +13,12 @@ use aionui_ai_agent::async_image::{
 use aionui_api_types::McpToolResponse;
 use aionui_common::{TimestampMs, now_ms};
 use aionui_db::models::{
-    AsyncImageJobKey, AsyncImageJobReceiptRow, AsyncImageJobState as State, ClaimedAsyncImageJob, McpServerRow,
-    MessageRow, NewAsyncImageJob,
+    AsyncImageJobKey, AsyncImageJobReceiptRow, AsyncImageJobState as State, ClaimedAsyncImageJob,
+    ConversationAssistantSnapshotRow, ConversationRow, McpServerRow, MessageRow, NewAsyncImageJob,
 };
 use aionui_db::{
-    AsyncImageJobUpdate, DbError, IAsyncImageJobRepository, IConversationRepository, IMcpServerRepository,
+    AsyncImageJobUpdate, DbError, IAssistantDefinitionRepository, IAsyncImageJobRepository, IConversationRepository,
+    IMcpServerRepository,
 };
 use aionui_realtime::EventBroadcaster;
 use base64::Engine;
@@ -49,6 +50,7 @@ pub struct AsyncImageJobs {
     repo: Arc<dyn IAsyncImageJobRepository>,
     mcp_repo: Arc<dyn IMcpServerRepository>,
     conversation_repo: Arc<dyn IConversationRepository>,
+    assistant_repo: Arc<dyn IAssistantDefinitionRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
     wake: Notify,
     clients: ImageJobClients,
@@ -67,16 +69,46 @@ impl AsyncImageJobs {
         repo: Arc<dyn IAsyncImageJobRepository>,
         mcp_repo: Arc<dyn IMcpServerRepository>,
         conversation_repo: Arc<dyn IConversationRepository>,
+        assistant_repo: Arc<dyn IAssistantDefinitionRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
     ) -> Self {
         Self {
             repo,
             mcp_repo,
             conversation_repo,
+            assistant_repo,
             broadcaster,
             wake: Notify::new(),
             clients: ImageJobClients::default(),
         }
+    }
+
+    async fn allowed_backends(
+        &self,
+        conversation: &ConversationRow,
+        extra: &Value,
+    ) -> Result<Vec<McpServerRow>, AsyncImageError> {
+        let snapshot = self
+            .conversation_repo
+            .get_assistant_snapshot(&conversation.user_id, &conversation.id)
+            .await
+            .map_err(database_error)?;
+        let allowed = image_backend_ids_for_assistant(
+            Some(self.assistant_repo.as_ref()),
+            &conversation.user_id,
+            image_assistant_id(snapshot.as_ref(), extra),
+        )
+        .await
+        .map_err(database_error)?;
+        let rows = self
+            .mcp_repo
+            .list(&conversation.user_id)
+            .await
+            .map_err(database_error)?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| image_backend_allowed(row, allowed.as_deref()))
+            .collect())
     }
 
     pub async fn read_image(
@@ -280,11 +312,17 @@ impl AsyncImageJobs {
 
 #[async_trait::async_trait]
 impl AsyncImageQueue for AsyncImageJobs {
-    async fn backends(&self, user_id: &str) -> Result<Vec<AsyncImageBackend>, AsyncImageError> {
-        let rows = self.mcp_repo.list(user_id).await.map_err(database_error)?;
+    async fn backends(&self, user_id: &str, conversation_id: &str) -> Result<Vec<AsyncImageBackend>, AsyncImageError> {
+        let conversation = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await
+            .map_err(database_error)?
+            .ok_or_else(|| AsyncImageError::new("conversation_not_found", "Image conversation not found"))?;
+        let extra = serde_json::from_str(&conversation.extra).unwrap_or(Value::Null);
+        let rows = self.allowed_backends(&conversation, &extra).await?;
         Ok(rows
             .into_iter()
-            .filter(McpServerRow::is_enabled_image_backend)
             .map(|row| {
                 let supports_edit = row
                     .tools
@@ -336,7 +374,7 @@ impl AsyncImageQueue for AsyncImageJobs {
             .ok_or_else(|| AsyncImageError::new("conversation_not_found", "Image conversation not found"))?;
         let extra = serde_json::from_str::<Value>(&conversation.extra).unwrap_or(Value::Null);
         let saved_backend = extra.get(IMAGE_BACKEND_OVERRIDE_KEY).and_then(Value::as_str);
-        let available = self.mcp_repo.list(&key.user_id).await.map_err(database_error)?;
+        let available = self.allowed_backends(&conversation, &extra).await?;
         let backend = select_backend(&available, request.requested_server_id.as_deref().or(saved_backend))?;
         let endpoint = serde_json::from_str::<EndpointConfig>(&backend.transport_config)
             .map_err(|_| AsyncImageError::new("backend_unavailable", "The selected image backend is unavailable"))?;
@@ -399,6 +437,49 @@ impl AsyncImageQueue for AsyncImageJobs {
         }
         Ok(to_receipt(receipt))
     }
+}
+
+pub(crate) fn image_assistant_id<'a>(
+    snapshot: Option<&'a ConversationAssistantSnapshotRow>,
+    extra: &'a Value,
+) -> Option<&'a str> {
+    snapshot.map(|row| row.assistant_id.as_str()).or_else(|| {
+        [
+            extra.pointer("/assistant_snapshot/assistant_id"),
+            extra.get("assistant_id"),
+            extra.get("preset_assistant_id"),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(Value::as_str)
+    })
+}
+
+/// Absent IDs inherit the account catalog. An empty list permits no image backend.
+pub(crate) async fn image_backend_ids_for_assistant(
+    repo: Option<&dyn IAssistantDefinitionRepository>,
+    user_id: &str,
+    assistant_id: Option<&str>,
+) -> Result<Option<Vec<String>>, DbError> {
+    let (Some(repo), Some(assistant_id)) = (repo, assistant_id) else {
+        return Ok(None);
+    };
+    let Some(definition) = repo.get_by_assistant_id_for_user(user_id, assistant_id).await? else {
+        return Ok(None);
+    };
+    if !definition.async_image_enabled {
+        return Ok(Some(Vec::new()));
+    }
+    definition
+        .async_image_backend_ids
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|error| DbError::Init(format!("Invalid assistant image backend IDs: {error}")))
+}
+
+pub(crate) fn image_backend_allowed(row: &McpServerRow, allowed: Option<&[String]>) -> bool {
+    row.is_enabled_image_backend() && allowed.is_none_or(|ids| ids.contains(&row.id))
 }
 
 fn select_backend<'a>(

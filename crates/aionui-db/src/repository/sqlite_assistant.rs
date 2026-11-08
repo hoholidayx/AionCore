@@ -306,9 +306,9 @@ impl SqliteAssistantDefinitionRepository {
                 default_permission_mode, default_permission_value,
                 default_thought_level_mode, default_thought_level_value,
                 default_skills_mode, default_skill_ids, custom_skill_names, default_disabled_builtin_skill_ids,
-                default_mcps_mode, default_mcp_ids, async_image_enabled,
+                default_mcps_mode, default_mcp_ids, async_image_enabled, async_image_backend_ids,
                 created_at, updated_at, deleted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 1), ?, ?, NULL)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 1), ?, ?, ?, NULL)
             ON CONFLICT(id) DO UPDATE SET
                 assistant_id = excluded.assistant_id,
                 source = excluded.source,
@@ -338,6 +338,7 @@ impl SqliteAssistantDefinitionRepository {
                 default_mcps_mode = excluded.default_mcps_mode,
                 default_mcp_ids = excluded.default_mcp_ids,
                 async_image_enabled = COALESCE(?, assistant_definitions.async_image_enabled),
+                async_image_backend_ids = COALESCE(excluded.async_image_backend_ids, assistant_definitions.async_image_backend_ids),
                 updated_at = excluded.updated_at,
                 deleted_at = NULL
              WHERE assistant_definitions.user_id IS excluded.user_id",
@@ -372,6 +373,7 @@ impl SqliteAssistantDefinitionRepository {
         .bind(params.default_mcps_mode)
         .bind(params.default_mcp_ids)
         .bind(params.async_image_enabled)
+        .bind(params.async_image_backend_ids)
         .bind(now)
         .bind(now)
         .bind(params.async_image_enabled)
@@ -1119,6 +1121,7 @@ mod tests {
             default_mcps_mode: "auto",
             default_mcp_ids: "[]",
             async_image_enabled: None,
+            async_image_backend_ids: None,
         }
     }
 

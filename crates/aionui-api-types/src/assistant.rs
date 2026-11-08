@@ -173,6 +173,8 @@ pub struct AssistantDefaultsRequest {
     pub mcps: Option<AssistantDefaultListRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub async_image_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub async_image_backend_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +186,8 @@ pub struct AssistantDefaultsResponse {
     pub mcps: AssistantDefaultListResponse,
     #[serde(default = "default_true")]
     pub async_image_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub async_image_backend_ids: Option<Vec<String>>,
 }
 
 fn default_true() -> bool {

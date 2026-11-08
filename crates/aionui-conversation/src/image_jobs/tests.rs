@@ -171,6 +171,7 @@ fn jobs(db: &Database, events: Arc<BroadcastEventBus>) -> AsyncImageJobs {
         Arc::new(SqliteAsyncImageJobRepository::new(db.pool().clone())),
         Arc::new(SqliteMcpServerRepository::new(db.pool().clone())),
         Arc::new(SqliteConversationRepository::new(db.pool().clone())),
+        Arc::new(aionui_db::SqliteAssistantDefinitionRepository::new(db.pool().clone())),
         events,
     )
 }
@@ -481,7 +482,7 @@ async fn routes_new_jobs_by_explicit_choice_then_live_global_default() {
     .execute(db.pool())
     .await
     .unwrap();
-    assert_eq!(service.backends(USER).await.unwrap().len(), 2);
+    assert_eq!(service.backends(USER, ORIGINAL).await.unwrap().len(), 2);
 
     let enqueue = |call: &'static str, explicit: Option<&'static str>| {
         let mut input = request();
@@ -525,7 +526,7 @@ async fn routes_new_jobs_by_explicit_choice_then_live_global_default() {
         enqueue("disabled", None).await.err().unwrap().code,
         "backend_unavailable"
     );
-    assert_eq!(service.backends(USER).await.unwrap().len(), 1);
+    assert_eq!(service.backends(USER, ORIGINAL).await.unwrap().len(), 1);
 
     sqlx::query("UPDATE conversations SET extra = '{}' WHERE id = ?")
         .bind(ORIGINAL)

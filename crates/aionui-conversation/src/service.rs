@@ -11,6 +11,7 @@ use aionui_ai_agent::{
     RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
 };
 
+use crate::image_jobs::{image_assistant_id, image_backend_allowed, image_backend_ids_for_assistant};
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
 use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
@@ -1089,8 +1090,13 @@ impl ConversationService {
                 reason: DEPRECATED_AGENT_TYPE_MESSAGE.into(),
             });
         }
-        self.validate_image_backend_override(user_id, &effective_type, &extra)
-            .await?;
+        self.validate_image_backend_override(
+            user_id,
+            &effective_type,
+            &extra,
+            assistant_id.as_deref().or_else(|| image_assistant_id(None, &extra)),
+        )
+        .await?;
 
         // Type-aware rule: top-level `model` is aionrs-only. Other agent types
         // carry model/mode via `extra` (see spec 2026-05-12). Reject early so
@@ -2338,10 +2344,21 @@ impl ConversationService {
         // Merge extra if provided. For aionrs, strip `extra.model` post-merge
         // so the row keeps a single canonical model source (top-level column).
         let merged_extra = if let Some(new_extra) = &req.extra {
-            self.validate_image_backend_override(user_id, &existing_type, new_extra)
-                .await?;
             let mut existing_extra: serde_json::Value =
                 serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
+            if new_extra
+                .get(IMAGE_BACKEND_OVERRIDE_KEY)
+                .is_some_and(|value| !value.is_null())
+            {
+                let snapshot = self.conversation_repo.get_assistant_snapshot(user_id, id).await?;
+                self.validate_image_backend_override(
+                    user_id,
+                    &existing_type,
+                    new_extra,
+                    image_assistant_id(snapshot.as_ref(), &existing_extra),
+                )
+                .await?;
+            }
             merge_json(&mut existing_extra, new_extra);
             strip_request_owner_user_id(&mut existing_extra);
             if existing_type == AgentType::Aionrs
@@ -2456,6 +2473,7 @@ impl ConversationService {
         user_id: &str,
         agent_type: &AgentType,
         extra: &serde_json::Value,
+        assistant_id: Option<&str>,
     ) -> Result<(), ConversationError> {
         let Some(value) = extra.get(IMAGE_BACKEND_OVERRIDE_KEY).filter(|value| !value.is_null()) else {
             return Ok(());
@@ -2478,10 +2496,12 @@ impl ConversationService {
             .as_ref()
             .cloned()
             .ok_or_else(|| ConversationError::internal("MCP server repository is unavailable"))?;
+        let allowed =
+            image_backend_ids_for_assistant(self.assistant_definition_repo().as_deref(), user_id, assistant_id).await?;
         if !repo
             .find_by_id(user_id, id)
             .await?
-            .is_some_and(|row| row.is_enabled_image_backend())
+            .is_some_and(|row| image_backend_allowed(&row, allowed.as_deref()))
         {
             return Err(ConversationError::BadRequest {
                 reason: "The selected image backend is unavailable".into(),
@@ -4834,31 +4854,24 @@ impl ConversationService {
         row: &ConversationRow,
         snapshot: Option<&ConversationAssistantSnapshotRow>,
     ) -> Result<bool, ConversationError> {
-        let Some(definition_repo) = self.assistant_definition_repo() else {
+        let extra = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+        let allowed = image_backend_ids_for_assistant(
+            self.assistant_definition_repo().as_deref(),
+            &row.user_id,
+            image_assistant_id(snapshot, &extra),
+        )
+        .await?;
+        if allowed.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(false);
+        }
+        let mcp_repo = self.mcp_server_repo.read().ok().and_then(|guard| guard.clone());
+        let Some(mcp_repo) = mcp_repo else {
             return Ok(true);
         };
-        let legacy_extra: serde_json::Value;
-        let assistant_id = if let Some(snapshot) = snapshot {
-            Some(snapshot.assistant_id.as_str())
-        } else {
-            legacy_extra = serde_json::from_str(&row.extra)
-                .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
-            [
-                legacy_extra.pointer("/assistant_snapshot/assistant_id"),
-                legacy_extra.get("assistant_id"),
-                legacy_extra.get("preset_assistant_id"),
-            ]
-            .into_iter()
-            .flatten()
-            .find_map(serde_json::Value::as_str)
-        };
-        let Some(assistant_id) = assistant_id else {
-            return Ok(true);
-        };
-        let definition = definition_repo
-            .get_by_assistant_id_for_user(&row.user_id, assistant_id)
-            .await?;
-        Ok(definition.is_none_or(|definition| definition.async_image_enabled))
+        let available = mcp_repo.list(&row.user_id).await?;
+        Ok(available
+            .iter()
+            .any(|row| image_backend_allowed(row, allowed.as_deref())))
     }
 
     /// Re-read the persisted resume anchor into a turn's `BuildTaskOptions`

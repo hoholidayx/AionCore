@@ -320,6 +320,7 @@ async fn upsert_assistant_with_fixed_model(
             default_mcps_mode: "auto",
             default_mcp_ids: "[]",
             async_image_enabled: None,
+            async_image_backend_ids: None,
         },
     )
     .await

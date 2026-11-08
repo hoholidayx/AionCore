@@ -1207,6 +1207,7 @@ async fn seed_assistant_definition(
             default_mcps_mode: "auto",
             default_mcp_ids: "[]",
             async_image_enabled: None,
+            async_image_backend_ids: None,
         },
     )
     .await

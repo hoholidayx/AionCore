@@ -265,6 +265,7 @@ impl AppServices {
             Arc::new(SqliteAsyncImageJobRepository::new(database.pool().clone())),
             mcp_server_repo.clone(),
             conversation_repo.clone(),
+            Arc::new(SqliteAssistantDefinitionRepository::new(database.pool().clone())),
             event_bus.clone(),
         ));
 

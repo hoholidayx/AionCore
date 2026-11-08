@@ -339,6 +339,7 @@ impl AssistantService {
                     default_mcps_mode: "auto",
                     default_mcp_ids: "[]",
                     async_image_enabled: None,
+                    async_image_backend_ids: None,
                 })
                 .await
                 .map_err(|e| AssistantError::Internal(format!("upsert builtin definition: {e}")))?;
@@ -667,6 +668,7 @@ impl AssistantService {
                     default_mcps_mode: "auto".into(),
                     default_mcp_ids: "[]".into(),
                     async_image_enabled: true,
+                    async_image_backend_ids: None,
                     created_at: 0,
                     updated_at: 0,
                     deleted_at: None,
@@ -788,6 +790,7 @@ impl AssistantService {
                     default_mcps_mode: "auto",
                     default_mcp_ids: "[]",
                     async_image_enabled: None,
+                    async_image_backend_ids: None,
                 },
             )
             .await
@@ -828,6 +831,7 @@ impl AssistantService {
                 user_id,
                 &UpsertAssistantDefinitionParams {
                     async_image_enabled: overrides.async_image_enabled,
+                    async_image_backend_ids: overrides.async_image_backend_ids.as_deref(),
                     ..upsert_params_from_definition(&patched)
                 },
             )
@@ -1239,7 +1243,7 @@ impl AssistantService {
                     || builtin_defaults_forbidden
                 {
                     return Err(AssistantError::Forbidden(
-                        "Only 'agent_id', 'defaults.model', 'defaults.permission', 'defaults.thought_level', and 'defaults.async_image_enabled' can be overridden on built-in assistants".into(),
+                        "Only 'agent_id', 'defaults.model', 'defaults.permission', 'defaults.thought_level', 'defaults.async_image_enabled', and 'defaults.async_image_backend_ids' can be overridden on built-in assistants".into(),
                     ));
                 }
 
@@ -1352,6 +1356,7 @@ impl AssistantService {
                         user_id,
                         &UpsertAssistantDefinitionParams {
                             async_image_enabled: detail_overrides.async_image_enabled,
+                            async_image_backend_ids: detail_overrides.async_image_backend_ids.as_deref(),
                             ..upsert_params_from_definition(&patched)
                         },
                     )
@@ -2722,6 +2727,11 @@ impl AssistantService {
                     value: default_mcp_ids,
                 },
                 async_image_enabled: definition.async_image_enabled,
+                async_image_backend_ids: definition
+                    .async_image_backend_ids
+                    .as_deref()
+                    .map(|ids| decode_str_list(Some(ids)))
+                    .transpose()?,
             },
             capabilities: AssistantCapabilitiesResponse {
                 default_skill_ids,
@@ -3007,6 +3017,7 @@ struct SerializedDetailOverrides {
     default_mcps_mode: Option<String>,
     default_mcp_ids: Option<String>,
     async_image_enabled: Option<bool>,
+    async_image_backend_ids: Option<String>,
 }
 
 impl SerializedDetailOverrides {
@@ -3041,6 +3052,16 @@ impl SerializedDetailOverrides {
 
         if let Some(defaults) = defaults {
             result.async_image_enabled = defaults.async_image_enabled;
+            if defaults
+                .async_image_backend_ids
+                .as_ref()
+                .is_some_and(|ids| ids.len() > 256 || ids.iter().any(|id| id.trim().is_empty() || id.len() > 256))
+            {
+                return Err(AssistantError::BadRequest(
+                    "Invalid defaults.async_image_backend_ids".into(),
+                ));
+            }
+            result.async_image_backend_ids = encode_str_list(defaults.async_image_backend_ids.as_deref())?;
             if let Some(model) = defaults.model.as_ref() {
                 let (mode, value) = validate_scalar_default(model, "defaults.model")?;
                 result.default_model_mode = Some(mode);
@@ -3085,6 +3106,7 @@ impl SerializedDetailOverrides {
             || self.default_mcps_mode.is_some()
             || self.default_mcp_ids.is_some()
             || self.async_image_enabled.is_some()
+            || self.async_image_backend_ids.is_some()
     }
 }
 
@@ -3170,6 +3192,7 @@ fn upsert_params_from_definition(definition: &AssistantDefinitionRow) -> UpsertA
         default_mcps_mode: &definition.default_mcps_mode,
         default_mcp_ids: &definition.default_mcp_ids,
         async_image_enabled: None,
+        async_image_backend_ids: None,
     }
 }
 
@@ -3936,6 +3959,7 @@ mod tests {
                 default_mcps_mode: "auto",
                 default_mcp_ids: "[]",
                 async_image_enabled: None,
+                async_image_backend_ids: None,
             })
             .await
             .unwrap();
@@ -3992,6 +4016,7 @@ mod tests {
                 default_mcps_mode: "auto",
                 default_mcp_ids: "[]",
                 async_image_enabled: None,
+                async_image_backend_ids: None,
             })
             .await
             .unwrap();
@@ -4158,6 +4183,7 @@ mod tests {
                 default_mcps_mode: "auto",
                 default_mcp_ids: "[]",
                 async_image_enabled: None,
+                async_image_backend_ids: None,
             })
             .await
             .unwrap();
@@ -4301,6 +4327,7 @@ mod tests {
                 default_mcps_mode: "auto",
                 default_mcp_ids: "[]",
                 async_image_enabled: None,
+                async_image_backend_ids: None,
             })
             .await
             .unwrap();
@@ -5770,6 +5797,7 @@ mod tests {
                             value: vec!["mcp-a".into()],
                         }),
                         async_image_enabled: None,
+                        async_image_backend_ids: None,
                     }),
                     ..Default::default()
                 },
@@ -6075,6 +6103,7 @@ mod tests {
                         value: vec!["mcp-a".into()],
                     }),
                     async_image_enabled: None,
+                    async_image_backend_ids: None,
                 }),
                 ..req_default()
             })
@@ -6176,6 +6205,7 @@ mod tests {
                             value: vec![],
                         }),
                         async_image_enabled: None,
+                        async_image_backend_ids: None,
                     }),
                     ..Default::default()
                 },
@@ -6230,6 +6260,7 @@ mod tests {
                             value: vec!["mcp-z".into()],
                         }),
                         async_image_enabled: None,
+                        async_image_backend_ids: None,
                     }),
                     ..Default::default()
                 },
@@ -6271,6 +6302,7 @@ mod tests {
                         value: vec!["mcp-z".into()],
                     }),
                     async_image_enabled: None,
+                    async_image_backend_ids: None,
                 }),
                 ..req_default()
             })
@@ -6300,6 +6332,7 @@ mod tests {
                             value: vec![],
                         }),
                         async_image_enabled: None,
+                        async_image_backend_ids: None,
                     }),
                     ..Default::default()
                 },

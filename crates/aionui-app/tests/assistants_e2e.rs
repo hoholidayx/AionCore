@@ -535,6 +535,7 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
             default_mcps_mode: "auto",
             default_mcp_ids: r#"["mcp-legacy"]"#,
             async_image_enabled: None,
+            async_image_backend_ids: None,
         })
         .await
         .unwrap();

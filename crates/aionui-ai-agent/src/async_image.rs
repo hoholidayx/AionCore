@@ -58,6 +58,6 @@ impl AsyncImageError {
 
 #[async_trait]
 pub trait AsyncImageQueue: Send + Sync {
-    async fn backends(&self, user_id: &str) -> Result<Vec<AsyncImageBackend>, AsyncImageError>;
+    async fn backends(&self, user_id: &str, conversation_id: &str) -> Result<Vec<AsyncImageBackend>, AsyncImageError>;
     async fn enqueue(&self, request: AsyncImageRequest) -> Result<AsyncImageReceipt, AsyncImageError>;
 }

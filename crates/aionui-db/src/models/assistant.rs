@@ -69,6 +69,7 @@ pub struct AssistantDefinitionRow {
     pub default_mcps_mode: String,
     pub default_mcp_ids: String,
     pub async_image_enabled: bool,
+    pub async_image_backend_ids: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
     pub deleted_at: Option<TimestampMs>,
@@ -181,6 +182,7 @@ pub struct UpsertAssistantDefinitionParams<'a> {
     pub default_mcp_ids: &'a str,
     /// Omit to keep the stored value, or use the database default for a new row.
     pub async_image_enabled: Option<bool>,
+    pub async_image_backend_ids: Option<&'a str>,
 }
 
 /// Insert-or-update parameters for `assistant_overlays`.

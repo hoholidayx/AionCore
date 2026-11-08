@@ -5,6 +5,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use aionui_ai_agent::async_image::{AsyncImageQueue, AsyncImageRequest};
 use aionui_ai_agent::{RuntimeTokenScope, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
 use aionui_app::{AppConfig, AppServices, create_router};
 use aionui_auth::{RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER};
@@ -35,6 +36,9 @@ async fn model(State(state): State<Arc<Upstream>>, Json(body): Json<Value>) -> R
     let edit = messages
         .last()
         .is_some_and(|message| message["content"].to_string().contains("Edit the generated square."));
+    let probe = messages
+        .last()
+        .is_some_and(|message| message["content"].to_string().contains("Check backend visibility."));
     let (call_id, arguments) = if edit {
         let result = messages.iter().rev().find(|message| message["role"] == "tool").unwrap();
         let receipt: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
@@ -46,7 +50,9 @@ async fn model(State(state): State<Arc<Upstream>>, Json(body): Json<Value>) -> R
         ("call_image_mock", json!({"prompt": "Draw a small square"}))
     };
     state.model_requests.lock().unwrap().push(body);
-    let (delta, reason) = if after_tool {
+    let (delta, reason) = if probe {
+        (json!({"content": "Backend visibility checked."}), "stop")
+    } else if after_tool {
         (json!({"content": "Task queued."}), "stop")
     } else {
         (
@@ -186,11 +192,22 @@ async fn model_receives_a_receipt_and_delayed_image_stays_in_its_original_conver
         .await
         .unwrap();
     assert_eq!(default_response.status(), StatusCode::OK);
+    let assistant = post_json(
+        &app,
+        "/api/assistants",
+        json!({"id":"image-fixture-assistant","name":"Image assistant","agent_id":"632f31d2"}),
+        auth,
+        StatusCode::CREATED,
+    )
+    .await;
+    let assistant_path = format!("/api/assistants/{}", assistant["id"].as_str().unwrap());
     let new_conversation = json!({
         "type":"aionrs",
+        "assistant":{"id":assistant["id"]},
         "model":{"provider_id":provider["id"], "model":"stub"},
         "extra":{
             "session_mode":"yolo",
+            "selected_mcp_server_ids":[server_id],
             "selected_session_mcp_servers":[{
                 "id":"inline-image-fixture",
                 "name":"image-fixture",
@@ -444,6 +461,71 @@ async fn model_receives_a_receipt_and_delayed_image_stays_in_its_original_conver
             .iter()
             .all(|request| !request.to_string().contains(PNG))
     );
+
+    let set_allowed = |ids: Value| {
+        app.clone().oneshot(json_with_token(
+            "PUT",
+            &assistant_path,
+            json!({"defaults":{"async_image_backend_ids":ids}}),
+            auth.0,
+            auth.1,
+        ))
+    };
+    assert_eq!(set_allowed(json!([second_id])).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        save_backend(json!(server_id)).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    let forged_call = AsyncImageRequest {
+        user_id: user.id.clone(),
+        conversation_id: switched.to_owned(),
+        turn_id: "restricted-turn".into(),
+        tool_call_id: "restricted-call".into(),
+        prompt: "Draw a square.".into(),
+        requested_server_id: Some(server_id.into()),
+        size: None,
+        preset: None,
+        references: Vec::new(),
+    };
+    assert_eq!(
+        services.async_image_jobs.enqueue(forged_call).await.err().unwrap().code,
+        "backend_unavailable"
+    );
+
+    for (allowed, expected_backend) in [(json!([second_id]), Some(second_id)), (json!([]), None)] {
+        assert_eq!(set_allowed(allowed).await.unwrap().status(), StatusCode::OK);
+        let count = upstream.model_requests.lock().unwrap().len();
+        post_json(
+            &app,
+            &format!("/api/conversations/{switched}/messages"),
+            json!({"content":"Check backend visibility."}),
+            auth,
+            StatusCode::ACCEPTED,
+        )
+        .await;
+        let tools = tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                let response = app
+                    .clone()
+                    .oneshot(get_with_token(&format!("/api/conversations/{switched}"), &token))
+                    .await
+                    .unwrap();
+                if body_json(response).await["data"]["status"] == "finished"
+                    && let Some(request) = upstream.model_requests.lock().unwrap().get(count)
+                {
+                    break request["tools"].to_string();
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("model received the scoped tool inventory");
+        assert_eq!(tools.contains("image_generate_async"), expected_backend.is_some());
+        assert!(!tools.contains(server_id));
+        if let Some(id) = expected_backend {
+            assert!(tools.contains(id));
+        }
+    }
 
     shutdown.send(true).unwrap();
     worker.await.unwrap();
