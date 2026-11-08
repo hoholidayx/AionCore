@@ -108,8 +108,6 @@ impl McpServerPurpose {
 pub struct CreateMcpServerRequest {
     #[serde(default)]
     pub purpose: Option<McpServerPurpose>,
-    #[serde(default)]
-    pub is_default: Option<bool>,
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
@@ -129,8 +127,6 @@ pub struct CreateMcpServerRequest {
 pub struct ImportMcpServerRequest {
     #[serde(default)]
     pub purpose: Option<McpServerPurpose>,
-    #[serde(default)]
-    pub is_default: Option<bool>,
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
@@ -149,8 +145,6 @@ pub struct UpdateMcpServerRequest {
     #[serde(default)]
     pub purpose: Option<McpServerPurpose>,
     #[serde(default)]
-    pub is_default: Option<bool>,
-    #[serde(default)]
     pub name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     pub description: Option<Option<String>>,
@@ -166,6 +160,14 @@ pub struct UpdateMcpServerRequest {
 #[derive(Debug, Deserialize)]
 pub struct BatchImportMcpServersRequest {
     pub servers: Vec<ImportMcpServerRequest>,
+}
+
+/// Request body for `PUT /api/mcp/image-default`.
+#[derive(Debug, Deserialize)]
+pub struct SetMcpImageDefaultRequest {
+    /// Explicitly pass null to clear the account's default.
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    pub server_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

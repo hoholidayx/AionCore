@@ -1116,6 +1116,10 @@ mod tests {
         ) -> Result<McpServerRow, aionui_db::DbError> {
             unimplemented!()
         }
+        async fn set_image_default(&self, _user_id: &str, _id: Option<&str>) -> Result<bool, aionui_db::DbError> {
+            unimplemented!("image defaults are not exercised by this mock")
+        }
+
         async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), aionui_db::DbError> {
             unimplemented!()
         }

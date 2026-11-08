@@ -745,7 +745,6 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
     let fixed_mcp = mcp_repo
         .create(CreateMcpServerParams {
             purpose: None,
-            is_default: None,
             user_id: "system_default_user",
             name: "fixed-mcp",
             description: None,
@@ -761,7 +760,6 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
     let extra_mcp = mcp_repo
         .create(CreateMcpServerParams {
             purpose: None,
-            is_default: None,
             user_id: "system_default_user",
             name: "extra-mcp",
             description: None,

@@ -5,7 +5,7 @@ use aionui_api_types::{
     UpdateMcpServerRequest,
 };
 use aionui_common::now_ms;
-use aionui_db::{CreateMcpServerParams, IMcpServerRepository, UpdateMcpServerParams};
+use aionui_db::{CreateMcpServerParams, DbError, IMcpServerRepository, UpdateMcpServerParams};
 use tracing::{info, warn};
 
 use crate::error::McpError;
@@ -40,7 +40,6 @@ struct UpsertMcpServer<'a> {
     builtin: bool,
     enabled: bool,
     purpose: Option<McpServerPurpose>,
-    is_default: Option<bool>,
 }
 
 impl McpConfigService {
@@ -82,7 +81,6 @@ impl McpConfigService {
             builtin: req.builtin,
             enabled: false,
             purpose: req.purpose,
-            is_default: req.is_default,
         })
         .await
     }
@@ -140,11 +138,9 @@ impl McpConfigService {
             purpose.unwrap_or(&existing_server.purpose),
             transport_type,
             req.builtin.unwrap_or(existing_server.builtin),
-            req.is_default,
         )?;
         let params = UpdateMcpServerParams {
             purpose,
-            is_default: req.is_default,
             name: req.name.as_deref(),
             description: req.description.as_ref().map(|opt| opt.as_deref()),
             transport_type: transport.as_ref().map(McpServerTransport::transport_type),
@@ -154,7 +150,7 @@ impl McpConfigService {
             ..Default::default()
         };
 
-        let row = self.repo.update(user_id, id, params).await?;
+        let row = self.repo.update(user_id, id, params).await.map_err(map_update_error)?;
         let server = McpServer::from_row(row)?;
         Ok(server.into_response())
     }
@@ -193,6 +189,24 @@ impl McpConfigService {
         Ok(server.into_response())
     }
 
+    /// Choose or clear the account's default among enabled image backends.
+    pub async fn set_image_default(&self, user_id: &str, server_id: Option<&str>) -> Result<(), McpError> {
+        if server_id.is_some_and(|id| id.trim().is_empty()) {
+            return Err(McpError::InvalidEdit("Default image backend ID cannot be empty".into()));
+        }
+        let updated = self
+            .repo
+            .set_image_default(user_id, server_id)
+            .await
+            .map_err(map_update_error)?;
+        if !updated {
+            return Err(McpError::InvalidEdit(
+                "The default must be an enabled asynchronous image MCP server".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Batch import MCP servers (upsert by name).
     ///
     /// Each server is processed individually: existing names are updated,
@@ -228,7 +242,6 @@ impl McpConfigService {
                     builtin: server_req.builtin,
                     enabled: server_req.enabled.unwrap_or(false),
                     purpose: server_req.purpose,
-                    is_default: server_req.is_default,
                 })
                 .await?;
             rows.push(server);
@@ -269,7 +282,6 @@ impl McpConfigService {
             builtin,
             enabled,
             purpose,
-            is_default,
         } = params;
         let purpose = purpose.map(McpServerPurpose::as_str);
         let config_json = transport.to_config_json()?;
@@ -285,13 +297,11 @@ impl McpConfigService {
                 purpose.unwrap_or(&existing.purpose),
                 transport.transport_type(),
                 builtin,
-                is_default,
             )?;
             let params = UpdateMcpServerParams {
                 purpose,
-                is_default,
                 description: Some(description),
-                enabled: Some(enabled),
+                enabled: existing.deleted_at.is_some().then_some(enabled),
                 transport_type: Some(transport.transport_type()),
                 transport_config: Some(&config_json),
                 original_json: Some(original_json),
@@ -299,20 +309,18 @@ impl McpConfigService {
                 deleted_at: Some(None),
                 ..Default::default()
             };
-            let updated = self.repo.update(user_id, &existing.id, params).await?;
+            let updated = self
+                .repo
+                .update(user_id, &existing.id, params)
+                .await
+                .map_err(map_update_error)?;
             let server = McpServer::from_row(updated)?;
             return Ok(server.into_response());
         }
 
-        validate_purpose(
-            purpose.unwrap_or("general"),
-            transport.transport_type(),
-            builtin,
-            is_default,
-        )?;
+        validate_purpose(purpose.unwrap_or("general"), transport.transport_type(), builtin)?;
         let params = CreateMcpServerParams {
             purpose,
-            is_default,
             user_id,
             name,
             description,
@@ -329,20 +337,18 @@ impl McpConfigService {
     }
 }
 
-fn validate_purpose(
-    purpose: &str,
-    transport_type: &str,
-    builtin: bool,
-    is_default: Option<bool>,
-) -> Result<(), McpError> {
+fn map_update_error(error: DbError) -> McpError {
+    match error {
+        DbError::NotFound(message) => McpError::NotFound(message),
+        DbError::Conflict(message) => McpError::Conflict(message),
+        other => other.into(),
+    }
+}
+
+fn validate_purpose(purpose: &str, transport_type: &str, builtin: bool) -> Result<(), McpError> {
     if purpose == "async_image" && (transport_type != "http" || builtin) {
         return Err(McpError::InvalidEdit(
             "Async image generation requires a user-configured Streamable HTTP server".into(),
-        ));
-    }
-    if is_default == Some(true) && purpose != "async_image" {
-        return Err(McpError::InvalidEdit(
-            "Only an async image endpoint can be set as the default".into(),
         ));
     }
     Ok(())
@@ -604,6 +610,10 @@ mod tests {
             Ok(servers[idx].clone())
         }
 
+        async fn set_image_default(&self, _user_id: &str, _id: Option<&str>) -> Result<bool, DbError> {
+            unimplemented!("image defaults are not exercised by this mock")
+        }
+
         async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
             let mut servers = self.servers.lock().unwrap();
             let idx = servers
@@ -700,7 +710,6 @@ mod tests {
     fn stdio_create_req(name: &str) -> CreateMcpServerRequest {
         CreateMcpServerRequest {
             purpose: None,
-            is_default: None,
             name: name.to_owned(),
             description: Some("test server".to_owned()),
             transport: McpTransport::Stdio {
@@ -716,7 +725,6 @@ mod tests {
     fn http_create_req(name: &str) -> CreateMcpServerRequest {
         CreateMcpServerRequest {
             purpose: None,
-            is_default: None,
             name: name.to_owned(),
             description: None,
             transport: McpTransport::Http {
@@ -731,7 +739,6 @@ mod tests {
     fn stdio_import_req(name: &str) -> ImportMcpServerRequest {
         ImportMcpServerRequest {
             purpose: None,
-            is_default: None,
             name: name.to_owned(),
             description: Some("test server".to_owned()),
             transport: McpTransport::Stdio {
@@ -748,7 +755,6 @@ mod tests {
     fn http_import_req(name: &str) -> ImportMcpServerRequest {
         ImportMcpServerRequest {
             purpose: None,
-            is_default: None,
             name: name.to_owned(),
             description: None,
             transport: McpTransport::Http {
@@ -841,7 +847,6 @@ mod tests {
                 TEST_USER_ID,
                 CreateMcpServerRequest {
                     purpose: None,
-                    is_default: None,
                     name: "stdio-full".into(),
                     description: Some("full stdio".into()),
                     transport: McpTransport::Stdio {
@@ -875,7 +880,6 @@ mod tests {
                 &created.id,
                 UpdateMcpServerRequest {
                     purpose: None,
-                    is_default: None,
                     name: Some("new-name".into()),
                     description: None,
                     transport: None,
@@ -898,7 +902,6 @@ mod tests {
                 &created.id,
                 UpdateMcpServerRequest {
                     purpose: None,
-                    is_default: None,
                     name: None,
                     description: None,
                     transport: Some(McpTransport::Http {
@@ -929,7 +932,6 @@ mod tests {
                 &created.id,
                 UpdateMcpServerRequest {
                     purpose: None,
-                    is_default: None,
                     name: None,
                     description: Some(None), // clear
                     transport: None,
@@ -951,7 +953,6 @@ mod tests {
                 "nonexistent",
                 UpdateMcpServerRequest {
                     purpose: None,
-                    is_default: None,
                     name: Some("x".into()),
                     description: None,
                     transport: None,
@@ -980,7 +981,6 @@ mod tests {
                 &b.id,
                 UpdateMcpServerRequest {
                     purpose: None,
-                    is_default: None,
                     name: Some("server-a".into()), // conflict
                     description: None,
                     transport: None,
@@ -1007,7 +1007,6 @@ mod tests {
                 &a.id,
                 UpdateMcpServerRequest {
                     purpose: None,
-                    is_default: None,
                     name: Some("server-a".into()),
                     description: None,
                     transport: None,
@@ -1034,7 +1033,6 @@ mod tests {
                 &created.id,
                 UpdateMcpServerRequest {
                     purpose: None,
-                    is_default: None,
                     name: None,
                     description: None,
                     transport: None,
@@ -1161,7 +1159,6 @@ mod tests {
             TEST_USER_ID,
             CreateMcpServerRequest {
                 purpose: None,
-                is_default: None,
                 name: "chrome-devtools".into(),
                 description: Some("builtin".into()),
                 transport: McpTransport::Stdio {
@@ -1190,7 +1187,6 @@ mod tests {
             TEST_USER_ID,
             CreateMcpServerRequest {
                 purpose: None,
-                is_default: None,
                 name: "chrome-devtools".into(),
                 description: Some("builtin".into()),
                 transport: McpTransport::Stdio {
@@ -1210,7 +1206,6 @@ mod tests {
                 TEST_USER_ID,
                 CreateMcpServerRequest {
                     purpose: None,
-                    is_default: None,
                     name: "chrome-devtools".into(),
                     description: Some("malicious override".into()),
                     transport: McpTransport::Http {
@@ -1233,7 +1228,6 @@ mod tests {
             TEST_USER_ID,
             CreateMcpServerRequest {
                 purpose: None,
-                is_default: None,
                 name: "chrome-devtools".into(),
                 description: Some("builtin".into()),
                 transport: McpTransport::Stdio {
@@ -1255,7 +1249,6 @@ mod tests {
                     servers: vec![
                         ImportMcpServerRequest {
                             purpose: None,
-                            is_default: None,
                             name: "chrome-devtools".into(),
                             description: Some("imported".into()),
                             transport: McpTransport::Http {
@@ -1268,7 +1261,6 @@ mod tests {
                         },
                         ImportMcpServerRequest {
                             purpose: None,
-                            is_default: None,
                             name: "playwright".into(),
                             description: Some("imported".into()),
                             transport: McpTransport::Stdio {
@@ -1298,7 +1290,6 @@ mod tests {
                 TEST_USER_ID,
                 CreateMcpServerRequest {
                     purpose: None,
-                    is_default: None,
                     name: "sentry".into(),
                     description: None,
                     transport: McpTransport::Stdio {

@@ -50,6 +50,10 @@ pub trait IMcpServerRepository: Send + Sync {
     async fn update(&self, user_id: &str, id: &str, params: UpdateMcpServerParams<'_>)
     -> Result<McpServerRow, DbError>;
 
+    /// Atomically replace the account's image default. Returns false when the
+    /// requested server exists but cannot be used as an enabled image backend.
+    async fn set_image_default(&self, user_id: &str, id: Option<&str>) -> Result<bool, DbError>;
+
     /// Soft-deletes an MCP server by ID. Returns `DbError::NotFound` if the ID
     /// doesn't exist.
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError>;
@@ -91,7 +95,6 @@ pub struct CreateMcpServerParams<'a> {
     pub original_json: Option<&'a str>,
     pub builtin: bool,
     pub purpose: Option<&'a str>,
-    pub is_default: Option<bool>,
 }
 
 /// Parameters for updating an existing MCP server.
@@ -110,6 +113,5 @@ pub struct UpdateMcpServerParams<'a> {
     pub original_json: Option<Option<&'a str>>,
     pub builtin: Option<bool>,
     pub purpose: Option<&'a str>,
-    pub is_default: Option<bool>,
     pub deleted_at: Option<Option<aionui_common::TimestampMs>>,
 }

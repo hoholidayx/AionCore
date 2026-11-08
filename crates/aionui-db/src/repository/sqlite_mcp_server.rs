@@ -102,18 +102,13 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
         let now = aionui_common::now_ms();
         let last_test_status = "disconnected";
         let purpose = params.purpose.unwrap_or("general");
-        let is_default = params.is_default.unwrap_or(false);
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        if is_default {
-            clear_default(&mut tx, params.user_id, &id).await?;
-        }
 
         sqlx::query(
             "INSERT INTO mcp_servers \
                 (id, user_id, name, description, enabled, transport_type, transport_config, \
                  tools, last_test_status, last_connected, original_json, builtin, \
-                 deleted_at, created_at, updated_at, purpose, is_default) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 deleted_at, created_at, updated_at, purpose) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(params.user_id)
@@ -131,8 +126,7 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
         .bind(now)
         .bind(now)
         .bind(purpose)
-        .bind(is_default)
-        .execute(&mut *tx)
+        .execute(&self.pool)
         .await
         .map_err(|e| match &e {
             sqlx::Error::Database(db_err) if is_unique_violation(db_err.as_ref()) => {
@@ -140,7 +134,6 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
             }
             _ => DbError::Query(e),
         })?;
-        tx.commit().await?;
 
         Ok(McpServerRow {
             id,
@@ -156,7 +149,7 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
             original_json: params.original_json.map(String::from),
             builtin: params.builtin,
             purpose: purpose.to_owned(),
-            is_default,
+            is_default: false,
             deleted_at: None,
             created_at: now,
             updated_at: now,
@@ -181,8 +174,11 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
             purpose != existing.purpose && (purpose == "async_image" || existing.purpose == "async_image")
         });
         let merged = merge_update(existing, params);
-        if merged.is_default {
-            clear_default(&mut tx, user_id, id).await?;
+        if merged.is_default && merged.purpose != "async_image" {
+            return Err(DbError::Conflict(
+                "Choose another default image backend or clear the default before changing this server's purpose"
+                    .into(),
+            ));
         }
 
         sqlx::query(
@@ -220,6 +216,36 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
         }
         tx.commit().await?;
         Ok(merged)
+    }
+
+    async fn set_image_default(&self, user_id: &str, id: Option<&str>) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(id) = id {
+            let target = sqlx::query_as::<_, McpServerRow>(
+                "SELECT * FROM mcp_servers WHERE user_id = ? AND id = ? AND deleted_at IS NULL",
+            )
+            .bind(user_id)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| DbError::NotFound(format!("MCP server '{id}' not found")))?;
+            if !target.is_enabled_image_backend() {
+                return Ok(false);
+            }
+        }
+        sqlx::query("UPDATE mcp_servers SET is_default = 0 WHERE user_id = ? AND is_default = 1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        if let Some(id) = id {
+            sqlx::query("UPDATE mcp_servers SET is_default = 1 WHERE user_id = ? AND id = ?")
+                .bind(user_id)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
@@ -266,7 +292,6 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
                         original_json: Some(params.original_json),
                         builtin: Some(params.builtin),
                         purpose: params.purpose,
-                        is_default: params.is_default,
                         ..Default::default()
                     };
                     self.update(user_id, &existing.id, update_params).await?
@@ -330,15 +355,6 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
     }
 }
 
-async fn clear_default(connection: &mut sqlx::SqliteConnection, user_id: &str, id: &str) -> Result<(), DbError> {
-    sqlx::query("UPDATE mcp_servers SET is_default = 0 WHERE user_id = ? AND id != ? AND is_default = 1")
-        .bind(user_id)
-        .bind(id)
-        .execute(connection)
-        .await?;
-    Ok(())
-}
-
 async fn remove_image_snapshots(
     connection: &mut sqlx::SqliteConnection,
     user_id: &str,
@@ -375,7 +391,6 @@ async fn remove_image_snapshots(
 fn merge_update(existing: McpServerRow, params: UpdateMcpServerParams<'_>) -> McpServerRow {
     let now = aionui_common::now_ms();
     let purpose = params.purpose.unwrap_or(&existing.purpose).to_owned();
-    let is_default = purpose == "async_image" && params.is_default.unwrap_or(existing.is_default);
     McpServerRow {
         id: existing.id,
         user_id: existing.user_id,
@@ -395,7 +410,7 @@ fn merge_update(existing: McpServerRow, params: UpdateMcpServerParams<'_>) -> Mc
             .map_or(existing.original_json, |v| v.map(String::from)),
         builtin: params.builtin.unwrap_or(existing.builtin),
         purpose,
-        is_default,
+        is_default: existing.is_default && params.enabled != Some(false),
         deleted_at: params.deleted_at.map_or(existing.deleted_at, |v| v),
         created_at: existing.created_at,
         updated_at: now,
@@ -432,7 +447,6 @@ mod tests {
     fn stdio_params() -> CreateMcpServerParams<'static> {
         CreateMcpServerParams {
             purpose: None,
-            is_default: None,
             user_id: USER_A,
             name: "test-mcp",
             description: Some("A test MCP server"),
@@ -448,7 +462,6 @@ mod tests {
     fn http_params() -> CreateMcpServerParams<'static> {
         CreateMcpServerParams {
             purpose: None,
-            is_default: None,
             user_id: USER_A,
             name: "http-mcp",
             description: None,
@@ -466,10 +479,10 @@ mod tests {
         let (repo, _db) = setup().await;
         let marked = CreateMcpServerParams {
             purpose: Some("async_image"),
-            is_default: Some(true),
             ..http_params()
         };
         let first = repo.create(marked.clone()).await.unwrap();
+        assert!(repo.set_image_default(USER_A, Some(&first.id)).await.unwrap());
         let other_user = repo
             .create(CreateMcpServerParams {
                 user_id: USER_B,
@@ -477,6 +490,7 @@ mod tests {
             })
             .await
             .unwrap();
+        assert!(repo.set_image_default(USER_B, Some(&other_user.id)).await.unwrap());
         let second = repo
             .create(CreateMcpServerParams {
                 name: "second",
@@ -484,6 +498,7 @@ mod tests {
             })
             .await
             .unwrap();
+        assert!(repo.set_image_default(USER_A, Some(&second.id)).await.unwrap());
         assert!(!repo.find_by_id(USER_A, &first.id).await.unwrap().unwrap().is_default);
         assert!(
             repo.find_by_id(USER_B, &other_user.id)
@@ -505,6 +520,20 @@ mod tests {
             .unwrap();
         assert_eq!(edited.purpose, "async_image");
         assert!(edited.is_default);
+        let blocked = repo
+            .update(
+                USER_A,
+                &second.id,
+                UpdateMcpServerParams {
+                    purpose: Some("general"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(blocked, DbError::Conflict(_)));
+        assert!(repo.find_by_id(USER_A, &second.id).await.unwrap().unwrap().is_default);
+        assert!(repo.set_image_default(USER_A, None).await.unwrap());
         let demoted = repo
             .update(
                 USER_A,

@@ -159,7 +159,7 @@ async fn model_receives_a_receipt_and_delayed_image_stays_in_its_original_conver
     let server = post_json(
         &app,
         "/api/mcp/servers",
-        json!({"name":"image-fixture", "purpose":"async_image", "is_default":true,
+        json!({"name":"image-fixture", "purpose":"async_image",
                "transport":{"type":"http", "url":format!("{base_url}/mcp")}}),
         auth,
         StatusCode::CREATED,
@@ -174,6 +174,18 @@ async fn model_receives_a_receipt_and_delayed_image_stays_in_its_original_conver
         StatusCode::OK,
     )
     .await;
+    let default_response = app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            "/api/mcp/image-default",
+            json!({"server_id":server_id}),
+            auth.0,
+            auth.1,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(default_response.status(), StatusCode::OK);
     let new_conversation = json!({
         "type":"aionrs",
         "model":{"provider_id":provider["id"], "model":"stub"},

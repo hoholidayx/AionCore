@@ -654,6 +654,218 @@ async fn batch_import_with_invalid_config_returns_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn importing_connections_leaves_the_account_image_default_unchanged() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let send = |method, route: &str, body| {
+        let app = app.clone();
+        let req = json_with_token(method, route, body, &token, &csrf);
+        async move { app.oneshot(req).await.unwrap() }
+    };
+    let image_server = |name, url, enabled, is_default| {
+        json!({
+            "name": name, "purpose": "async_image", "enabled": enabled, "is_default": is_default,
+            "transport": { "type": "http", "url": url },
+        })
+    };
+    let response = send(
+        "POST",
+        "/api/mcp/servers/import",
+        json!({"servers": [
+            image_server("first", "https://first.example/mcp", true, true),
+            image_server("second", "https://second.example/mcp", true, true),
+        ]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let imported = body_json(response).await;
+    assert_eq!(imported["data"][0]["is_default"], false);
+    assert_eq!(imported["data"][1]["is_default"], false);
+    let first_id = imported["data"][0]["id"].as_str().unwrap();
+    let second_id = imported["data"][1]["id"].as_str().unwrap();
+    let response = send("PUT", "/api/mcp/image-default", json!({"server_id": first_id})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await, json!({"success": true, "data": null}));
+
+    let response = send(
+        "POST",
+        "/api/mcp/servers/import",
+        json!({"servers": [
+            image_server("second", "https://second.example/mcp", false, true),
+            image_server("first", "https://updated.example/mcp", false, false),
+            image_server("third", "https://third.example/mcp", true, true),
+        ]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let updated = body_json(response).await;
+    assert_eq!(updated["data"][0]["is_default"], false);
+    assert_eq!(updated["data"][0]["enabled"], true);
+    assert_eq!(updated["data"][1]["id"], first_id);
+    assert_eq!(updated["data"][1]["is_default"], true);
+    assert_eq!(updated["data"][1]["enabled"], true);
+    assert_eq!(updated["data"][1]["transport"]["url"], "https://updated.example/mcp");
+    assert_eq!(updated["data"][2]["is_default"], false);
+
+    let response = send(
+        "POST",
+        "/api/mcp/servers/import",
+        json!({"servers": [{
+            "name": "first", "purpose": "general",
+            "transport": {"type": "http", "url": "https://updated.example/mcp"},
+        }]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let rejected = body_json(response).await;
+    assert_eq!(rejected["code"], "CONFLICT");
+    assert_eq!(
+        rejected["error"],
+        "Choose another default image backend or clear the default before changing this server's purpose"
+    );
+
+    let response = send("PUT", "/api/mcp/image-default", json!({"server_id": second_id})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/mcp/servers/{first_id}"), &token))
+        .await
+        .unwrap();
+    assert_eq!(body_json(response).await["data"]["is_default"], false);
+    let response = send("POST", &format!("/api/mcp/servers/{second_id}/toggle"), json!({})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["data"]["is_default"], false);
+
+    assert_eq!(
+        send("PUT", "/api/mcp/image-default", json!({"server_id":first_id}))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send("PUT", "/api/mcp/image-default", json!({"server_id":null}))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let response = app
+        .oneshot(get_with_token(&format!("/api/mcp/servers/{first_id}"), &token))
+        .await
+        .unwrap();
+    assert_eq!(body_json(response).await["data"]["is_default"], false);
+}
+
+#[tokio::test]
+async fn setting_image_default_requires_authentication_and_an_enabled_owned_image_server() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let route = "/api/mcp/image-default";
+    let anonymous = axum::http::Request::builder()
+        .method("PUT")
+        .uri(route)
+        .header("content-type", "application/json")
+        .header("x-csrf-token", &csrf)
+        .header("cookie", format!("aionui-csrf-token={csrf}"))
+        .body(axum::body::Body::from(r#"{"server_id":null}"#))
+        .unwrap();
+    let response = app.clone().oneshot(anonymous).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(response).await["code"], "UNAUTHORIZED");
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri(route)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::from(r#"{"server_id":null}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["code"], "CSRF_INVALID");
+
+    for body in [json!({}), json!({"server_id":17})] {
+        let response = app
+            .clone()
+            .oneshot(json_with_token("PUT", route, body, &token, &csrf))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "BAD_REQUEST");
+    }
+    let foreign = services
+        .user_repo
+        .create_user("image-settings-other", "hash")
+        .await
+        .unwrap();
+    use aionui_db::{CreateMcpServerParams, IMcpServerRepository, SqliteMcpServerRepository};
+    let repo = SqliteMcpServerRepository::new(services.database.pool().clone());
+    let foreign = repo
+        .create(CreateMcpServerParams {
+            user_id: &foreign.id,
+            name: "foreign-image",
+            description: None,
+            enabled: true,
+            transport_type: "http",
+            transport_config: r#"{"url":"https://foreign.example/mcp"}"#,
+            tools: None,
+            original_json: None,
+            builtin: false,
+            purpose: Some("async_image"),
+        })
+        .await
+        .unwrap();
+    for id in [foreign.id.as_str(), "not-found"] {
+        let response = app
+            .clone()
+            .oneshot(json_with_token("PUT", route, json!({"server_id": id}), &token, &csrf))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["code"], "NOT_FOUND");
+    }
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/mcp/servers/import",
+            json!({"servers": [
+                {"name":"general", "enabled":true, "transport":{"type":"http","url":"https://general.example/mcp"}},
+                {"name":"disabled", "purpose":"async_image", "transport":{"type":"http","url":"https://disabled.example/mcp"}},
+            ]}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let servers = body_json(response).await;
+    for server in servers["data"].as_array().unwrap() {
+        let response = app
+            .clone()
+            .oneshot(json_with_token(
+                "PUT",
+                route,
+                json!({"server_id":server["id"]}),
+                &token,
+                &csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let rejected = body_json(response).await;
+        assert_eq!(rejected["code"], "BAD_REQUEST");
+        assert_eq!(
+            rejected["error"],
+            "The default must be an enabled asynchronous image MCP server"
+        );
+    }
+}
+
 // ===========================================================================
 // AU-1: Auth required
 // ===========================================================================

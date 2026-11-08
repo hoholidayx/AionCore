@@ -5,12 +5,13 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 
 use aionui_api_types::{
     ApiResponse, BatchImportMcpServersRequest, CreateMcpServerRequest, DetectedMcpServerResponse, ErrorResponse,
     McpConnectionTestErrorCode, McpServerPurpose, McpServerResponse, OAuthCheckStatusRequest, OAuthLoginRequest,
-    OAuthLoginResponse, OAuthLogoutRequest, OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
+    OAuthLoginResponse, OAuthLogoutRequest, OAuthStatusResponse, SetMcpImageDefaultRequest, TestMcpConnectionRequest,
+    UpdateMcpServerRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -64,6 +65,7 @@ pub fn mcp_routes(state: McpRouterState) -> Router {
     Router::new()
         .route("/api/mcp/servers", get(list_servers).post(add_server))
         .route("/api/mcp/servers/import", post(batch_import))
+        .route("/api/mcp/image-default", put(set_image_default))
         .route(
             "/api/mcp/servers/{id}",
             get(get_server).put(edit_server).delete(delete_server),
@@ -184,6 +186,20 @@ async fn batch_import(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(servers)))
+}
+
+/// `PUT /api/mcp/image-default` — set or clear the account's default image backend.
+async fn set_image_default(
+    State(state): State<McpRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<SetMcpImageDefaultRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .config_service
+        .set_image_default(&user.id, req.server_id.as_deref())
+        .await?;
+    Ok(Json(ApiResponse::ok(())))
 }
 
 // ---------------------------------------------------------------------------

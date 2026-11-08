@@ -81,6 +81,10 @@ mod aionui {
             unimplemented!()
         }
 
+        async fn set_image_default(&self, _user_id: &str, _id: Option<&str>) -> Result<bool, DbError> {
+            unimplemented!("image defaults are not exercised by this mock")
+        }
+
         async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
             unimplemented!()
         }
