@@ -6806,6 +6806,7 @@ async fn send_message_does_not_auto_replay_after_tool_side_effect() {
                 input: None,
                 output: None,
                 description: None,
+                image: None,
                 parent_call_id: None,
             }),
             AgentStreamEvent::Error(ErrorEventData {

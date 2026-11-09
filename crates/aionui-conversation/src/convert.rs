@@ -183,7 +183,17 @@ pub fn row_to_message_response_compact(row: MessageRow) -> Result<MessageRespons
     }
 
     let mut truncated = false;
-    truncate_large_strings(&mut response.content, TOOL_CONTENT_PREVIEW_CHARS, &mut truncated);
+    if response.r#type == MessageType::ToolCall
+        && let Some(content) = response.content.as_object_mut()
+    {
+        for (key, value) in content {
+            if key != "image" {
+                truncate_large_strings(value, TOOL_CONTENT_PREVIEW_CHARS, &mut truncated);
+            }
+        }
+    } else {
+        truncate_large_strings(&mut response.content, TOOL_CONTENT_PREVIEW_CHARS, &mut truncated);
+    }
     if truncated && let Some(obj) = response.content.as_object_mut() {
         obj.insert(
             "_compact".to_string(),
@@ -329,6 +339,27 @@ mod tests {
     use super::*;
     use aionui_common::{AgentType, ConversationSource, ConversationStatus};
     use serde_json::json;
+
+    #[test]
+    fn compact_tool_call_keeps_its_image_reference() {
+        let path = format!("/fixture/{}.png", "a".repeat(TOOL_CONTENT_PREVIEW_CHARS));
+        let image = json!({"path": path, "mime_type": "image/png"});
+        let row = MessageRow {
+            id: "image-call".into(),
+            conversation_id: "conv_1".into(),
+            msg_id: None,
+            r#type: "tool_call".into(),
+            content: json!({"image": image, "output": "x".repeat(TOOL_CONTENT_COMPACT_THRESHOLD_BYTES)}).to_string(),
+            position: Some("left".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: 1000,
+            backend_turn_id: None,
+        };
+        let compact = row_to_message_response_compact(row).unwrap();
+        assert_eq!(compact.content["image"], image);
+        assert_eq!(compact.content["_compact"]["truncated"], true);
+    }
 
     fn make_row(
         agent_type: &str,

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use aionui_ai_agent::{
     AgentError, AgentInstance, AgentStreamEvent, IWorkerTaskManager,
     agent_task::{IAgentTask, IMockAgent},
-    protocol::events::{FinishEventData, ToolCallEventData, ToolCallStatus},
+    protocol::events::{FinishEventData, ToolCallEventData, ToolCallStatus, tool_call::ToolCallImage},
     types::{BuildTaskOptions, SendMessageData},
 };
 use aionui_api_types::AgentModeResponse;
@@ -86,6 +86,7 @@ async fn run_tool_call_with_empty_call_id_is_not_persisted() {
         input: Some(json!({"pattern": "*.rs"})),
         output: None,
         description: None,
+        image: None,
         parent_call_id: None,
     }))
     .unwrap();
@@ -135,6 +136,7 @@ async fn run_tool_call_late_running_event_does_not_regress_completed_message() {
         input: None,
         output: Some("src/main.rs".into()),
         description: None,
+        image: None,
         parent_call_id: None,
     }))
     .unwrap();
@@ -146,6 +148,7 @@ async fn run_tool_call_late_running_event_does_not_regress_completed_message() {
         input: Some(json!({"pattern": "*.rs"})),
         output: None,
         description: Some("search files".into()),
+        image: None,
         parent_call_id: None,
     }))
     .unwrap();
@@ -179,6 +182,68 @@ async fn run_tool_call_late_running_event_does_not_regress_completed_message() {
 }
 
 #[tokio::test]
+async fn generated_image_updates_one_tool_call_on_websocket_and_in_history() {
+    let (repo, _db) = setup_repo().await;
+    let bus = Arc::new(BroadcastEventBus::new(64));
+    let mut websocket = bus.subscribe();
+    let (tx, rx) = broadcast::channel(64);
+    let relay = StreamRelay::new(
+        "conv-1".into(),
+        "asst-1".into(),
+        "turn-1".into(),
+        "system_default_user".into(),
+        repo.clone(),
+        bus,
+    );
+
+    let image_path = "/fixture/generated.png";
+    let mut tool = ToolCallEventData {
+        call_id: "generated-image".into(),
+        name: "imageGeneration".into(),
+        args: json!({"type": "imageGeneration"}),
+        status: ToolCallStatus::Running,
+        input: None,
+        output: None,
+        description: None,
+        image: None,
+        parent_call_id: None,
+    };
+    tx.send(AgentStreamEvent::ToolCall(tool.clone())).unwrap();
+    tool.status = ToolCallStatus::Completed;
+    tool.image = Some(ToolCallImage {
+        path: image_path.into(),
+        mime_type: "image/png".into(),
+    });
+    tx.send(AgentStreamEvent::ToolCall(tool)).unwrap();
+    tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+    relay.consume(rx).await;
+
+    let streamed = std::iter::from_fn(|| websocket.try_recv().ok())
+        .find(|message| message.data["data"]["image"]["path"] == image_path)
+        .expect("completed image reference must reach the WebSocket");
+    assert_eq!(streamed.data["data"]["call_id"], "generated-image");
+    let messages = repo
+        .list_messages_page(
+            "system_default_user",
+            "conv-1",
+            &MessagePageParams {
+                limit: 100,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    let tool_rows: Vec<_> = messages.items.iter().filter(|row| row.r#type == "tool_call").collect();
+    let [row] = tool_rows.as_slice() else {
+        panic!("expected one tool call row");
+    };
+    let content: serde_json::Value = serde_json::from_str(&row.content).unwrap();
+    assert_eq!(row.id, "generated-image");
+    assert_eq!(content["image"], streamed.data["data"]["image"]);
+    assert_eq!(content["status"], "completed");
+}
+
+#[tokio::test]
 async fn run_tool_call_canceled_status_persists_as_terminal_finish() {
     let (repo, _db) = setup_repo().await;
     let bus = Arc::new(BroadcastEventBus::new(64));
@@ -202,6 +267,7 @@ async fn run_tool_call_canceled_status_persists_as_terminal_finish() {
         input: Some(json!({"command": "sleep 60"})),
         output: None,
         description: None,
+        image: None,
         parent_call_id: None,
     }))
     .unwrap();
@@ -215,6 +281,7 @@ async fn run_tool_call_canceled_status_persists_as_terminal_finish() {
         input: None,
         output: None,
         description: None,
+        image: None,
         parent_call_id: None,
     }))
     .unwrap();
@@ -296,6 +363,7 @@ impl IAgentTask for ToolCallAgent {
             input: Some(json!({"pattern": "*.rs"})),
             output: None,
             description: None,
+            image: None,
             parent_call_id: None,
         }));
         let _ = self.event_tx.send(AgentStreamEvent::Finish(FinishEventData::default()));

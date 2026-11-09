@@ -315,6 +315,7 @@ mod tests {
             input: None,
             output: None,
             description: None,
+            image: None,
             parent_call_id: None,
         });
         let json = serde_json::to_value(&event).unwrap();
@@ -333,6 +334,7 @@ mod tests {
             input: Some(json!({ "pattern": "**/*.rs" })),
             output: Some("src/main.rs\nsrc/lib.rs".into()),
             description: Some("Search for Rust files".into()),
+            image: None,
             parent_call_id: Some("toolu_task".into()),
         });
         let json = serde_json::to_value(&event).unwrap();
@@ -353,6 +355,7 @@ mod tests {
             input: None,
             output: None,
             description: None,
+            image: None,
             parent_call_id: None,
         });
         let json = serde_json::to_value(&event).unwrap();

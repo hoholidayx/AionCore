@@ -1252,6 +1252,7 @@ mod tests {
             input: None,
             output: None,
             description: None,
+            image: None,
             parent_call_id: None,
         }))
         .unwrap();

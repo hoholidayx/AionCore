@@ -358,6 +358,7 @@ impl WorkflowCard {
             description: Some(rendered.description.clone()),
             // Cards ride a MAIN-STREAM launching call; absent (not null) so the
             // merge-patch never touches attribution persisted by the call itself.
+            image: None,
             parent_call_id: None,
         };
         let entries = rendered.entries.clone();

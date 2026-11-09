@@ -1539,6 +1539,7 @@ mod tests {
                     input: None,
                     output: Some("Phase 1  Run   [0/1]".into()),
                     description: Some("Run [0/1] · run:A · 1 agents".into()),
+                    image: None,
                     parent_call_id: None,
                 },
                 agents: vec![ToolGroupEntry {
@@ -1592,6 +1593,7 @@ mod tests {
             input: None,
             output: None,
             description: None,
+            image: None,
             parent_call_id: None,
         }))
         .await;
@@ -1673,6 +1675,7 @@ mod tests {
             args: json!({"path": "a.ts"}),
             status: ToolCallStatus::Running,
             description: None,
+            image: None,
             parent_call_id: None,
             input: None,
             output: None,
@@ -2032,6 +2035,7 @@ mod tests {
             input: None,
             output: None,
             description: None,
+            image: None,
             parent_call_id: None,
         }))
         .unwrap();
@@ -2291,6 +2295,7 @@ mod tests {
             args: json!({"path": "a.ts"}),
             status: ToolCallStatus::Running,
             description: None,
+            image: None,
             parent_call_id: None,
             input: None,
             output: None,
@@ -2358,6 +2363,7 @@ mod tests {
             args: json!({"path": "a.ts"}),
             status: ToolCallStatus::Running,
             description: None,
+            image: None,
             parent_call_id: None,
             input: None,
             output: None,
@@ -2626,6 +2632,7 @@ mod tests {
             input: Some(json!({"prompt": "a cat", "size": "1024x1024"})),
             output: None,
             description: Some("Generate image".into()),
+            image: None,
             parent_call_id: None,
         }))
         .unwrap();
@@ -2638,6 +2645,7 @@ mod tests {
             input: None,
             output: Some("image.png".into()),
             description: None,
+            image: None,
             parent_call_id: None,
         }))
         .unwrap();

@@ -25,7 +25,7 @@ use crate::agent_task::IAgentTask;
 use crate::error::AgentError;
 use crate::protocol::events::session_updates::AvailableCommandsEventData;
 use crate::protocol::events::session_updates::ThinkingEventData;
-use crate::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+use crate::protocol::events::tool_call::{ToolCallEventData, ToolCallImage, ToolCallStatus};
 use crate::protocol::events::{
     AgentStreamEvent, FinishEventData, StartEventData, TextEventData, TipType, TipsEventData,
 };
@@ -2969,6 +2969,7 @@ fn spawn_event_pump(
                     input: None,
                     output: Some(acc.clone()),
                     description: None,
+                    image: None,
                     parent_call_id: None,
                 }));
                 continue;
@@ -3178,6 +3179,7 @@ fn spawn_event_pump(
                                     input: None,
                                     output: None,
                                     description: None,
+                                    image: None,
                                     parent_call_id: None,
                                 }));
                             }
@@ -3311,6 +3313,7 @@ fn spawn_event_pump(
                             input: None,
                             output: None,
                             description: None,
+                            image: None,
                             parent_call_id: None,
                         }));
                     }
@@ -4005,6 +4008,7 @@ fn update_workflow_cards(
                                 input: None,
                                 output: None,
                                 description: None,
+                                image: None,
                                 parent_call_id: None,
                             },
                             agents: Vec::new(),
@@ -4288,6 +4292,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 description: None,
                 // Subagent attribution (009 H5): persisted onto the row so the
                 // frontend can group a subagent's steps under its Task call.
+                image: None,
                 parent_call_id: parent_tool_use_id,
             })]
         }
@@ -4299,6 +4304,18 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             ..
         } => {
             let output = tool_result_text(&content);
+            let image = if is_error {
+                None
+            } else {
+                content.into_iter().find_map(|part| match part {
+                    ToolResultContent::FilePath {
+                        path,
+                        mime: Some(mime_type),
+                        ..
+                    } if mime_type.starts_with("image/") => Some(ToolCallImage { path, mime_type }),
+                    _ => None,
+                })
+            };
             vec![AgentStreamEvent::ToolCall(ToolCallEventData {
                 call_id: tool_use_id,
                 name: String::new(),
@@ -4311,6 +4328,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 input: None,
                 output,
                 description: None,
+                image,
                 parent_call_id: parent_tool_use_id,
             })]
         }
@@ -5558,6 +5576,40 @@ mod translate_tests {
         assert!(v.get("cost").is_none(), "no cost → no `cost` key, got {v}");
     }
 
+    #[test]
+    fn completed_generated_image_reaches_the_tool_call_output() {
+        for (mime, is_error, expected) in [
+            (Some("image/png"), false, true),
+            (Some("image/png"), true, false),
+            (None, false, false),
+        ] {
+            let events = translate_event(
+                SessionEvent::ToolResult {
+                    tool_use_id: "generated-image".into(),
+                    is_error,
+                    content: vec![ToolResultContent::FilePath {
+                        path: "/fixture/generated.png".into(),
+                        mime: mime.map(str::to_owned),
+                        old_text: None,
+                        new_text: None,
+                    }],
+                    parent_tool_use_id: None,
+                },
+                "conv-1",
+                false,
+            );
+            let [AgentStreamEvent::ToolCall(data)] = events.as_slice() else {
+                panic!("expected one tool call update");
+            };
+            assert_eq!(data.call_id, "generated-image");
+            assert_eq!(
+                data.image.as_ref().map(|image| image.path.as_str()),
+                expected.then_some("/fixture/generated.png")
+            );
+            assert_eq!(data.output, None);
+        }
+    }
+
     fn tool_call(call_id: &str, name: &str, status: ToolCallStatus) -> AgentStreamEvent {
         AgentStreamEvent::ToolCall(ToolCallEventData {
             call_id: call_id.into(),
@@ -5567,6 +5619,7 @@ mod translate_tests {
             input: None,
             output: None,
             description: None,
+            image: None,
             parent_call_id: None,
         })
     }

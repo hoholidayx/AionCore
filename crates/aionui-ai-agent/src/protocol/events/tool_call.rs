@@ -22,6 +22,8 @@ pub struct ToolCallEventData {
     pub output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ToolCallImage>,
     /// The `call_id` of the Task/Agent call this call runs INSIDE (claude's
     /// frame-level `parent_tool_use_id`); `None` = the main agent's own call.
     /// Lets the frontend group/indent a subagent's internal steps under its
@@ -30,6 +32,13 @@ pub struct ToolCallEventData {
     /// would DELETE the stored attribution).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_call_id: Option<String>,
+}
+
+/// A generated image on the backend filesystem.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallImage {
+    pub path: String,
+    pub mime_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

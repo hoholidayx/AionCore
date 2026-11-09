@@ -23,6 +23,7 @@
 //! independently contract-tested via the `build_with_io` seam.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3146,6 +3147,20 @@ fn command_execution_display_name(item: &Value) -> String {
     label
 }
 
+fn generated_image_mime(path: &str) -> Option<&'static str> {
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return None;
+    }
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        _ => None,
+    }
+}
+
 /// A1 CORE: match the item's `type` STRING with a fallthrough. The closed codex
 /// ThreadItem enum is NEVER constructed in our code, so an unknown future `type`
 /// becomes `AdapterSpecific` instead of a deserialization panic.
@@ -3235,19 +3250,18 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                         });
                     }
                 }
-                // imageGeneration writes the produced image to disk and reports its
-                // path in `savedPath` (source-verified: v2/item.rs:372-380
-                // ImageGeneration{result:String(base64), saved_path:Option<AbsolutePathBuf>}
-                // → wire key `savedPath`). Previously DROPPED — we only read
-                // aggregatedOutput (a commandExecution-only field imageGeneration lacks),
-                // so the image card was empty. Carry the path as FilePath (NOT the
-                // base64 `result` as Text — that would dump megabytes of bytes).
+                // The app-server ItemCompletedNotification schema declares savedPath
+                // as an optional absolute path. Use it to reference the image without
+                // forwarding the inline result.
                 if item_type == "imageGeneration"
+                    && !is_error
+                    && item.get("status").and_then(Value::as_str) == Some("completed")
                     && let Some(path) = item.get("savedPath").and_then(Value::as_str)
+                    && let Some(mime) = generated_image_mime(path)
                 {
                     content.push(crate::event::ToolResultContent::FilePath {
                         path: path.to_string(),
-                        mime: None,
+                        mime: Some(mime.to_owned()),
                         old_text: None,
                         new_text: None,
                     });
@@ -3265,7 +3279,9 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                 //     structuredContent?, _meta?} + error:{message} on failure.
                 //   dynamicToolCall completed → contentItems:[{type:inputText,text}|
                 //     {type:inputImage,imageUrl}].
-                content.extend(parse_codex_mcp_result(item.get("result")));
+                if item_type != "imageGeneration" {
+                    content.extend(parse_codex_mcp_result(item.get("result")));
+                }
                 content.extend(parse_codex_dynamic_content_items(item.get("contentItems")));
                 if let Some(msg) = item
                     .get("error")
@@ -3286,6 +3302,12 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                     parent_tool_use_id: None,
                 });
             } else {
+                let mut input = item.clone();
+                if item_type == "imageGeneration"
+                    && let Some(input) = input.as_object_mut()
+                {
+                    input.remove("result");
+                }
                 out.push(SessionEvent::ToolCall {
                     tool_use_id: id.clone(),
                     name: if item_type == "commandExecution" {
@@ -3298,9 +3320,9 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                     // (non-completed) item the invocation fields (command/cwd/
                     // commandActions for commandExecution; arguments for mcp/dynamic
                     // tool calls) are present while the output fields are still null,
-                    // so the whole item Value is the faithful argument carrier.
+                    // so the item Value carries the invocation arguments.
                     // TIO-13: never logged at info.
-                    input: item.clone(),
+                    input,
                     // 009 H5: codex inline tool — main agent.
                     parent_tool_use_id: None,
                 });
@@ -9488,13 +9510,19 @@ mod tests {
     /// shape WAS in the schema all along — flipped to assert the path is carried.
     #[test]
     fn codex_imagegeneration_saved_path_reaches_file_path() {
+        let image_path = std::env::temp_dir().join("generated.png");
+        // Shape observed through thread/read in a real completed app-server turn.
         let params = serde_json::json!({
             "item": {
                 "type": "imageGeneration",
                 "id": "call_x",
                 "status": "completed",
+                "transparentBackground": false,
+                "failure": null,
+                "startedAtMs": 1794198568659_u64,
+                "completedAtMs": 1794198588347_u64,
                 "result": "iVBORw0KGgo=", // base64 bytes — must NOT be dumped as Text
-                "savedPath": "/w/generated.png"
+                "savedPath": image_path
             }
         });
         let events = map_item(&params, true);
@@ -9508,7 +9536,8 @@ mod tests {
             .collect();
         assert!(
             content.iter().any(|c| matches!(c,
-                crate::event::ToolResultContent::FilePath { path, .. } if path == "/w/generated.png")),
+                crate::event::ToolResultContent::FilePath { path, mime: Some(mime), .. }
+                    if Path::new(path) == image_path && mime == "image/png")),
             "imageGeneration savedPath must reach a FilePath ToolResultContent, got {content:?}"
         );
         assert!(
@@ -9516,6 +9545,29 @@ mod tests {
                 crate::event::ToolResultContent::Text(t) if t.contains("iVBORw0KGgo"))),
             "the base64 `result` bytes must NOT be dumped as Text, got {content:?}"
         );
+    }
+
+    #[test]
+    fn codex_imagegeneration_only_references_completed_images_with_absolute_paths() {
+        let path = std::env::temp_dir().join("generated.png");
+        for (status, saved_path) in [
+            ("completed", Value::Null),
+            ("completed", json!("generated.png")),
+            ("completed", json!(path.with_extension("txt"))),
+            ("failed", json!(path)),
+            ("in_progress", json!(path)),
+        ] {
+            let params = json!({"item": {
+                "type": "imageGeneration",
+                "id": "call_x",
+                "status": status,
+                "savedPath": saved_path
+            }});
+            assert!(map_item(&params, true).iter().any(|event| matches!(
+                event, SessionEvent::ToolResult { content, is_error, .. }
+                    if content.is_empty() && *is_error == (status == "failed")
+            )));
+        }
     }
 
     /// LC-8a: codex `turn/plan/updated` → `SessionEvent::Plan`. step→content,
