@@ -579,8 +579,15 @@ impl StreamRelay {
                             self.complete_active_thinking(&mut active_thinking).await;
                             self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
                                 .await;
+                            // The image card can request its persisted file reference as
+                            // soon as the event arrives.
+                            if data.image.is_some() {
+                                self.adapter.persist_tool_call(data).await;
+                            }
                             self.forward_to_websocket(&event);
-                            self.adapter.persist_tool_call(data).await;
+                            if data.image.is_none() {
+                                self.adapter.persist_tool_call(data).await;
+                            }
                         }
                         AgentStreamEvent::AcpToolCall(data) => {
                             attempt.saw_tool_or_side_effect = true;
@@ -2602,6 +2609,65 @@ mod tests {
         // turn_id rides inside content (the column set is fixed); the plan bar
         // gates on it matching the running turn.
         assert_eq!(content["turn_id"], "turn-1");
+    }
+
+    #[tokio::test]
+    async fn tool_image_is_persisted_before_its_websocket_event() {
+        use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallImage, ToolCallStatus};
+
+        struct ImageObserver {
+            repo: Arc<RecordingRepo>,
+            observed: AtomicBool,
+        }
+
+        impl EventBroadcaster for ImageObserver {
+            fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
+                if event.name != "message.stream" || !event.data["data"]["image"].is_object() {
+                    return;
+                }
+                let inserts = self.repo.inserts.lock().unwrap();
+                assert!(
+                    inserts
+                        .iter()
+                        .any(|row| row.id == "image-call" && row.status.as_deref() == Some("finish"))
+                );
+                self.observed.store(true, Ordering::Release);
+            }
+        }
+
+        let repo = Arc::new(RecordingRepo::new());
+        let observer = Arc::new(ImageObserver {
+            repo: repo.clone(),
+            observed: AtomicBool::new(false),
+        });
+        let (tx, rx) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo,
+            observer.clone(),
+        );
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "image-call".into(),
+            name: "imageGeneration".into(),
+            args: json!({"type": "imageGeneration"}),
+            status: ToolCallStatus::Completed,
+            input: None,
+            output: None,
+            description: None,
+            image: Some(ToolCallImage {
+                path: "/image.png".into(),
+                mime_type: "image/png".into(),
+            }),
+            parent_call_id: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+        relay.consume(rx).await;
+
+        assert!(observer.observed.load(Ordering::Acquire));
     }
 
     #[tokio::test]

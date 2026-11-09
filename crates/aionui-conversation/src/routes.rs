@@ -22,6 +22,7 @@ use aionui_common::ApiError;
 
 use crate::ConversationError;
 use crate::image_jobs::AsyncImageJobs;
+use crate::service::ConversationService;
 use crate::state::ConversationRouterState;
 
 impl From<ConversationError> for ApiError {
@@ -152,13 +153,21 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
 }
 
 /// Build attachment routes so the caller can require end-user authentication.
-pub fn conversation_attachment_routes(jobs: Arc<AsyncImageJobs>) -> Router {
+pub fn conversation_attachment_routes(jobs: Arc<AsyncImageJobs>, service: Arc<ConversationService>) -> Router {
     Router::new()
         .route(
             "/api/conversations/{conversation_id}/async-images/{attachment_id}",
             get(read_async_image),
         )
         .with_state(jobs)
+        .merge(
+            Router::new()
+                .route(
+                    "/api/conversations/{conversation_id}/messages/{message_id}/image",
+                    get(read_tool_image),
+                )
+                .with_state(service),
+        )
 }
 
 // ── Handlers ───────────────────────────────────────────────────────
@@ -181,6 +190,23 @@ async fn read_async_image(
             (header::CACHE_CONTROL, "private, no-store"),
         ],
         attachment.png,
+    )
+        .into_response())
+}
+
+async fn read_tool_image(
+    State(service): State<Arc<ConversationService>>,
+    Extension(user): Extension<CurrentUser>,
+    Path((conversation_id, message_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let image = service.read_tool_image(&user.id, &conversation_id, &message_id).await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, image.mime_type),
+            (header::CACHE_CONTROL, "private, no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        image.bytes,
     )
         .into_response())
 }

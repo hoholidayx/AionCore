@@ -586,6 +586,7 @@ dependencies = [
  "chrono",
  "crc32fast",
  "futures-util",
+ "libc",
  "png",
  "regex",
  "serde",

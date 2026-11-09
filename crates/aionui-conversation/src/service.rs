@@ -64,6 +64,7 @@ use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder,
 use crate::session_mentions;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
+use crate::tool_image::{ToolImage, read_tool_image_file};
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
 use std::sync::RwLock;
 
@@ -3358,6 +3359,50 @@ impl ConversationService {
         }
 
         Ok(response)
+    }
+
+    /// Read a generated Codex image by an owned message's id or tool call id.
+    pub(crate) async fn read_tool_image(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<ToolImage, ConversationError> {
+        let unavailable = || ConversationError::not_found_reason("Generated image not found");
+        let row = match self
+            .conversation_repo
+            .get_message(user_id, conversation_id, message_id)
+            .await?
+        {
+            Some(row) => row,
+            // Forks remint row ids, but keep the original tool call id as msg_id.
+            None => self
+                .conversation_repo
+                .get_message_by_msg_id(user_id, conversation_id, message_id, "tool_call")
+                .await?
+                .ok_or_else(unavailable)?,
+        };
+        if row.r#type != "tool_call"
+            || row.position.as_deref() != Some("left")
+            || row.status.as_deref() != Some("finish")
+            || row.hidden
+        {
+            return Err(unavailable());
+        }
+        let content: serde_json::Value = serde_json::from_str(&row.content).map_err(|_| unavailable())?;
+        if content["name"] != "imageGeneration"
+            || content["args"]["type"] != "imageGeneration"
+            || content["status"] != "completed"
+        {
+            return Err(unavailable());
+        }
+        let image = &content["image"];
+        let path = PathBuf::from(image["path"].as_str().ok_or_else(unavailable)?);
+        let mime_type = image["mime_type"].as_str().ok_or_else(unavailable)?.to_owned();
+        tokio::task::spawn_blocking(move || read_tool_image_file(&path, &mime_type))
+            .await
+            .map_err(|_| ConversationError::internal("Could not read generated image"))?
+            .ok_or_else(unavailable)
     }
 
     /// List artifacts for a conversation with durable status state.

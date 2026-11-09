@@ -28,6 +28,7 @@ pub mod state;
 mod stream_persistence;
 pub mod stream_relay;
 pub mod task_options;
+mod tool_image;
 mod turn_continuation_policy;
 mod turn_orchestrator;
 mod turn_recovery_policy;

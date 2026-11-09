@@ -285,14 +285,17 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let conversation_authenticated = conversation_routes(states.conversation.clone())
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
-    let conversation_attachments_authenticated = conversation_attachment_routes(services.async_image_jobs.clone())
-        .route_layer(from_fn_with_state(
-            AuthState {
-                runtime_token_verifier: None,
-                ..auth_mw_state.clone()
-            },
-            auth_middleware,
-        ));
+    let conversation_attachments_authenticated = conversation_attachment_routes(
+        services.async_image_jobs.clone(),
+        Arc::new(states.conversation.service.clone()),
+    )
+    .route_layer(from_fn_with_state(
+        AuthState {
+            runtime_token_verifier: None,
+            ..auth_mw_state.clone()
+        },
+        auth_middleware,
+    ));
 
     let conversation_ops_authenticated = conversation_ops_routes(states.conversation)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
