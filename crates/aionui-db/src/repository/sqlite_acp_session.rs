@@ -2,7 +2,7 @@
 
 use aionui_common::now_ms;
 use serde_json::Value;
-use sqlx::SqlitePool;
+use sqlx::{SqliteExecutor, SqlitePool};
 
 use crate::error::DbError;
 use crate::models::AcpSessionRow;
@@ -108,6 +108,23 @@ impl SqliteAcpSessionRepository {
 
 fn is_unique_violation(err: &dyn sqlx::error::DatabaseError) -> bool {
     err.code().is_some_and(|c| c == "2067" || c == "1555")
+}
+
+pub(super) async fn delete_acp_session_for_user<'e>(
+    executor: impl SqliteExecutor<'e>,
+    user_id: &str,
+    conversation_id: &str,
+) -> Result<bool, DbError> {
+    let result = sqlx::query(
+        "DELETE FROM acp_session \
+         WHERE conversation_id = ? \
+           AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = acp_session.conversation_id AND c.user_id = ?)",
+    )
+    .bind(conversation_id)
+    .bind(user_id)
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 fn decode_runtime_state(raw: &str) -> Result<PersistedSessionState, DbError> {
@@ -296,16 +313,7 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
     }
 
     async fn delete_for_user(&self, user_id: &str, conversation_id: &str) -> Result<bool, DbError> {
-        let result = sqlx::query(
-            "DELETE FROM acp_session \
-             WHERE conversation_id = ? \
-               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = acp_session.conversation_id AND c.user_id = ?)",
-        )
-        .bind(conversation_id)
-        .bind(user_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
+        delete_acp_session_for_user(&self.pool, user_id, conversation_id).await
     }
 
     async fn load_runtime_state_for_user(

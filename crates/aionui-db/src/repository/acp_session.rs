@@ -97,8 +97,8 @@ pub trait IAcpSessionRepository: Send + Sync {
     async fn clear_session_id_for_user(&self, user_id: &str, conversation_id: &str) -> Result<bool, DbError>;
 
     /// Delete the row when the owning conversation belongs to `user_id`.
-    /// Called by the conversation delete hook — no DB foreign key, so this
-    /// must be invoked explicitly.
+    /// To delete the conversation itself, use the conversation repository so
+    /// both rows are removed in one transaction.
     async fn delete_for_user(&self, user_id: &str, conversation_id: &str) -> Result<bool, DbError>;
 
     /// Decode and return the `session_config.runtime` sub-object.

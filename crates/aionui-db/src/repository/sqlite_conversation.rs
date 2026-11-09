@@ -12,6 +12,7 @@ use crate::repository::conversation::{
     MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
     StaleRuntimeMessageRow,
 };
+use crate::repository::sqlite_acp_session::delete_acp_session_for_user;
 
 /// Bump `conversations.updated_at` so the conversation-list sort
 /// (ORDER BY conversations.updated_at DESC) floats a conversation with fresh
@@ -413,16 +414,20 @@ impl IConversationRepository for SqliteConversationRepository {
     }
 
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        // ACP bindings have no foreign key, and their ownership check needs the conversation row.
+        delete_acp_session_for_user(&mut *tx, user_id, id).await?;
         let result = sqlx::query("DELETE FROM conversations WHERE user_id = ? AND id = ?")
             .bind(user_id)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("Conversation '{id}' not found")));
         }
 
+        tx.commit().await?;
         Ok(())
     }
 

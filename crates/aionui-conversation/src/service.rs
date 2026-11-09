@@ -2632,7 +2632,7 @@ impl ConversationService {
             .map_err(|error| ConversationError::internal(format!("Failed to clear ACP session anchor: {error}")))
     }
 
-    /// Delete a conversation (messages cascade via FK).
+    /// Delete a conversation and its local ACP binding (messages cascade via FK).
     ///
     /// Broadcasts `conversation.listChanged(deleted)`.
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
@@ -2698,15 +2698,6 @@ impl ConversationService {
         }
         if !had_active_turn {
             self.runtime_state.clear_deleting(id);
-        }
-        // No FK / CASCADE on `acp_session`: clean it up here so non-ACP
-        // conversations that used to be ACP (shouldn't happen but is
-        // cheap to cover) still drop their orphaned session row.
-        if let Err(err) = self.acp_session_repo.delete_for_user(user_id, id).await {
-            warn!(
-                error = %ErrorChain(&err),
-                "Failed to delete acp_session row on conversation delete"
-            );
         }
         if let Some(workspace) = auto_workspace_to_delete {
             let workspace_removed = match tokio::fs::remove_dir_all(&workspace).await {

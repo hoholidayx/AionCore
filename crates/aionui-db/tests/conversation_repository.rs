@@ -1,7 +1,8 @@
 use aionui_db::{
-    ConversationFilters, ConversationRowUpdate, DbError, IConversationRepository, MessagePageCursor,
-    MessagePageDirection, MessagePageParams, MessageRowUpdate, SqliteConversationRepository, init_database_memory,
-    models::ConversationRow, models::MessageRow,
+    ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, Database, DbError, IAcpSessionRepository,
+    IConversationRepository, MessagePageCursor, MessagePageDirection, MessagePageParams, MessageRowUpdate,
+    SqliteAcpSessionRepository, SqliteConversationRepository, init_database_memory, models::ConversationRow,
+    models::MessageRow,
 };
 
 const USER_ID: &str = "system_default_user";
@@ -81,6 +82,27 @@ fn make_artifact(conv_id: &str, artifact_id: &str) -> aionui_db::ConversationArt
 
 // ── Conversation CRUD ───────────────────────────────────────────────
 
+async fn create_acp_binding(db: &Database, conv: &ConversationRow) {
+    SqliteAcpSessionRepository::new(db.pool().clone())
+        .create(&CreateAcpSessionParams {
+            user_id: &conv.user_id,
+            conversation_id: &conv.id,
+            agent_source: "builtin",
+            agent_id: "8e1acf31",
+        })
+        .await
+        .unwrap();
+}
+
+async fn acp_binding_count(db: &Database, id: &str) -> i64 {
+    // A scoped lookup also returns None for an orphan, masking a failed delete.
+    sqlx::query_scalar("SELECT COUNT(*) FROM acp_session WHERE conversation_id = ?")
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 async fn create_get_update_delete_lifecycle() {
     let (repo, _db) = setup().await;
@@ -119,10 +141,12 @@ async fn create_get_update_delete_lifecycle() {
 }
 
 #[tokio::test]
-async fn delete_conversation_cascades_messages() {
+async fn delete_conversation_removes_messages_and_acp_binding() {
     let (repo, db) = setup().await;
     let conv = make_conversation("cascade");
     repo.create(&conv).await.unwrap();
+    create_acp_binding(&db, &conv).await;
+    assert_eq!(acp_binding_count(&db, &conv.id).await, 1);
 
     // Insert messages
     for i in 0..3 {
@@ -146,6 +170,8 @@ async fn delete_conversation_cascades_messages() {
 
     // Delete conversation → messages cascade
     repo.delete(&conv.user_id, &conv.id).await.unwrap();
+    assert!(repo.get(&conv.user_id, &conv.id).await.unwrap().is_none());
+    assert_eq!(acp_binding_count(&db, &conv.id).await, 0);
 
     let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id = ?")
         .bind(&conv.id)
@@ -153,6 +179,73 @@ async fn delete_conversation_cascades_messages() {
         .await
         .unwrap();
     assert_eq!(remaining, 0);
+}
+
+#[tokio::test]
+async fn delete_conversation_as_another_user_preserves_acp_binding() {
+    let (repo, db) = setup().await;
+    create_user_2(&db).await;
+    let conv = make_conversation("other-user-delete");
+    repo.create(&conv).await.unwrap();
+    create_acp_binding(&db, &conv).await;
+    let message = make_message(&conv.id, "keep this message");
+    repo.insert_message(&conv.user_id, &message).await.unwrap();
+
+    let err = repo.delete("user_2", &conv.id).await.unwrap_err();
+    assert!(matches!(err, DbError::NotFound(_)));
+    assert!(repo.get(&conv.user_id, &conv.id).await.unwrap().is_some());
+    assert_eq!(acp_binding_count(&db, &conv.id).await, 1);
+    assert!(
+        repo.get_message(&conv.user_id, &conv.id, &message.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn failed_conversation_delete_rolls_back_acp_binding() {
+    let (repo, db) = setup().await;
+    let conv = make_conversation("failed-delete");
+    repo.create(&conv).await.unwrap();
+    create_acp_binding(&db, &conv).await;
+    let message = make_message(&conv.id, "keep this message until retry");
+    repo.insert_message(&conv.user_id, &message).await.unwrap();
+
+    sqlx::query(
+        "CREATE TRIGGER reject_conversation_delete BEFORE DELETE ON conversations
+         WHEN NOT EXISTS (SELECT 1 FROM acp_session WHERE conversation_id = OLD.id)
+         BEGIN
+             SELECT RAISE(ABORT, 'injected conversation delete failure');
+         END",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let err = repo.delete(&conv.user_id, &conv.id).await.unwrap_err();
+    assert!(
+        matches!(&err, DbError::Query(error) if error.as_database_error().is_some_and(|e| {
+            e.message() == "injected conversation delete failure"
+        })),
+        "{err:?}"
+    );
+    assert!(repo.get(&conv.user_id, &conv.id).await.unwrap().is_some());
+    assert_eq!(acp_binding_count(&db, &conv.id).await, 1);
+    assert!(
+        repo.get_message(&conv.user_id, &conv.id, &message.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    sqlx::query("DROP TRIGGER reject_conversation_delete")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    repo.delete(&conv.user_id, &conv.id).await.unwrap();
+    assert!(repo.get(&conv.user_id, &conv.id).await.unwrap().is_none());
+    assert_eq!(acp_binding_count(&db, &conv.id).await, 0);
 }
 
 // ── Cursor pagination ───────────────────────────────────────────────

@@ -3,10 +3,10 @@
 mod common;
 
 use aionui_db::{
-    IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantPreferenceRepository,
-    IConversationRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantPreferenceRepository, SqliteConversationRepository, UpsertAssistantDefinitionParams,
-    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams,
+    IAcpSessionRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantPreferenceRepository,
+    IConversationRepository, SqliteAcpSessionRepository, SqliteAssistantDefinitionRepository,
+    SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository, SqliteConversationRepository,
+    UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams,
 };
 use axum::http::StatusCode;
 use serde_json::json;
@@ -781,27 +781,56 @@ async fn t4_6_update_requires_auth() {
 // ── T5: Delete ────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn t5_1_delete_conversation() {
-    let (mut app, services) = build_app().await;
+async fn t5_1_delete_conversation_with_codex_binding() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, services, _paths) = common::build_app_with_skill_paths(tmp.path()).await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let req = json_with_token("POST", "/api/conversations", create_body("To Delete"), &token, &csrf);
+    let req = json_with_token(
+        "POST",
+        "/api/conversations",
+        create_body_with_extra(
+            "To Delete",
+            json!({"agent_id": "8e1acf31", "backend": "codex", "agent_source": "builtin"}),
+        ),
+        &token,
+        &csrf,
+    );
     let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
     let json = body_json(resp).await;
     let id = json["data"]["id"].as_str().unwrap().to_owned();
+    let uri = format!("/api/conversations/{id}");
+    let owner = services.user_repo.find_by_username("admin").await.unwrap().unwrap();
+    let pool = services.database.pool();
+    let acp_repo = SqliteAcpSessionRepository::new(pool.clone());
+    let binding = acp_repo.get_for_user(&owner.id, &id).await.unwrap().unwrap();
+    assert_eq!(binding.agent_id, "8e1acf31");
+    // A local binding can outlive its backend thread.
+    assert!(
+        acp_repo
+            .update_session_id_for_user(&owner.id, &id, "00000000-0000-4000-8000-000000000001")
+            .await
+            .unwrap()
+    );
 
     let resp = app
         .clone()
-        .oneshot(delete_with_token(&format!("/api/conversations/{id}"), &token, &csrf))
+        .oneshot(delete_with_token(&uri, &token, &csrf))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // Verify it's gone
-    let resp = app
-        .oneshot(get_with_token(&format!("/api/conversations/{id}"), &token))
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM acp_session WHERE conversation_id = ?")
+        .bind(&id)
+        .fetch_one(pool)
         .await
         .unwrap();
+    assert_eq!(remaining, 0);
+
+    let resp = app.clone().oneshot(get_with_token(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = app.oneshot(delete_with_token(&uri, &token, &csrf)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
