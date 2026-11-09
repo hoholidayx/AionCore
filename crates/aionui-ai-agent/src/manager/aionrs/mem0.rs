@@ -272,13 +272,14 @@ impl Mem0Tool {
             if !self.approvals.request(id, text).await {
                 return Err(failure("memory_deletion_not_approved", "The memory was kept."));
             }
+            let current = self.client.get_record(id).await;
             if !self.client.binding.is_entitled().await {
                 return Err(failure(
                     "memory_disabled",
                     "Long-term memory is no longer enabled for this assistant.",
                 ));
             }
-            if self.client.get_record(id).await? != before {
+            if current? != before {
                 return Err(failure(
                     "memory_changed",
                     "The memory changed. Review it before proposing deletion again.",

@@ -54,7 +54,7 @@ pub struct CurrentUser {
     pub status: UserStatus,
 }
 
-/// Inserted only after validating an end-user access token, never for runtime helpers or local mode.
+/// Inserted after validating an end-user access token on the regular session channel.
 #[derive(Clone, Copy)]
 pub struct AuthenticatedUserSession;
 
@@ -139,7 +139,11 @@ pub async fn auth_middleware(
         return Err(ApiError::Unauthorized("Invalid authentication session".into()));
     }
 
-    request.extensions_mut().insert(AuthenticatedUserSession);
+    // A runtime header exempts the request from CSRF. Even when the request also
+    // has a valid user token, do not grant privileges reserved for the session channel.
+    if !request.headers().contains_key(RUNTIME_TOKEN_HEADER) {
+        request.extensions_mut().insert(AuthenticatedUserSession);
+    }
     request.extensions_mut().insert(CurrentUser {
         id: user.id,
         username: user.username.unwrap_or_else(|| "external_user".to_string()),

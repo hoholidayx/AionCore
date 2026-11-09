@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 
@@ -18,7 +18,7 @@ use aionui_api_types::{
     SearchMessagesQuery, SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest,
     UpdateConversationRequest,
 };
-use aionui_auth::{AuthenticatedUserSession, CurrentUser, RUNTIME_TOKEN_HEADER};
+use aionui_auth::{AuthenticatedUserSession, CurrentUser};
 use aionui_common::ApiError;
 
 use crate::ConversationError;
@@ -509,14 +509,13 @@ async fn list_confirmations(
     Extension(user): Extension<CurrentUser>,
     session: Option<Extension<AuthenticatedUserSession>>,
     Path(id): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Json<ApiResponse<ConfirmationListResponse>>, ApiError> {
     let mut items = state
         .service
         .list_confirmations(&user.id, &id, &state.task_manager)
         .await
         .map_err(ApiError::from)?;
-    if session.is_none() || headers.contains_key(RUNTIME_TOKEN_HEADER) {
+    if session.is_none() {
         items.retain(|item| !item.call_id.starts_with(MEM0_DELETE_CONFIRMATION_PREFIX));
     }
     Ok(Json(ApiResponse::ok(items)))
@@ -534,12 +533,9 @@ async fn confirm(
     Extension(user): Extension<CurrentUser>,
     session: Option<Extension<AuthenticatedUserSession>>,
     Path(params): Path<ConfirmPathParams>,
-    headers: HeaderMap,
     body: Result<Json<ConfirmRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    if params.call_id.starts_with(MEM0_DELETE_CONFIRMATION_PREFIX)
-        && (session.is_none() || headers.contains_key(RUNTIME_TOKEN_HEADER))
-    {
+    if params.call_id.starts_with(MEM0_DELETE_CONFIRMATION_PREFIX) && session.is_none() {
         return Err(ApiError::Forbidden(
             "Memory deletion requires an authenticated Web user session".into(),
         ));

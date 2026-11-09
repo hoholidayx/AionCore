@@ -48,7 +48,7 @@ impl Mem0DeleteApprovals {
         }
     }
 
-    pub(super) async fn request(self: &Arc<Self>, memory_id: &str, memory: &str) -> bool {
+    pub(super) async fn request(&self, memory_id: &str, memory: &str) -> bool {
         let id = format!("{MEM0_DELETE_CONFIRMATION_PREFIX}{}", Uuid::now_v7());
         let (sender, receiver) = oneshot::channel();
         let deadline = Instant::now() + CONFIRMATION_TIMEOUT;

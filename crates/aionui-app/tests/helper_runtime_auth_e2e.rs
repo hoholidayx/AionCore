@@ -289,3 +289,22 @@ async fn helper_token_cannot_approve_a_memory_deletion() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     services.database.close().await;
 }
+
+#[tokio::test]
+async fn runtime_header_cannot_bypass_csrf_for_mem0_settings() {
+    let (app, services, user_id) = build_aionpro_app().await;
+    let access = services.jwt_service.sign(&user_id, "Helper Pro User").unwrap();
+    let request = Request::put("/api/assistants/example")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .header("x-aionui-runtime-token", "unused")
+        .body(Body::from(r#"{"defaults":{"mem0_memory_enabled":false}}"#))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        body_json(response).await["error"],
+        "A signed-in user session is required to change Mem0 settings"
+    );
+    services.database.close().await;
+}

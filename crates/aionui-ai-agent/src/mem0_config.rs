@@ -167,16 +167,16 @@ impl PartialEq for Mem0Binding {
 impl Eq for Mem0Binding {}
 
 impl Mem0Binding {
-    pub fn url(&self) -> &Url {
+    pub(crate) fn url(&self) -> &Url {
         &self.url
     }
 
-    pub fn bearer(&self) -> &str {
+    pub(crate) fn bearer(&self) -> &str {
         &self.bearer
     }
 
     /// Recheck the live owner, conversation scope, assistant binding, and opt-in before tool calls.
-    pub async fn is_entitled(&self) -> bool {
+    pub(crate) async fn is_entitled(&self) -> bool {
         if !matches!(self.repos.users.find_active_by_id(&self.user_id).await, Ok(Some(_))) {
             return false;
         }
