@@ -60,6 +60,9 @@ mod acp_error_recovery_test;
 #[path = "service_test/runtime_create_test.rs"]
 mod runtime_create_test;
 
+#[path = "service_test/assistant_runtime_test.rs"]
+mod assistant_runtime_test;
+
 #[derive(Clone, Debug)]
 struct RecordedViewSync {
     user_id: String,
@@ -290,6 +293,16 @@ impl IConversationRepository for MockRepo {
             .find(|r| r.user_id == user_id && r.id == id)
             .ok_or_else(|| aionui_db::DbError::NotFound(format!("Conversation {id}")))?;
 
+        if updates
+            .expected_extra
+            .as_ref()
+            .is_some_and(|expected| expected != &row.extra)
+        {
+            return Err(aionui_db::DbError::Conflict(
+                "Conversation metadata changed concurrently".into(),
+            ));
+        }
+
         if let Some(name) = &updates.name {
             row.name = name.clone();
         }
@@ -391,6 +404,27 @@ impl IConversationRepository for MockRepo {
     ) -> Result<Option<ConversationAssistantSnapshotRow>, aionui_db::DbError> {
         let rows = self.assistant_snapshots.lock().unwrap();
         Ok(rows.iter().find(|row| row.conversation_id == conversation_id).cloned())
+    }
+
+    async fn update_assistant_runtime_preferences(
+        &self,
+        _user_id: &str,
+        conversation_id: &str,
+        updates: aionui_db::AssistantRuntimePreferenceSnapshotUpdate<'_>,
+    ) -> Result<(), aionui_db::DbError> {
+        let mut rows = self.assistant_snapshots.lock().unwrap();
+        if let Some(row) = rows.iter_mut().find(|row| row.conversation_id == conversation_id) {
+            if let Some(model) = updates.model {
+                row.resolved_model_id = Some(model.to_owned());
+            }
+            if let Some(permission) = updates.permission {
+                row.resolved_permission_value = Some(permission.to_owned());
+            }
+            if let Some(thought_level) = updates.thought_level {
+                row.resolved_thought_level_value = Some(thought_level.to_owned());
+            }
+        }
+        Ok(())
     }
 
     async fn upsert_assistant_snapshot(
@@ -3268,6 +3302,7 @@ impl IMockAgent for MockAgent {
 
 struct BlockingCancelAgent {
     conversation_id: String,
+    workspace: String,
     agent_type: AgentType,
     event_tx: broadcast::Sender<AgentStreamEvent>,
     send_started: Notify,
@@ -3285,6 +3320,7 @@ impl BlockingCancelAgent {
         let (event_tx, _) = broadcast::channel(64);
         Self {
             conversation_id: conversation_id.to_owned(),
+            workspace: "/tmp/test".to_owned(),
             agent_type,
             event_tx,
             send_started: Notify::new(),
@@ -3320,7 +3356,7 @@ impl IAgentTask for BlockingCancelAgent {
     }
 
     fn workspace(&self) -> &str {
-        "/tmp/test"
+        &self.workspace
     }
 
     fn status(&self) -> Option<ConversationStatus> {
@@ -3871,6 +3907,7 @@ impl IWorkerTaskManager for MockTaskManagerWithWorkspace {
 
 struct ScriptedAgent {
     conversation_id: String,
+    workspace: String,
     agent_type: AgentType,
     status: Option<ConversationStatus>,
     event_tx: broadcast::Sender<AgentStreamEvent>,
@@ -3884,6 +3921,7 @@ impl ScriptedAgent {
         let (event_tx, _) = broadcast::channel(64);
         Self {
             conversation_id: conversation_id.to_owned(),
+            workspace: "/tmp/test".to_owned(),
             agent_type: AgentType::Acp,
             status: Some(ConversationStatus::Finished),
             event_tx,
@@ -3924,7 +3962,7 @@ impl IAgentTask for ScriptedAgent {
     }
 
     fn workspace(&self) -> &str {
-        "/tmp/test"
+        &self.workspace
     }
 
     fn status(&self) -> Option<ConversationStatus> {
@@ -8193,6 +8231,105 @@ async fn assistant_backed_aionrs_build_options_include_snapshot_rule_as_preset_r
             assert_eq!(ctx.config.preset_rules.as_deref(), Some("assistant rule body"));
         }
     }
+}
+
+#[tokio::test]
+async fn aionrs_create_seeds_published_revisions_and_uses_latest_auto_defaults() {
+    use aionui_db::{
+        AssistantRuntimeConfig, IAssistantRuntimeConfigRepository, SqliteAssistantRuntimeConfigRepository,
+    };
+
+    use crate::assistant_runtime_provenance::ASSISTANT_RUNTIME_PROVENANCE_KEY;
+
+    let resolver = Arc::new(FixedSkillResolver {
+        names: vec!["auto-skill".into()],
+    });
+    let assistant_id = "preset-runtime-provenance";
+    let definition_id = "asstdef_runtime_provenance";
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::from([(assistant_id.to_owned(), "unpublished rule".into())]),
+    });
+    let (svc, _, repo, definition_repo, _, preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+    upsert_test_assistant_definition(&definition_repo, definition_id, assistant_id, "aionrs", "auto", "auto").await;
+    preference_repo
+        .upsert_for_user(
+            "user_1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: definition_id,
+                last_model_id: None,
+                last_permission_value: None,
+                last_thought_level_value: None,
+                last_skill_ids: r#"["latest-skill"]"#,
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
+        .await
+        .unwrap();
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let config_repo = Arc::new(SqliteAssistantRuntimeConfigRepository::new(db.pool().clone()));
+    config_repo
+        .put_for_user(
+            "user_1",
+            assistant_id,
+            &AssistantRuntimeConfig {
+                skills_revision: 5,
+                mcps_revision: 3,
+                rules_revision: 4,
+                skills_mode: "auto".into(),
+                mcps_mode: "auto".into(),
+                skill_ids: vec!["older-skill".into()],
+                rules_by_locale: std::collections::BTreeMap::from([
+                    ("zh-CN".into(), "published localized rule".into()),
+                    (String::new(), "published default rule".into()),
+                ]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let svc = svc.with_assistant_runtime_config_repo(config_repo);
+    let workspace = ensure_test_workspace_path();
+
+    let request = serde_json::from_value(json!({
+        "type":"aionrs",
+        "assistant":{"id":assistant_id,"locale":"zh-CN"},
+        "extra":{"workspace":workspace,(ASSISTANT_RUNTIME_PROVENANCE_KEY):{"skills_revision":999}}
+    }))
+    .unwrap();
+    let response = svc.create("user_1", request).await.unwrap();
+    assert_eq!(response.extra["skills"], json!(["auto-skill", "latest-skill"]));
+    let row = repo.get("user_1", &response.id).await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+    assert_eq!(extra["preset_rules"], "published localized rule");
+    let provenance = &extra[ASSISTANT_RUNTIME_PROVENANCE_KEY];
+    assert_eq!(provenance["locale"], "zh-CN");
+    assert_eq!(provenance["skills_revision"], 5);
+    assert_eq!(provenance["mcps_revision"], 3);
+    assert_eq!(provenance["rules_revision"], 4);
+    assert_eq!(provenance["overrides"], json!({}));
+
+    let request = serde_json::from_value(json!({
+        "type":"aionrs",
+        "assistant":{
+            "id":assistant_id,
+            "runtime_overrides":{"skill_ids":[],"disabled_builtin_skill_ids":["auto-skill"],"mcp_ids":[]}
+        },
+        "extra":{"workspace":workspace}
+    }))
+    .unwrap();
+    let response = svc.create("user_1", request).await.unwrap();
+    assert_eq!(response.extra["skills"], json!([]));
+    assert_eq!(response.extra["mcp_server_ids"], json!([]));
+    let row = repo.get("user_1", &response.id).await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+    assert_eq!(
+        extra[ASSISTANT_RUNTIME_PROVENANCE_KEY]["overrides"]["skill_ids"],
+        json!([])
+    );
+    assert_eq!(extra["preset_rules"], "published default rule");
 }
 
 #[tokio::test]

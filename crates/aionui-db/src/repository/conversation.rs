@@ -131,6 +131,28 @@ pub trait IConversationRepository: Send + Sync {
         Ok(None)
     }
 
+    /// Apply turn-start assistant settings without replacing unrelated extra keys or snapshot columns.
+    async fn apply_assistant_runtime_config(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _updates: &ApplyAssistantRuntimeConfigParams<'_>,
+    ) -> Result<ConversationRow, DbError> {
+        Err(DbError::Init(
+            "Assistant runtime configuration updates are unsupported".into(),
+        ))
+    }
+
+    /// Set conversation runtime preferences without touching applied assistant settings.
+    async fn update_assistant_runtime_preferences(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _updates: AssistantRuntimePreferenceSnapshotUpdate<'_>,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+
     /// Deletes the assistant snapshot bound to a conversation.
     async fn delete_assistant_snapshot(&self, _user_id: &str, _conversation_id: &str) -> Result<bool, DbError> {
         Ok(false)
@@ -351,6 +373,35 @@ pub trait IConversationRepository: Send + Sync {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ApplyAssistantRuntimeConfigParams<'a> {
+    pub extra_patch: &'a serde_json::Value,
+    pub expected_extra: &'a str,
+    pub skills: Option<AssistantRuntimeSkillSnapshotUpdate<'a>>,
+    pub mcps: Option<AssistantRuntimeMcpSnapshotUpdate<'a>>,
+    pub rules_content: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AssistantRuntimeSkillSnapshotUpdate<'a> {
+    pub mode: &'a str,
+    pub ids_json: &'a str,
+    pub disabled_ids_json: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AssistantRuntimeMcpSnapshotUpdate<'a> {
+    pub mode: &'a str,
+    pub ids_json: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AssistantRuntimePreferenceSnapshotUpdate<'a> {
+    pub model: Option<&'a str>,
+    pub permission: Option<&'a str>,
+    pub thought_level: Option<&'a str>,
+}
+
 // ── Supporting types ────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -460,6 +511,8 @@ pub struct ConversationRowUpdate {
     pub pinned_at: Option<Option<TimestampMs>>,
     pub model: Option<Option<String>>,
     pub extra: Option<String>,
+    /// Compare-and-swap guard for an extra replacement derived from a previous read.
+    pub expected_extra: Option<String>,
     pub status: Option<String>,
     pub updated_at: Option<TimestampMs>,
     /// Project binding (project-bind side branch); `Some` sets the column.

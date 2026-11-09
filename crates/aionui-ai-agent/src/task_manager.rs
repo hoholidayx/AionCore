@@ -183,7 +183,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
                     })
                 })
                 .await?;
-            if managed.runtime_capabilities.satisfies(&options.runtime_capabilities) {
+            if options.only_create_if_missing || managed.runtime_capabilities.satisfies(&options.runtime_capabilities) {
                 return Ok(managed.agent.clone());
             }
 
@@ -644,6 +644,24 @@ mod tests {
 
         assert!(!same_mock(&h1, &h2));
         assert_eq!(mgr.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_passive_warmup_cannot_replace_the_runtime_selected_by_a_user_turn() {
+        let mgr = make_manager();
+        let mut current = make_options("conv-1");
+        current.runtime_capabilities.assistant_configuration_fingerprint = Some([2; 32]);
+        let current = mgr.get_or_build_task("conv-1", current).await.unwrap();
+
+        let mut stale = make_options("conv-1");
+        stale.runtime_capabilities.assistant_configuration_fingerprint = Some([1; 32]);
+        let warmed = mgr
+            .get_or_build_task("conv-1", stale.only_create_if_missing())
+            .await
+            .unwrap();
+
+        assert!(same_mock(&current, &warmed));
+        assert!(same_mock(&current, &mgr.get_task("conv-1").unwrap()));
     }
 
     #[tokio::test]

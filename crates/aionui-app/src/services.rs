@@ -18,9 +18,9 @@ use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
     IProjectStore, ISkillRepository, IUserOrderStore, IUserRepository, SqliteAcpSessionRepository,
     SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantPreferenceRepository, SqliteConversationRepository, SqliteMcpServerRepository, SqliteProjectStore,
-    SqliteProviderRepository, SqliteSettingsRepository, SqliteSkillRepository, SqliteUserOrderStore,
-    SqliteUserRepository,
+    SqliteAssistantPreferenceRepository, SqliteAssistantRuntimeConfigRepository, SqliteConversationRepository,
+    SqliteMcpServerRepository, SqliteProjectStore, SqliteProviderRepository, SqliteSettingsRepository,
+    SqliteSkillRepository, SqliteUserOrderStore, SqliteUserRepository,
 };
 use aionui_project::ProjectService;
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
@@ -140,6 +140,7 @@ impl AppServices {
             user_order_store: self.user_order_store.clone(),
             mem0_config: self.conversation_service.mem0_config().cloned(),
             user_repo: self.user_repo.clone(),
+            identity_mode: self.identity_mode,
         });
         self
     }
@@ -431,6 +432,7 @@ impl AppServices {
             user_order_store: user_order_store.clone(),
             mem0_config,
             user_repo: user_repo.clone(),
+            identity_mode,
         });
 
         let session_message_queue = Arc::new(DeliveryQueue::new(Arc::new(SystemClock)));
@@ -512,6 +514,7 @@ struct ConversationServiceDeps<'a> {
     user_order_store: Arc<dyn IUserOrderStore>,
     mem0_config: Option<Arc<Mem0Config>>,
     user_repo: Arc<dyn IUserRepository>,
+    identity_mode: IdentityMode,
 }
 
 fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> ConversationService {
@@ -535,6 +538,10 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     .with_runtime_state(deps.conversation_runtime_state)
     .with_runtime_helper_context(deps.runtime_helper_bin, deps.runtime_base_url)
     .with_runtime_token_service(deps.runtime_token_service);
+    if matches!(deps.identity_mode, IdentityMode::Local | IdentityMode::WebUi) {
+        service = service
+            .with_assistant_runtime_config_repo(Arc::new(SqliteAssistantRuntimeConfigRepository::new(pool.clone())));
+    }
     if let Some(config) = deps.mem0_config {
         service = service.with_mem0_config(
             config,

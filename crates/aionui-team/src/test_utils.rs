@@ -1085,6 +1085,7 @@ pub(crate) mod workspace_harness {
                         pinned: None,
                         pinned_at: None,
                         extra: Some(serde_json::to_string(&extra).unwrap()),
+                        expected_extra: None,
                         status: None,
                         updated_at: Some(now_ms()),
                         project_id: None,

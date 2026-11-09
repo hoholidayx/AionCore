@@ -643,6 +643,7 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                     pinned: None,
                     pinned_at: None,
                     extra: Some(serde_json::to_string(&extra).unwrap()),
+                    expected_extra: None,
                     status: None,
                     updated_at: Some(aionui_common::now_ms()),
                     project_id: None,

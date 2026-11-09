@@ -18,12 +18,12 @@ use aionui_api_types::{
     SearchMessagesQuery, SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest,
     UpdateConversationRequest,
 };
-use aionui_auth::{AuthenticatedUserSession, CurrentUser};
+use aionui_auth::{AuthenticatedUserSession, CurrentUser, LocalUserSession};
 use aionui_common::ApiError;
 
 use crate::ConversationError;
 use crate::image_jobs::AsyncImageJobs;
-use crate::service::ConversationService;
+use crate::service::{ConversationSendOrigin, ConversationService};
 use crate::state::ConversationRouterState;
 
 impl From<ConversationError> for ApiError {
@@ -368,13 +368,21 @@ async fn send_msg(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     session: Option<Extension<AuthenticatedUserSession>>,
+    local_session: Option<Extension<LocalUserSession>>,
     Path(id): Path<String>,
     body: Result<Json<SendMessageRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<SendMessageResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    let origin = if session.is_some() {
+        ConversationSendOrigin::AuthenticatedUser
+    } else if local_session.is_some() {
+        ConversationSendOrigin::DesktopLocal
+    } else {
+        ConversationSendOrigin::Background
+    };
     let response = state
         .service
-        .send_message_for_session(&user.id, &id, req, &state.task_manager, session.is_some())
+        .send_message_for_session(&user.id, &id, req, &state.task_manager, origin)
         .await
         .map_err(ApiError::from)?;
     // B5: a mid-turn delivery already handed the message to the RUNNING turn —

@@ -1,6 +1,7 @@
 pub mod acp_session;
 pub mod agent_metadata;
 pub mod assistant;
+mod assistant_runtime_config;
 pub mod async_image_job;
 pub mod channel;
 mod client_preference;
@@ -19,6 +20,7 @@ pub mod skill;
 mod sqlite_acp_session;
 mod sqlite_agent_metadata;
 mod sqlite_assistant;
+mod sqlite_assistant_runtime_config;
 mod sqlite_async_image_job;
 mod sqlite_channel;
 mod sqlite_client_preference;
@@ -46,6 +48,7 @@ pub use assistant::{
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
     IAssistantPreferenceRepository, IAssistantRepository,
 };
+pub use assistant_runtime_config::IAssistantRuntimeConfigRepository;
 pub use async_image_job::IAsyncImageJobRepository;
 pub use channel::IChannelRepository;
 pub use client_preference::IClientPreferenceRepository;
@@ -69,6 +72,7 @@ pub use sqlite_assistant::{
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
 };
+pub use sqlite_assistant_runtime_config::SqliteAssistantRuntimeConfigRepository;
 pub use sqlite_async_image_job::SqliteAsyncImageJobRepository;
 pub use sqlite_channel::SqliteChannelRepository;
 pub use sqlite_client_preference::SqliteClientPreferenceRepository;

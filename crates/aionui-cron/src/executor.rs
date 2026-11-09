@@ -378,6 +378,7 @@ impl JobExecutor {
 
         if changed {
             let update = ConversationRowUpdate {
+                expected_extra: Some(row.extra),
                 extra: Some(extra.to_string()),
                 updated_at: Some(now_ms()),
                 ..Default::default()
@@ -425,6 +426,7 @@ impl JobExecutor {
         }
 
         let update = ConversationRowUpdate {
+            expected_extra: Some(row.extra),
             extra: Some(extra.to_string()),
             updated_at: Some(now_ms()),
             ..Default::default()
@@ -457,6 +459,7 @@ impl JobExecutor {
                 serde_json::Value::String(resolved_workspace.to_owned()),
             );
             let update = ConversationRowUpdate {
+                expected_extra: Some(row.extra),
                 extra: Some(extra.to_string()),
                 updated_at: Some(now_ms()),
                 ..Default::default()
@@ -484,6 +487,7 @@ impl JobExecutor {
         );
 
         let update = ConversationRowUpdate {
+            expected_extra: Some(row.extra),
             extra: Some(extra.to_string()),
             updated_at: Some(now_ms()),
             ..Default::default()
@@ -1179,6 +1183,7 @@ fn build_assistant_request(job: &CronJob) -> Option<AssistantConversationRequest
         id: assistant_id,
         locale: None,
         conversation_overrides: None,
+        runtime_overrides: None,
     })
 }
 

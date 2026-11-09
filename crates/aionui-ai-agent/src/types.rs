@@ -39,6 +39,7 @@ pub struct PromptMediaCaps {
 pub struct BuildTaskOptions {
     pub context: AgentSessionContext,
     pub runtime_capabilities: RuntimeCapabilities,
+    pub(crate) only_create_if_missing: bool,
 }
 
 impl BuildTaskOptions {
@@ -46,7 +47,15 @@ impl BuildTaskOptions {
         Self {
             context,
             runtime_capabilities: RuntimeCapabilities::default(),
+            only_create_if_missing: false,
         }
+    }
+
+    /// A passive warmup can initialize a missing task, but must not replace
+    /// a task another caller may have started with fresher options.
+    pub fn only_create_if_missing(mut self) -> Self {
+        self.only_create_if_missing = true;
+        self
     }
 
     pub fn conversation_id(&self) -> &str {
@@ -109,11 +118,18 @@ pub struct RuntimeCapabilities {
     /// Assistant setting for the host image tool. Unspecified builds default to enabled.
     pub async_image_enabled: Option<bool>,
     pub mem0: Option<Mem0Binding>,
+    /// Digest of the effective rules, Skill names and MCP settings for this runtime.
+    pub assistant_configuration_fingerprint: Option<[u8; 32]>,
 }
 
 impl RuntimeCapabilities {
     pub fn satisfies(&self, requested: &Self) -> bool {
         if self.mem0 != requested.mem0 {
+            return false;
+        }
+        if let Some(fingerprint) = requested.assistant_configuration_fingerprint
+            && self.assistant_configuration_fingerprint != Some(fingerprint)
+        {
             return false;
         }
         if requested
@@ -368,6 +384,22 @@ mod tests {
         assert!(data.turn_id.is_none());
         assert!(data.files.is_empty());
         assert!(data.inject_skills.is_empty());
+    }
+
+    #[test]
+    fn requested_assistant_configuration_requires_an_exact_runtime_match() {
+        let previous = RuntimeCapabilities {
+            assistant_configuration_fingerprint: Some([1; 32]),
+            ..Default::default()
+        };
+        let updated = RuntimeCapabilities {
+            assistant_configuration_fingerprint: Some([2; 32]),
+            ..Default::default()
+        };
+        assert!(previous.satisfies(&previous));
+        assert!(!previous.satisfies(&updated));
+        assert!(!RuntimeCapabilities::default().satisfies(&updated));
+        assert!(updated.satisfies(&RuntimeCapabilities::default()));
     }
 
     #[test]

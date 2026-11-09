@@ -20,9 +20,9 @@ use aionui_db::{
     IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IConversationRepository,
     IProviderRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
     SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
-    SqliteAssistantRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
-    SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
-    SqliteSettingsRepository,
+    SqliteAssistantRepository, SqliteAssistantRuntimeConfigRepository, SqliteClientPreferenceRepository,
+    SqliteConversationRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
+    SqliteRemoteAgentRepository, SqliteSettingsRepository,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -441,6 +441,7 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
         Arc::new(SqliteAssistantOverlayRepository::new(pool.clone()));
     let preference_repo: Arc<dyn IAssistantPreferenceRepository> =
         Arc::new(SqliteAssistantPreferenceRepository::new(pool.clone()));
+    let runtime_config_repo = Arc::new(SqliteAssistantRuntimeConfigRepository::new(pool.clone()));
     let repo: Arc<dyn IAssistantRepository> = Arc::new(SqliteAssistantRepository::new(pool.clone()));
     let override_repo: Arc<dyn IAssistantOverrideRepository> =
         Arc::new(SqliteAssistantOverrideRepository::new(pool.clone()));
@@ -462,6 +463,7 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
                 definition_repo,
                 state_repo,
                 preference_repo,
+                runtime_config_repo,
                 repo,
                 override_repo,
                 provider_repo,

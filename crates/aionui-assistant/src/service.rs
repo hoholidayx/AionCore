@@ -19,9 +19,9 @@ use aionui_common::{AgentType, generate_prefixed_id, now_ms};
 use aionui_db::{
     AgentBindingResolution, AssistantDefinitionRow, AssistantOverlayRow, AssistantRow, CreateAssistantParams,
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
-    IAssistantPreferenceRepository, IAssistantRepository, IProviderRepository, SqlitePool, UpdateAssistantParams,
-    UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams,
-    resolve_agent_binding_for_user,
+    IAssistantPreferenceRepository, IAssistantRepository, IAssistantRuntimeConfigRepository, IProviderRepository,
+    SqlitePool, UpdateAssistantParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    UpsertAssistantPreferenceParams, resolve_agent_binding_for_user,
 };
 use aionui_extension::{AssistantClassifier, AssistantRuleDispatcher, ExtensionError};
 use aionui_realtime::EventBroadcaster;
@@ -33,6 +33,10 @@ use crate::agent_catalog::AssistantAgentCatalogPort;
 use crate::builtin::BuiltinAssistant;
 use crate::builtin::{AvatarAsset, BuiltinAssistantRegistry};
 use crate::error::AssistantError;
+
+mod runtime_config;
+
+use runtime_config::{AssistantMutationLocks, RuntimeConfigChanges};
 
 /// Max attempts (initial + retries) and per-retry backoff for a bootstrap step
 /// contended by a concurrent startup (Sentry 135525166 Option B).
@@ -112,6 +116,8 @@ pub struct AssistantService {
     definition_repo: Arc<dyn IAssistantDefinitionRepository>,
     state_repo: Arc<dyn IAssistantOverlayRepository>,
     preference_repo: Arc<dyn IAssistantPreferenceRepository>,
+    runtime_config_repo: Arc<dyn IAssistantRuntimeConfigRepository>,
+    mutation_locks: AssistantMutationLocks,
     repo: Arc<dyn IAssistantRepository>,
     override_repo: Arc<dyn IAssistantOverrideRepository>,
     /// Used to infer a sane `agent_id` default when the caller did not supply
@@ -134,6 +140,7 @@ pub struct AssistantServiceDeps {
     pub definition_repo: Arc<dyn IAssistantDefinitionRepository>,
     pub state_repo: Arc<dyn IAssistantOverlayRepository>,
     pub preference_repo: Arc<dyn IAssistantPreferenceRepository>,
+    pub runtime_config_repo: Arc<dyn IAssistantRuntimeConfigRepository>,
     pub repo: Arc<dyn IAssistantRepository>,
     pub override_repo: Arc<dyn IAssistantOverrideRepository>,
     pub provider_repo: Arc<dyn IProviderRepository>,
@@ -170,6 +177,7 @@ impl AssistantService {
             definition_repo,
             state_repo,
             preference_repo,
+            runtime_config_repo,
             repo,
             override_repo,
             provider_repo,
@@ -177,6 +185,8 @@ impl AssistantService {
             agent_catalog,
         } = deps;
         Self {
+            runtime_config_repo,
+            mutation_locks: AssistantMutationLocks::default(),
             pool,
             definition_repo,
             state_repo,
@@ -1146,12 +1156,16 @@ impl AssistantService {
         publish_mcp_change: bool,
     ) -> Result<AssistantResponse, AssistantError> {
         let response = self.get_for_user(user_id, assistant_id).await?;
-        if publish_mcp_change
-            && let Err(error) = self.publish_assistant_mcp_binding_changed(user_id, assistant_id).await
-        {
-            warn!(user_id, assistant_id, error = %error, "failed to publish assistant MCP binding change");
+        if publish_mcp_change {
+            self.notify_mcp_binding_changed(user_id, assistant_id).await;
         }
         Ok(response)
+    }
+
+    async fn notify_mcp_binding_changed(&self, user_id: &str, assistant_id: &str) {
+        if let Err(error) = self.publish_assistant_mcp_binding_changed(user_id, assistant_id).await {
+            warn!(user_id, assistant_id, error = %error, "failed to publish assistant MCP binding change");
+        }
     }
 
     async fn publish_assistant_mcp_binding_changed(
@@ -1219,6 +1233,7 @@ impl AssistantService {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => generate_user_id(),
         };
+        let _guard = self.mutation_locks.lock(user_id, &id).await?;
 
         // Reject id collisions with built-ins.
         if self.builtin.has(&id) {
@@ -1279,9 +1294,44 @@ impl AssistantService {
         &self,
         user_id: &str,
         id: &str,
-        req: UpdateAssistantRequest,
+        mut req: UpdateAssistantRequest,
     ) -> Result<AssistantResponse, AssistantError> {
         let mcp_binding_changed = req.defaults.as_ref().is_some_and(|defaults| defaults.mcps.is_some());
+        let _guard = self.mutation_locks.lock(user_id, id).await?;
+        let changes = RuntimeConfigChanges::from_request(&req);
+        let rules = req.rules.take();
+        if rules.is_some() && self.classify_source_for_user(user_id, id).await == AssistantSource::Builtin {
+            return Err(AssistantError::BadRequest(
+                "Cannot edit rules for built-in assistant".into(),
+            ));
+        }
+        let prior = if changes.any() {
+            self.runtime_config_baseline(user_id, id).await?
+        } else {
+            None
+        };
+
+        self.update_fields_for_user(user_id, id, req).await?;
+        if let Some(rules) = rules.as_ref() {
+            self.apply_rule_source_mutation(user_id, id, rules)?;
+        }
+        let response = self.get_for_user(user_id, id).await?;
+        if let Some(prior) = prior {
+            self.publish_runtime_config(user_id, id, prior, changes, rules.as_ref())
+                .await?;
+        }
+        if mcp_binding_changed {
+            self.notify_mcp_binding_changed(user_id, id).await;
+        }
+        Ok(response)
+    }
+
+    async fn update_fields_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        req: UpdateAssistantRequest,
+    ) -> Result<(), AssistantError> {
         let mem0_preference = req.defaults.as_ref().and_then(|defaults| defaults.mem0_memory_enabled);
         match self.classify_source_for_user(user_id, id).await {
             AssistantSource::Builtin => {
@@ -1395,7 +1445,7 @@ impl AssistantService {
                 .await?;
                 self.apply_mem0_preference(user_id, &definition, mem0_preference)
                     .await?;
-                return self.finish_assistant_mutation(user_id, id, mcp_binding_changed).await;
+                return Ok(());
             }
             AssistantSource::Generated => {
                 if req.name.is_some()
@@ -1468,7 +1518,7 @@ impl AssistantService {
                 )
                 .await?;
                 self.apply_mem0_preference(user_id, &patched, mem0_preference).await?;
-                return self.finish_assistant_mutation(user_id, id, mcp_binding_changed).await;
+                return Ok(());
             }
             AssistantSource::User => {}
         }
@@ -1534,7 +1584,7 @@ impl AssistantService {
             self.apply_mem0_preference(user_id, &definition, mem0_preference)
                 .await?;
         }
-        self.finish_assistant_mutation(user_id, id, mcp_binding_changed).await
+        Ok(())
     }
 
     async fn sync_preferences_from_defaults_request_for_user(
@@ -1712,6 +1762,7 @@ impl AssistantService {
     }
 
     pub async fn delete_for_user(&self, user_id: &str, id: &str) -> Result<(), AssistantError> {
+        let _guard = self.mutation_locks.lock(user_id, id).await?;
         match self.classify_source_for_user(user_id, id).await {
             AssistantSource::Builtin => {
                 return Err(AssistantError::Forbidden("Cannot delete built-in assistant".into()));
@@ -1749,6 +1800,7 @@ impl AssistantService {
 
         // Best-effort filesystem cleanup.
         self.cleanup_user_assets_for_user(user_id, id);
+        self.runtime_config_repo.delete_for_user(user_id, id).await?;
 
         Ok(())
     }
@@ -2089,20 +2141,12 @@ impl AssistantService {
         locale: Option<&str>,
         content: &str,
     ) -> Result<(), AssistantError> {
-        match self.classify_source_for_user(user_id, id).await {
-            AssistantSource::Builtin => Err(AssistantError::BadRequest(
-                "Cannot write rule for built-in assistant".into(),
-            )),
-            AssistantSource::Generated | AssistantSource::User => {
-                let path = self.user_rule_path_for_user(user_id, id, locale);
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| AssistantError::Internal(format!("create dir failed: {e}")))?;
-                }
-                std::fs::write(&path, content).map_err(|e| AssistantError::Internal(format!("write failed: {e}")))?;
-                Ok(())
-            }
-        }
+        let mutation = aionui_api_types::AssistantRuleMutation::Write {
+            locale: locale.map(str::to_owned),
+            content: content.to_owned(),
+        };
+        self.mutate_rule_for_user(user_id, id, mutation).await?;
+        Ok(())
     }
 
     /// Delete all locale versions of an assistant rule.
@@ -2112,14 +2156,8 @@ impl AssistantService {
 
     /// Delete all locale versions of an assistant rule for the current owner.
     pub async fn delete_rule_for_user(&self, user_id: &str, id: &str) -> Result<bool, AssistantError> {
-        match self.classify_source_for_user(user_id, id).await {
-            AssistantSource::Builtin => Err(AssistantError::BadRequest(
-                "Cannot delete rule for built-in assistant".into(),
-            )),
-            AssistantSource::Generated | AssistantSource::User => {
-                Ok(remove_assistant_md_files(&self.user_rules_dir_for_user(user_id), id))
-            }
-        }
+        self.mutate_rule_for_user(user_id, id, aionui_api_types::AssistantRuleMutation::Clear)
+            .await
     }
 
     pub async fn read_skill(&self, id: &str, locale: Option<&str>) -> Result<String, AssistantError> {
@@ -3656,6 +3694,9 @@ mod tests {
                 definition_repo: Arc::new(SqliteAssistantDefinitionRepository::new(db.pool().clone())),
                 state_repo: Arc::new(SqliteAssistantOverlayRepository::new(db.pool().clone())),
                 preference_repo: Arc::new(SqliteAssistantPreferenceRepository::new(db.pool().clone())),
+                runtime_config_repo: Arc::new(aionui_db::SqliteAssistantRuntimeConfigRepository::new(
+                    db.pool().clone(),
+                )),
                 repo: Arc::new(SqliteAssistantRepository::new(db.pool().clone())),
                 override_repo: Arc::new(SqliteAssistantOverrideRepository::new(db.pool().clone())),
                 provider_repo: Arc::new(SqliteProviderRepository::new(db.pool().clone())),
@@ -3904,6 +3945,9 @@ mod tests {
                 definition_repo: definition_repo.clone(),
                 state_repo: state_repo.clone(),
                 preference_repo: preference_repo.clone(),
+                runtime_config_repo: Arc::new(aionui_db::SqliteAssistantRuntimeConfigRepository::new(
+                    db.pool().clone(),
+                )),
                 repo: repo.clone(),
                 override_repo: orepo.clone(),
                 provider_repo: provider_repo.clone(),
@@ -6298,6 +6342,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_combined_save_keeps_the_previous_runtime_config_and_can_be_retried() {
+        use aionui_api_types::AssistantRuleMutation;
+
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("runtime-save".into()),
+                name: "Runtime Save".into(),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        fx.service
+            .write_rule("runtime-save", Some("en-US"), "old rule")
+            .await
+            .unwrap();
+        let before = fx
+            .service
+            .runtime_config_repo
+            .get_for_user(DEFAULT_USER_ID, "runtime-save")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.resolve_rule(Some("en-US")), "old rule");
+
+        let broken_path = fx
+            .service
+            .user_rule_path_for_user(DEFAULT_USER_ID, "runtime-save", Some("zh-CN"));
+        std::fs::create_dir(&broken_path).unwrap();
+        let request = UpdateAssistantRequest {
+            defaults: Some(AssistantDefaultsRequest {
+                skills: Some(AssistantDefaultListRequest {
+                    mode: "fixed".into(),
+                    value: vec!["new-skill".into()],
+                }),
+                mcps: Some(AssistantDefaultListRequest {
+                    mode: "fixed".into(),
+                    value: vec!["new-mcp".into()],
+                }),
+                ..Default::default()
+            }),
+            rules: Some(AssistantRuleMutation::Write {
+                locale: Some("zh-CN".into()),
+                content: "new rule".into(),
+            }),
+            ..Default::default()
+        };
+        let error = fx.service.update("runtime-save", request.clone()).await.unwrap_err();
+        assert!(
+            matches!(error, AssistantError::Internal(message) if message.contains("assistant rule file operation failed"))
+        );
+        assert_eq!(
+            fx.service
+                .runtime_config_repo
+                .get_for_user(DEFAULT_USER_ID, "runtime-save")
+                .await
+                .unwrap(),
+            Some(before.clone())
+        );
+
+        fx.service
+            .write_rule("runtime-save", Some("en-US"), "standalone edit")
+            .await
+            .unwrap();
+        let standalone = fx
+            .service
+            .runtime_config_repo
+            .get_for_user(DEFAULT_USER_ID, "runtime-save")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(standalone.skill_ids, before.skill_ids);
+        assert_eq!(standalone.mcp_ids, before.mcp_ids);
+        assert_eq!(standalone.rules_revision, before.rules_revision + 1);
+
+        std::fs::remove_dir(broken_path).unwrap();
+        fx.service.update("runtime-save", request.clone()).await.unwrap();
+        let saved = fx
+            .service
+            .runtime_config_repo
+            .get_for_user(DEFAULT_USER_ID, "runtime-save")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.skill_ids, ["new-skill"]);
+        assert_eq!(saved.mcp_ids, ["new-mcp"]);
+        assert_eq!(saved.skills_revision, before.skills_revision + 1);
+        assert_eq!(saved.mcps_revision, before.mcps_revision + 1);
+        assert_eq!(saved.rules_revision, standalone.rules_revision + 1);
+        assert_eq!(saved.resolve_rule(Some("zh-CN")), "new rule");
+        assert_eq!(saved.resolve_rule(Some("en-US")), "standalone edit");
+
+        fx.service.update("runtime-save", request).await.unwrap();
+        assert_eq!(
+            fx.service
+                .runtime_config_repo
+                .get_for_user(DEFAULT_USER_ID, "runtime-save")
+                .await
+                .unwrap(),
+            Some(saved)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rule_clear_publishes_empty_and_removes_legacy_fallback_files() {
+        use aionui_api_types::AssistantRuleMutation;
+
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("old-rule".into()),
+                name: "Legacy Rule".into(),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        let legacy_dir = fx.service.user_rules_root_dir();
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_path = legacy_dir.join("old-rule.en-US.md");
+        std::fs::write(&legacy_path, "legacy rule").unwrap();
+        assert_eq!(
+            fx.service.read_rule("old-rule", Some("en-US")).await.unwrap(),
+            "legacy rule"
+        );
+
+        fx.service
+            .update(
+                "old-rule",
+                UpdateAssistantRequest {
+                    rules: Some(AssistantRuleMutation::Clear),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let saved = fx
+            .service
+            .runtime_config_repo
+            .get_for_user(DEFAULT_USER_ID, "old-rule")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.rules_revision, 1);
+        assert_eq!(saved.resolve_rule(Some("en-US")), "");
+        assert!(!legacy_path.exists());
+        assert_eq!(fx.service.read_rule("old-rule", Some("en-US")).await.unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn only_an_explicit_auto_selection_save_advances_its_revision() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("auto-save".into()),
+                name: "Auto Save".into(),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        let request = UpdateAssistantRequest {
+            defaults: Some(AssistantDefaultsRequest {
+                mcps: Some(AssistantDefaultListRequest {
+                    mode: "auto".into(),
+                    value: Vec::new(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        fx.service.update("auto-save", request.clone()).await.unwrap();
+        fx.service
+            .write_rule("auto-save", None, "only update rules")
+            .await
+            .unwrap();
+        let after_rule = fx
+            .service
+            .runtime_config_repo
+            .get_for_user(DEFAULT_USER_ID, "auto-save")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_rule.mcps_revision, 1);
+        assert_eq!(after_rule.rules_revision, 1);
+
+        fx.service.update("auto-save", request).await.unwrap();
+        let after_save = fx
+            .service
+            .runtime_config_repo
+            .get_for_user(DEFAULT_USER_ID, "auto-save")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_save.mcps_revision, 2);
+        assert_eq!(after_save.rules_revision, after_rule.rules_revision);
+    }
+
+    #[tokio::test]
     async fn update_persists_detail_defaults_and_recommended_prompts() {
         let fx = fixture().await;
         fx.service
@@ -6985,6 +7226,9 @@ mod tests {
                 definition_repo,
                 state_repo,
                 preference_repo,
+                runtime_config_repo: Arc::new(aionui_db::SqliteAssistantRuntimeConfigRepository::new(
+                    db.pool().clone(),
+                )),
                 repo,
                 override_repo: orepo,
                 provider_repo,

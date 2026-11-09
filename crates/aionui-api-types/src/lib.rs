@@ -70,10 +70,10 @@ pub use assistant::{
     AssistantDefaultListRequest, AssistantDefaultListResponse, AssistantDefaultScalarRequest,
     AssistantDefaultScalarResponse, AssistantDefaultsRequest, AssistantDefaultsResponse, AssistantDetailResponse,
     AssistantEngineResponse, AssistantMcpBindingChanged, AssistantPreferencesResponse, AssistantProfileResponse,
-    AssistantPromptsResponse, AssistantResponse, AssistantRulesResponse, AssistantSource, AssistantStateResponse,
-    CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult, ImportError, SetAssistantStateRequest,
-    UpdateAssistantRequest, assistant_avatar_response_value, assistant_avatar_response_value_with_version,
-    is_local_avatar_value,
+    AssistantPromptsResponse, AssistantResponse, AssistantRuleMutation, AssistantRulesResponse, AssistantSource,
+    AssistantStateResponse, CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult, ImportError,
+    SetAssistantStateRequest, UpdateAssistantRequest, assistant_avatar_response_value,
+    assistant_avatar_response_value_with_version, is_local_avatar_value,
 };
 pub use auth::{
     AuthStatusResponse, ChangePasswordRequest, EnsureExternalSessionRequest, EnsureExternalSessionResponse,
@@ -97,14 +97,15 @@ pub use confirmation::{
 pub use connection_test::TestBedrockConnectionRequest;
 pub use conversation::{
     ActiveCountResponse, AssistantConversationOverridesRequest, AssistantConversationRequest,
-    CancelConversationRequest, CancelConversationResponse, CloneConversationRequest, ConversationArtifactKind,
-    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
-    ConversationAssistantIdentityResponse, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
-    ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary,
-    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
-    ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse,
-    MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, PromptCapabilityView, SearchMessagesQuery,
-    SendMessageRequest, SendMessageResponse, SessionRef, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    AssistantRuntimeOverridesRequest, CancelConversationRequest, CancelConversationResponse, CloneConversationRequest,
+    ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ConversationArtifactStatus, ConversationAssistantIdentityResponse, ConversationListResponse, ConversationMcpStatus,
+    ConversationMcpStatusKind, ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeStateKind,
+    ConversationRuntimeSummary, CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView,
+    ForkConversationRequest, ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse,
+    MessageResponse, MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, PromptCapabilityView,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionRef, UpdateConversationArtifactRequest,
+    UpdateConversationRequest,
 };
 pub use conversation_tools::{
     CONVERSATION_TOOLS_SCHEMA_VERSION, ConversationCliEnvelope, ConversationCliMeta, ConversationCreateAssistant,

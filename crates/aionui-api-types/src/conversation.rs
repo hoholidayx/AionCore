@@ -72,6 +72,19 @@ pub struct AssistantConversationRequest {
     pub locale: Option<String>,
     #[serde(default)]
     pub conversation_overrides: Option<AssistantConversationOverridesRequest>,
+    /// Selections the user explicitly wants this conversation to keep on later turns.
+    #[serde(default)]
+    pub runtime_overrides: Option<AssistantRuntimeOverridesRequest>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub struct AssistantRuntimeOverridesRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_builtin_skill_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_ids: Option<Vec<String>>,
 }
 
 /// Body for `POST /api/conversations`.
@@ -481,6 +494,10 @@ mod tests {
                     "skill_ids": ["skill-a"],
                     "disabled_builtin_skill_ids": ["builtin-a"],
                     "mcp_ids": ["mcp-a"]
+                },
+                "runtime_overrides": {
+                    "skill_ids": [],
+                    "mcp_ids": ["mcp-a"]
                 }
             },
             "source": "aionui",
@@ -502,6 +519,11 @@ mod tests {
                     thought_level: Some("high".into()),
                     skill_ids: Some(vec!["skill-a".into()]),
                     disabled_builtin_skill_ids: Some(vec!["builtin-a".into()]),
+                    mcp_ids: Some(vec!["mcp-a".into()]),
+                }),
+                runtime_overrides: Some(AssistantRuntimeOverridesRequest {
+                    skill_ids: Some(Vec::new()),
+                    disabled_builtin_skill_ids: None,
                     mcp_ids: Some(vec!["mcp-a".into()]),
                 }),
             })

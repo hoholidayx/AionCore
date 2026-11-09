@@ -8,8 +8,9 @@ use crate::models::{
     UpsertConversationAssistantSnapshotParams,
 };
 use crate::repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, MentionableCandidatesParams,
-    MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
+    ApplyAssistantRuntimeConfigParams, AssistantRuntimePreferenceSnapshotUpdate, ConversationFilters,
+    ConversationRowUpdate, IConversationRepository, MentionableCandidatesParams, MessagePageCursor,
+    MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
     StaleRuntimeMessageRow,
 };
 use crate::repository::sqlite_acp_session::delete_acp_session_for_user;
@@ -403,8 +404,13 @@ impl IConversationRepository for SqliteConversationRepository {
             return Ok(());
         }
 
+        let extra_guard = if updates.expected_extra.is_some() {
+            " AND extra = ?"
+        } else {
+            ""
+        };
         let sql = format!(
-            "UPDATE conversations SET {} WHERE user_id = ? AND id = ?",
+            "UPDATE conversations SET {} WHERE user_id = ? AND id = ?{extra_guard}",
             set_parts.join(", ")
         );
 
@@ -414,10 +420,16 @@ impl IConversationRepository for SqliteConversationRepository {
         }
         query = query.bind(user_id);
         query = query.bind(id);
+        if let Some(expected_extra) = &updates.expected_extra {
+            query = query.bind(expected_extra);
+        }
 
         let result = query.execute(&self.pool).await?;
 
         if result.rows_affected() == 0 {
+            if updates.expected_extra.is_some() && self.conversation_exists_for_user(user_id, id).await? {
+                return Err(DbError::Conflict("Conversation metadata changed concurrently".into()));
+            }
             return Err(DbError::NotFound(format!("Conversation '{id}' not found")));
         }
 
@@ -761,6 +773,97 @@ impl IConversationRepository for SqliteConversationRepository {
         .await?;
 
         self.get_assistant_snapshot(user_id, params.conversation_id).await
+    }
+
+    async fn apply_assistant_runtime_config(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        updates: &ApplyAssistantRuntimeConfigParams<'_>,
+    ) -> Result<ConversationRow, DbError> {
+        if !updates.extra_patch.is_object() {
+            return Err(DbError::Init("Assistant runtime extra patch must be an object".into()));
+        }
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query_as::<_, ConversationRow>(
+            "UPDATE conversations SET extra = json_patch(extra, ?) \
+             WHERE user_id = ? AND id = ? AND archived_at IS NULL AND extra = ? RETURNING *",
+        )
+        .bind(updates.extra_patch.to_string())
+        .bind(user_id)
+        .bind(conversation_id)
+        .bind(updates.expected_extra)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM conversations WHERE user_id = ? AND id = ? AND archived_at IS NULL)",
+            )
+            .bind(user_id)
+            .bind(conversation_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if exists != 0 {
+                return Err(DbError::Conflict("Conversation metadata changed concurrently".into()));
+            }
+            return Err(DbError::NotFound(format!("Conversation '{conversation_id}' not found")));
+        };
+
+        let result = sqlx::query(
+            "UPDATE conversation_assistant_snapshots SET \
+                default_skills_mode = COALESCE(?, default_skills_mode), \
+                resolved_skill_ids = COALESCE(?, resolved_skill_ids), \
+                resolved_disabled_builtin_skill_ids = COALESCE(?, resolved_disabled_builtin_skill_ids), \
+                default_mcps_mode = COALESCE(?, default_mcps_mode), \
+                resolved_mcp_ids = COALESCE(?, resolved_mcp_ids), \
+                rules_content = COALESCE(?, rules_content), updated_at = ? \
+             WHERE conversation_id = ?",
+        )
+        .bind(updates.skills.map(|skills| skills.mode))
+        .bind(updates.skills.map(|skills| skills.ids_json))
+        .bind(updates.skills.map(|skills| skills.disabled_ids_json))
+        .bind(updates.mcps.map(|mcps| mcps.mode))
+        .bind(updates.mcps.map(|mcps| mcps.ids_json))
+        .bind(updates.rules_content)
+        .bind(aionui_common::now_ms())
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!(
+                "Assistant snapshot for '{conversation_id}' not found"
+            )));
+        }
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    async fn update_assistant_runtime_preferences(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        updates: AssistantRuntimePreferenceSnapshotUpdate<'_>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE conversation_assistant_snapshots SET \
+                resolved_model_id = COALESCE(?, resolved_model_id), \
+                resolved_permission_value = COALESCE(?, resolved_permission_value), \
+                resolved_thought_level_value = COALESCE(?, resolved_thought_level_value), updated_at = ? \
+             WHERE conversation_id = ? AND EXISTS ( \
+                SELECT 1 FROM conversations c WHERE c.id = conversation_assistant_snapshots.conversation_id \
+                  AND c.user_id = ? \
+             )",
+        )
+        .bind(updates.model)
+        .bind(updates.permission)
+        .bind(updates.thought_level)
+        .bind(aionui_common::now_ms())
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn delete_assistant_snapshot(&self, user_id: &str, conversation_id: &str) -> Result<bool, DbError> {

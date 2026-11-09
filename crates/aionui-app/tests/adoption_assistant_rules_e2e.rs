@@ -49,6 +49,7 @@ fn assistant_service(db: &Database, data_dir: &Path) -> AssistantService {
             as Arc<dyn IAssistantOverlayRepository>,
         preference_repo: Arc::new(SqliteAssistantPreferenceRepository::new(pool.clone()))
             as Arc<dyn IAssistantPreferenceRepository>,
+        runtime_config_repo: Arc::new(aionui_db::SqliteAssistantRuntimeConfigRepository::new(pool.clone())),
         repo: Arc::new(SqliteAssistantRepository::new(pool.clone())) as Arc<dyn IAssistantRepository>,
         override_repo: Arc::new(SqliteAssistantOverrideRepository::new(pool.clone()))
             as Arc<dyn IAssistantOverrideRepository>,

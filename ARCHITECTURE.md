@@ -701,6 +701,12 @@ Before adding a new crate, confirm:
 
 ## Runtime Infrastructure
 
+### Assistant Settings in Existing Conversations
+
+Ordinary AionRS chats load saved assistant Skill selections, MCP selections, and rules at the start of the next user turn. The editor publishes a complete configuration after saving the requested settings and Markdown rule changes. Each component has its own publication revision. Remembered selections from another conversation affect new conversations and are picked up by existing conversations after an explicit assistant save.
+
+The conversation stores user overrides and the applied revision for each component. At turn start it updates the effective configuration and the Skill helper allow-list in the same transaction. A changed effective configuration rebuilds the runtime and restores the conversation history. The new runtime restores the session's approval mode and collects any new in-memory tool approvals. Team, scheduled, and channel runtimes continue to use their existing configuration paths.
+
 ### Assistant Long-Term Memory
 
 Authenticated WebUI conversations using AionRS can opt in to Mem0 in the assistant's MCP settings. The assistant overlay defaults to disabled. The host resolves the authenticated user and persisted assistant definition before granting the capability. Use separate NAS bearer profiles for distinct user and assistant pairs. Each profile should bind a distinct long-term namespace, without a session ID or bulk deletion permission.

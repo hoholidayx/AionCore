@@ -376,6 +376,19 @@ pub struct UpdateAssistantRequest {
     pub recommended_prompts_i18n: Option<HashMap<String, Vec<String>>>,
     #[serde(default)]
     pub defaults: Option<AssistantDefaultsRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules: Option<AssistantRuleMutation>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AssistantRuleMutation {
+    Write {
+        #[serde(default)]
+        locale: Option<String>,
+        content: String,
+    },
+    Clear,
 }
 
 /// `PATCH /api/assistants/{id}/state`. Upserts `assistant_overrides`.

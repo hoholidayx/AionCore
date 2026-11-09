@@ -24,6 +24,7 @@ pub use error::{
     message_indicates_unique_violation,
 };
 pub use instance_lock::{DataDirInstanceGuard, instance_lock_path};
+pub use models::AssistantRuntimeConfig;
 pub use models::{
     AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow,
     AssistantRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, CreateAssistantParams,
@@ -36,8 +37,10 @@ pub use models::{
 pub use repository::async_image_job::AsyncImageJobUpdate;
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, MentionableCandidatesParams, MessagePageCursor, MessagePageDirection,
-    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, StaleRuntimeMessageRow,
+    ApplyAssistantRuntimeConfigParams, AssistantRuntimeMcpSnapshotUpdate, AssistantRuntimePreferenceSnapshotUpdate,
+    AssistantRuntimeSkillSnapshotUpdate, ConversationFilters, ConversationRowUpdate, MentionableCandidatesParams,
+    MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
+    StaleRuntimeMessageRow,
 };
 pub use repository::cron::{
     ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, RecoverableCronRun, UpdateCronJobParams,
@@ -65,6 +68,7 @@ pub use repository::{
     SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSidebarStore,
     SqliteSkillRepository, SqliteTeamRepository, SqliteUserOrderStore, SqliteUserRepository,
 };
+pub use repository::{IAssistantRuntimeConfigRepository, SqliteAssistantRuntimeConfigRepository};
 pub use repository::{IAsyncImageJobRepository, SqliteAsyncImageJobRepository};
 
 // Re-export sqlx pool type for downstream crates

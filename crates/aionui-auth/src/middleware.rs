@@ -58,6 +58,10 @@ pub struct CurrentUser {
 #[derive(Clone, Copy)]
 pub struct AuthenticatedUserSession;
 
+/// Inserted for desktop-local requests outside the runtime helper channel.
+#[derive(Clone, Copy)]
+pub struct LocalUserSession;
+
 impl CurrentUser {
     pub fn local_default() -> Self {
         Self {
@@ -99,7 +103,7 @@ pub async fn auth_middleware(
 ) -> Result<Response, ApiError> {
     // In local mode, skip JWT verification and inject a fixed default user.
     if state.identity_mode == AuthIdentityMode::Local {
-        request.extensions_mut().insert(CurrentUser::local_default());
+        insert_local_user(&mut request);
         return Ok(next.run(request).await);
     }
 
@@ -218,8 +222,15 @@ async fn runtime_token_channel(state: &AuthState, mut request: Request, next: Ne
 /// Injects a fixed `CurrentUser` with id and username `system_default_user`.
 /// Used when the server runs as an embedded subprocess inside Electron.
 pub async fn local_auth_middleware(mut request: Request, next: Next) -> Response {
-    request.extensions_mut().insert(CurrentUser::local_default());
+    insert_local_user(&mut request);
     next.run(request).await
+}
+
+fn insert_local_user(request: &mut Request) {
+    if !request.headers().contains_key(RUNTIME_TOKEN_HEADER) {
+        request.extensions_mut().insert(LocalUserSession);
+    }
+    request.extensions_mut().insert(CurrentUser::local_default());
 }
 
 #[cfg(test)]
@@ -253,5 +264,39 @@ mod tests {
             std::str::from_utf8(&body).unwrap(),
             "system_default_user:system_default_user"
         );
+    }
+
+    #[tokio::test]
+    async fn local_runtime_helpers_do_not_receive_the_interactive_session_marker() {
+        let app = Router::new()
+            .route(
+                "/test",
+                get(|request: Request<Body>| async move {
+                    if request.extensions().get::<LocalUserSession>().is_some() {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::FORBIDDEN
+                    }
+                }),
+            )
+            .route_layer(axum::middleware::from_fn(local_auth_middleware));
+
+        let local = app
+            .clone()
+            .oneshot(Request::get("/test").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(local.status(), StatusCode::OK);
+
+        let helper = app
+            .oneshot(
+                Request::get("/test")
+                    .header(RUNTIME_TOKEN_HEADER, "test-helper")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(helper.status(), StatusCode::FORBIDDEN);
     }
 }

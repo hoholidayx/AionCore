@@ -315,12 +315,14 @@ async fn fixture() -> Fixture {
         .await
         .expect("seed provider");
     let builtin = Arc::new(BuiltinAssistantRegistry::load_from_dir(builtin_assets_dir.clone()));
+    let runtime_config_repo = Arc::new(aionui_db::SqliteAssistantRuntimeConfigRepository::new(pool.clone()));
     let service = Arc::new(AssistantService::new(
         pool,
         aionui_assistant::service::AssistantServiceDeps {
             definition_repo,
             state_repo,
             preference_repo,
+            runtime_config_repo,
             repo,
             override_repo,
             provider_repo,

@@ -12,6 +12,9 @@ use aionui_ai_agent::{
     RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
 };
 
+use crate::assistant_runtime_provenance::{
+    ASSISTANT_RUNTIME_PROVENANCE_KEY, AssistantRuntimeProvenance, is_ordinary_assistant_extra,
+};
 use crate::image_jobs::{image_backend_allowed, image_backend_ids_for_assistant};
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
 use crate::runtime_completion::RuntimeCompletionPublisher;
@@ -42,8 +45,8 @@ use aionui_db::models::{
 use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, IProviderRepository,
-    MessagePageCursor, MessagePageDirection, MessagePageParams, SaveRuntimeStateParams,
+    IAssistantPreferenceRepository, IAssistantRuntimeConfigRepository, IConversationRepository, IMcpServerRepository,
+    IProviderRepository, MessagePageCursor, MessagePageDirection, MessagePageParams, SaveRuntimeStateParams,
     UpsertConversationAssistantSnapshotParams, resolve_agent_binding_from_rows,
 };
 use aionui_extension::AssistantRuleDispatcher;
@@ -68,6 +71,9 @@ use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
 use crate::tool_image::{ToolImage, read_tool_image_file};
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
 use std::sync::RwLock;
+
+#[path = "assistant_runtime.rs"]
+mod assistant_runtime;
 
 pub(crate) const MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN: usize = 4;
 const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
@@ -183,11 +189,33 @@ struct AssistantEffectiveDefaultModes<'a> {
     thought_level: &'a str,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct AssistantRuntimePreferenceUpdate<'a> {
-    pub(crate) model: Option<&'a str>,
-    pub(crate) permission: Option<&'a str>,
-    pub(crate) thought_level: Option<&'a str>,
+pub(crate) use aionui_db::AssistantRuntimePreferenceSnapshotUpdate as AssistantRuntimePreferenceUpdate;
+
+fn apply_published_create_defaults(
+    snapshot: &mut AssistantSnapshot,
+    overrides: &AssistantConversationOverrides,
+    config: &aionui_db::AssistantRuntimeConfig,
+    locale: Option<&str>,
+) {
+    // New conversations in auto mode still start from the latest last-used
+    // selection. Fixed values and rules come from the last complete save.
+    if snapshot.default_modes.skills != "auto" || config.skills_mode != "auto" {
+        if overrides.skill_ids.is_none() {
+            snapshot.resolved_defaults.skill_ids.clone_from(&config.skill_ids);
+        }
+        if overrides.disabled_builtin_skill_ids.is_none() {
+            snapshot
+                .resolved_defaults
+                .disabled_builtin_skill_ids
+                .clone_from(&config.disabled_builtin_skill_ids);
+        }
+    }
+    if (snapshot.default_modes.mcps != "auto" || config.mcps_mode != "auto") && overrides.mcp_ids.is_none() {
+        snapshot.resolved_defaults.mcp_ids.clone_from(&config.mcp_ids);
+    }
+    snapshot.default_modes.skills.clone_from(&config.skills_mode);
+    snapshot.default_modes.mcps.clone_from(&config.mcps_mode);
+    snapshot.rules.content = config.resolve_rule(locale).to_owned();
 }
 
 fn assistant_snapshot_modes<'a>(
@@ -333,6 +361,7 @@ pub struct ConversationService {
     assistant_definition_repo: Arc<RwLock<Option<Arc<dyn IAssistantDefinitionRepository>>>>,
     assistant_state_repo: Arc<RwLock<Option<Arc<dyn IAssistantOverlayRepository>>>>,
     assistant_preference_repo: Arc<RwLock<Option<Arc<dyn IAssistantPreferenceRepository>>>>,
+    assistant_runtime_config_repo: Option<Arc<dyn IAssistantRuntimeConfigRepository>>,
     /// Only the agent-facing `conversation create` path reads this, to match an
     /// aionrs assistant's default model to one of the user's providers.
     provider_repo: Arc<RwLock<Option<Arc<dyn IProviderRepository>>>>,
@@ -359,6 +388,13 @@ pub struct ConversationService {
     conversation_repo: Arc<dyn IConversationRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     acp_session_repo: Arc<dyn IAcpSessionRepository>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConversationSendOrigin {
+    Background,
+    AuthenticatedUser,
+    DesktopLocal,
 }
 
 #[derive(Clone)]
@@ -422,6 +458,7 @@ impl ConversationService {
             assistant_definition_repo: Arc::new(RwLock::new(None)),
             assistant_state_repo: Arc::new(RwLock::new(None)),
             assistant_preference_repo: Arc::new(RwLock::new(None)),
+            assistant_runtime_config_repo: None,
             provider_repo: Arc::new(RwLock::new(None)),
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
@@ -453,6 +490,15 @@ impl ConversationService {
     pub fn with_runtime_token_service(mut self, runtime_token_service: Arc<RuntimeTokenService>) -> Self {
         self.runtime_token_service = Some(runtime_token_service);
         self
+    }
+
+    pub fn with_assistant_runtime_config_repo(mut self, repo: Arc<dyn IAssistantRuntimeConfigRepository>) -> Self {
+        self.assistant_runtime_config_repo = Some(repo);
+        self
+    }
+
+    pub(crate) fn assistant_runtime_config_repository(&self) -> Option<&Arc<dyn IAssistantRuntimeConfigRepository>> {
+        self.assistant_runtime_config_repo.as_ref()
     }
 
     pub fn with_mem0_config(mut self, config: Arc<Mem0Config>, repos: Mem0Repositories) -> Self {
@@ -1065,6 +1111,9 @@ impl ConversationService {
         // value would let anyone fork an arbitrary `parent_session_id` they do
         // not own — strip it unconditionally on the create path.
         strip_request_fork_spec(&mut extra);
+        if let Some(obj) = extra.as_object_mut() {
+            obj.remove(ASSISTANT_RUNTIME_PROVENANCE_KEY);
+        }
 
         let assistant_id = req
             .assistant
@@ -1077,13 +1126,41 @@ impl ConversationService {
                     .and_then(|value| value.as_str().map(ToOwned::to_owned))
             });
         let assistant_locale = req.assistant.as_ref().and_then(|assistant| assistant.locale.clone());
-        let assistant_overrides = req
+        let can_follow_assistant = matches!(source, ConversationSource::Aionui)
+            && req.channel_chat_id.is_none()
+            && req.r#type.is_none_or(|agent_type| agent_type == AgentType::Aionrs)
+            && is_ordinary_assistant_extra(&extra);
+        let runtime_overrides = if can_follow_assistant {
+            req.assistant
+                .as_ref()
+                .and_then(|assistant| assistant.runtime_overrides.clone())
+        } else {
+            None
+        };
+        let mut assistant_overrides = req
             .assistant
             .clone()
             .and_then(|assistant| assistant.conversation_overrides)
             .map(AssistantConversationOverrides::from)
             .unwrap_or_default();
-        let assistant_snapshot = match assistant_id.as_deref() {
+        if let Some(overrides) = &runtime_overrides {
+            assistant_overrides.skill_ids = overrides.skill_ids.clone().or(assistant_overrides.skill_ids);
+            assistant_overrides.disabled_builtin_skill_ids = overrides
+                .disabled_builtin_skill_ids
+                .clone()
+                .or(assistant_overrides.disabled_builtin_skill_ids);
+            assistant_overrides.mcp_ids = overrides.mcp_ids.clone().or(assistant_overrides.mcp_ids);
+        }
+        // Capture the published revisions before resolving the usual create-time
+        // values. A save racing creation can then be picked up on the first turn.
+        let runtime_config = if can_follow_assistant
+            && let (Some(repo), Some(id)) = (self.assistant_runtime_config_repository(), assistant_id.as_deref())
+        {
+            repo.get_for_user(user_id, id).await
+        } else {
+            Ok(None)
+        };
+        let mut assistant_snapshot = match assistant_id.as_deref() {
             Some(id) => {
                 self.resolve_assistant_snapshot(user_id, id, assistant_locale.as_deref(), &assistant_overrides, &extra)
                     .await?
@@ -1092,6 +1169,30 @@ impl ConversationService {
         };
         let explicit_type = req.r#type;
         let effective_type = resolve_create_agent_type(explicit_type, assistant_snapshot.as_ref())?;
+        let follows_assistant =
+            can_follow_assistant && effective_type == AgentType::Aionrs && assistant_snapshot.is_some();
+        if follows_assistant && let (Some(snapshot), Some(obj)) = (assistant_snapshot.as_mut(), extra.as_object_mut()) {
+            let mut provenance = AssistantRuntimeProvenance {
+                locale: assistant_locale,
+                overrides: runtime_overrides.clone().unwrap_or_default(),
+                ..Default::default()
+            };
+            if let Some(config) = runtime_config? {
+                apply_published_create_defaults(snapshot, &assistant_overrides, &config, provenance.locale.as_deref());
+                // The published rule is authoritative, including an explicit empty rule.
+                obj.remove("preset_rules");
+                obj.remove("preset_context");
+                provenance.skills_revision = config.skills_revision;
+                provenance.mcps_revision = config.mcps_revision;
+                provenance.rules_revision = config.rules_revision;
+            }
+            obj.insert(
+                ASSISTANT_RUNTIME_PROVENANCE_KEY.to_owned(),
+                serde_json::to_value(provenance).map_err(|e| {
+                    ConversationError::internal(format!("Failed to serialize assistant runtime provenance: {e}"))
+                })?,
+            );
+        }
 
         if !effective_type.supports_new_conversation() {
             info!(
@@ -1353,6 +1454,8 @@ impl ConversationService {
         }
 
         let is_team_conversation = extra.get("teamId").is_some();
+        let has_legacy_mcp_selection =
+            extra.get("selected_mcp_server_ids").is_some() || extra.get("selected_session_mcp_servers").is_some();
         let selected_mcp_server_ids = match extra.as_object_mut() {
             Some(obj) => {
                 if obj.contains_key("selected_mcp_server_ids") {
@@ -1395,8 +1498,17 @@ impl ConversationService {
             Vec::new()
         };
 
-        let mcp_snapshot = self
-            .build_runtime_mcp_snapshot(
+        let runtime_mcp_override = runtime_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.mcp_ids.as_deref());
+        let resolve_assistant_mcp_ids =
+            follows_assistant && (runtime_mcp_override.is_some() || !has_legacy_mcp_selection);
+        let mcp_snapshot = if resolve_assistant_mcp_ids && let Some(snapshot) = &assistant_snapshot {
+            let ids = &snapshot.resolved_defaults.mcp_ids;
+            self.build_selected_assistant_mcp_snapshot(user_id, ids, &effective_type, &extra)
+                .await?
+        } else {
+            self.build_runtime_mcp_snapshot(
                 user_id,
                 selected_mcp_server_ids.as_deref(),
                 selected_session_mcp_servers.as_deref().unwrap_or(&[]),
@@ -1404,7 +1516,8 @@ impl ConversationService {
                 &effective_type,
                 &extra,
             )
-            .await?;
+            .await?
+        };
 
         if let Some(obj) = extra.as_object_mut() {
             obj.insert(
@@ -1435,7 +1548,7 @@ impl ConversationService {
                     ConversationError::internal(format!("Failed to serialize MCP status snapshot: {e}"))
                 })?,
             );
-            if selected_session_mcp_servers.is_some() {
+            if selected_session_mcp_servers.is_some() || resolve_assistant_mcp_ids {
                 obj.insert(
                     "session_mcp_servers".to_owned(),
                     serde_json::to_value(&mcp_snapshot.session_mcp_servers).map_err(|e| {
@@ -1961,48 +2074,10 @@ impl ConversationService {
         conversation_id: &str,
         updates: AssistantRuntimePreferenceUpdate<'_>,
     ) -> Result<(), ConversationError> {
-        let Some(snapshot) = self
-            .conversation_repo
-            .get_assistant_snapshot(user_id, conversation_id)
-            .await
-            .map_err(|e| {
-                ConversationError::internal(format!(
-                    "Failed to load persisted assistant snapshot for runtime sync: {e}"
-                ))
-            })?
-        else {
-            return Ok(());
-        };
-
         self.conversation_repo
-            .upsert_assistant_snapshot(
-                user_id,
-                &UpsertConversationAssistantSnapshotParams {
-                    conversation_id: &snapshot.conversation_id,
-                    assistant_definition_id: &snapshot.assistant_definition_id,
-                    assistant_id: &snapshot.assistant_id,
-                    assistant_source: &snapshot.assistant_source,
-                    agent_id: &snapshot.agent_id,
-                    rules_content: &snapshot.rules_content,
-                    default_model_mode: &snapshot.default_model_mode,
-                    resolved_model_id: updates.model.or(snapshot.resolved_model_id.as_deref()),
-                    default_permission_mode: &snapshot.default_permission_mode,
-                    resolved_permission_value: updates.permission.or(snapshot.resolved_permission_value.as_deref()),
-                    default_thought_level_mode: &snapshot.default_thought_level_mode,
-                    resolved_thought_level_value: updates
-                        .thought_level
-                        .or(snapshot.resolved_thought_level_value.as_deref()),
-                    default_skills_mode: &snapshot.default_skills_mode,
-                    resolved_skill_ids: &snapshot.resolved_skill_ids,
-                    resolved_disabled_builtin_skill_ids: &snapshot.resolved_disabled_builtin_skill_ids,
-                    default_mcps_mode: &snapshot.default_mcps_mode,
-                    resolved_mcp_ids: &snapshot.resolved_mcp_ids,
-                },
-            )
+            .update_assistant_runtime_preferences(user_id, conversation_id, updates)
             .await
-            .map_err(|e| ConversationError::internal(format!("assistant snapshot upsert failed: {e}")))?;
-
-        Ok(())
+            .map_err(|e| ConversationError::internal(format!("assistant snapshot preference update failed: {e}")))
     }
 
     pub(crate) async fn persist_runtime_assistant_preferences(
@@ -2170,7 +2245,8 @@ impl ConversationService {
 
         let mut extra: serde_json::Value = serde_json::from_str(&row.extra)
             .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
-        self.backfill_extra_inplace(user_id, &row.id, &mut extra).await;
+        self.backfill_extra_inplace(user_id, &row.id, &row.extra, &mut extra)
+            .await;
         // Project-bind side branch: lazily backfill owner binding on read. The
         // `row` snapshot predates the backfill, so this response still carries
         // the old (null) project_id; on a real None→Some backfill we broadcast
@@ -2252,7 +2328,8 @@ impl ConversationService {
                     continue;
                 }
             };
-            self.backfill_extra_inplace(user_id, &row_id, &mut extra).await;
+            self.backfill_extra_inplace(user_id, &row_id, &row.extra, &mut extra)
+                .await;
             match row_to_response_with_extra(row, extra, &self.workspace_root) {
                 Ok(mut resp) => {
                     self.attach_assistant_identity(user_id, &mut resp).await?;
@@ -2294,9 +2371,8 @@ impl ConversationService {
 
         let existing_type: AgentType = string_to_enum(&existing.r#type)?;
 
-        // Snapshot invariant: once written at create time, `extra.skills`
-        // must not be re-shaped by PATCH. The frontend must clone the
-        // conversation to produce a new snapshot.
+        // Skill and MCP projections, and the provenance that authorizes their
+        // next-turn refresh, are controlled by the server.
         if let Some(incoming) = &req.extra
             && (incoming.get("skills").is_some()
                 || incoming.get("mcp_server_ids").is_some()
@@ -2306,6 +2382,15 @@ impl ConversationService {
         {
             return Err(ConversationError::BadRequest {
                 reason: "extra.skills and MCP snapshots are immutable post-creation".into(),
+            });
+        }
+        if req
+            .extra
+            .as_ref()
+            .is_some_and(|incoming| incoming.get(ASSISTANT_RUNTIME_PROVENANCE_KEY).is_some())
+        {
+            return Err(ConversationError::BadRequest {
+                reason: "Assistant runtime provenance cannot be patched directly".into(),
             });
         }
 
@@ -2421,6 +2506,7 @@ impl ConversationService {
             pinned: req.pinned,
             pinned_at,
             model: model_json,
+            expected_extra: merged_extra.as_ref().map(|_| existing.extra),
             extra: merged_extra,
             status: None,
             updated_at: Some(now),
@@ -2548,6 +2634,7 @@ impl ConversationService {
         }
 
         let updates = ConversationRowUpdate {
+            expected_extra: Some(existing.extra),
             extra: Some(
                 serde_json::to_string(&merged)
                     .map_err(|e| ConversationError::internal(format!("Failed to serialize merged extra: {e}")))?,
@@ -3925,8 +4012,14 @@ impl ConversationService {
         req: SendMessageRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<SendMessageResponse, ConversationError> {
-        self.send_message_for_session(user_id, conversation_id, req, task_manager, false)
-            .await
+        self.send_message_for_session(
+            user_id,
+            conversation_id,
+            req,
+            task_manager,
+            ConversationSendOrigin::Background,
+        )
+        .await
     }
 
     /// Only the authenticated end-user route grants host-private conversation tools.
@@ -3936,7 +4029,7 @@ impl ConversationService {
         conversation_id: &str,
         req: SendMessageRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
-        end_user_session: bool,
+        origin: ConversationSendOrigin,
     ) -> Result<SendMessageResponse, ConversationError> {
         if req.content.trim().is_empty() {
             return Err(ConversationError::BadRequest {
@@ -4096,6 +4189,22 @@ impl ConversationService {
                 .await;
             return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
         }
+        // Capture the effective assistant configuration under the turn claim.
+        // Reject a conflicting snapshot write before accepting the user message.
+        let row = if origin != ConversationSendOrigin::Background && !req.hidden {
+            match self.refresh_published_assistant_runtime(row).await {
+                Ok(row) => row,
+                Err(error) => {
+                    let mut turn_claim = turn_claim;
+                    let was_deleting = turn_claim.release();
+                    self.complete_released_turn(user_id, conversation_id, &turn_id, was_deleting)
+                        .await;
+                    return Err(error);
+                }
+            }
+        } else {
+            row
+        };
         // The TurnEnded fallback already persisted + broadcast this message
         // (with the statusChanged flip) — doing it again would duplicate the
         // row and the live-view bubble.
@@ -4122,11 +4231,8 @@ impl ConversationService {
             ));
         }
 
-        // Build task options from conversation row
-        let mut build_opts = match self
-            .build_task_options_for_session(&row, None, end_user_session && !req.hidden)
-            .await
-        {
+        let web_user_turn = origin == ConversationSendOrigin::AuthenticatedUser && !req.hidden;
+        let mut build_opts = match self.build_task_options_for_session(&row, None, web_user_turn).await {
             Ok(opts) => opts,
             Err(err) => {
                 error!(
@@ -4152,7 +4258,7 @@ impl ConversationService {
             }
         };
         self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
-        self.ensure_session_skill_view(&build_opts.context).await;
+        self.ensure_session_skill_view(&build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
 
         let user_msg_id_ret = user_msg_id.clone();
@@ -4274,7 +4380,7 @@ impl ConversationService {
         };
 
         self.apply_conversation_runtime_context(&mut build_opts, &request.user_id, &request.conversation_id);
-        self.ensure_session_skill_view(&build_opts.context).await;
+        self.ensure_session_skill_view(&build_opts).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let conversation_id = request.conversation_id.clone();
         let result = ConversationTurnOrchestrator::new(self.clone(), self.task_manager.clone())
@@ -4768,10 +4874,21 @@ impl ConversationService {
 
         let mut build_opts = self.build_task_options(&row).await?;
         self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
-        self.ensure_session_skill_view(&build_opts.context).await;
+        // A warmup can hold an older row while a user turn applies new Skill
+        // access. Only the turn may change the view for a following runtime.
+        if build_opts
+            .runtime_capabilities
+            .assistant_configuration_fingerprint
+            .is_none()
+        {
+            self.ensure_session_skill_view(&build_opts).await;
+        }
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let backend = build_options_backend(&build_opts).map(str::to_owned);
-        let agent = match task_manager.get_or_build_task(conversation_id, build_opts).await {
+        let agent = match task_manager
+            .get_or_build_task(conversation_id, build_opts.only_create_if_missing())
+            .await
+        {
             Ok(agent) => agent,
             Err(err) => {
                 let send_error = AgentSendError::from_agent_error_ref_for_backend(&err, backend.as_deref());
@@ -4916,6 +5033,10 @@ impl ConversationService {
             options.runtime_capabilities.async_image_enabled =
                 Some(self.resolve_async_image_enabled(row, snapshot.as_ref()).await?);
         }
+        if snapshot.is_some() && self.assistant_runtime_config_repo.is_some() {
+            options.runtime_capabilities.assistant_configuration_fingerprint =
+                Self::assistant_runtime_fingerprint(row, &options.context)?;
+        }
         if end_user_session
             && let (Some((config, repos)), Some(snapshot)) = (self.mem0_runtime.as_ref(), snapshot.as_ref())
         {
@@ -5006,16 +5127,26 @@ impl ConversationService {
     /// AionUi's data dir, so unlike the workspace wiring this needs no
     /// auto-workspace-path guard and runs for every agent regardless of the
     /// vendor's declared delivery mode.
-    pub(crate) async fn ensure_session_skill_view(&self, context: &AgentSessionContext) {
+    async fn ensure_session_skill_view(&self, options: &BuildTaskOptions) {
+        let context = &options.context;
         let skill_names = context_skill_names(context);
-        if skill_names.is_empty() {
-            return;
-        }
-        let resolved = self
-            .skill_resolver
-            .resolve_skills_for_user(&context.conversation.user_id, &skill_names)
-            .await;
+        let resolved = if skill_names.is_empty() {
+            Vec::new()
+        } else {
+            self.skill_resolver
+                .resolve_skills_for_user(&context.conversation.user_id, &skill_names)
+                .await
+        };
         if resolved.is_empty() {
+            if options
+                .runtime_capabilities
+                .assistant_configuration_fingerprint
+                .is_some()
+            {
+                self.skill_resolver
+                    .remove_skill_view(&context.conversation.user_id, context.conversation_id())
+                    .await;
+            }
             return;
         }
         self.skill_resolver
@@ -5060,6 +5191,7 @@ impl ConversationService {
             .map_err(|e| ConversationError::internal(format!("Failed to serialize extra: {e}")))?;
 
         let update = ConversationRowUpdate {
+            expected_extra: Some(row.extra),
             extra: Some(extra_json),
             updated_at: Some(now_ms()),
             ..Default::default()
@@ -5100,7 +5232,13 @@ impl ConversationService {
     /// Persists the mutation asynchronously; failures are logged and
     /// swallowed so a read path never 500s because of a backfill write
     /// failure.
-    async fn backfill_extra_inplace(&self, user_id: &str, conversation_id: &str, extra: &mut serde_json::Value) {
+    async fn backfill_extra_inplace(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        expected_extra: &str,
+        extra: &mut serde_json::Value,
+    ) {
         let auto_inject = self.skill_resolver.auto_inject_names().await;
         let mut mutated = backfill_skills_if_missing(extra, &auto_inject);
         mutated |= backfill_cron_job_id_alias(extra);
@@ -5119,6 +5257,7 @@ impl ConversationService {
             }
         };
         let update = ConversationRowUpdate {
+            expected_extra: Some(expected_extra.to_owned()),
             extra: Some(serialized),
             ..Default::default()
         };
@@ -5550,6 +5689,16 @@ impl ConversationService {
             preference.as_ref().map(|row| row.last_mcp_ids.as_str()),
         )?;
 
+        self.resolve_selected_assistant_mcp(user_id, &selected_ids)
+            .await
+            .map(Some)
+    }
+
+    async fn resolve_selected_assistant_mcp(
+        &self,
+        user_id: &str,
+        selected_ids: &[String],
+    ) -> Result<TeamMcpSelection, ConversationError> {
         let repo = {
             let guard = self
                 .mcp_server_repo
@@ -5561,7 +5710,7 @@ impl ConversationService {
                 .ok_or_else(|| ConversationError::internal("MCP server repository is unavailable"))?
         };
         let rows = repo
-            .list_by_ids_any(user_id, &selected_ids)
+            .list_by_ids_any(user_id, selected_ids)
             .await
             .map_err(|e| ConversationError::internal(format!("Failed to load selected MCP servers: {e}")))?;
         let mut rows_by_id = rows
@@ -5571,7 +5720,7 @@ impl ConversationService {
         let mut mcp_server_ids = Vec::new();
         let mut session_mcp_servers = Vec::new();
         let mut mcp_statuses = Vec::new();
-        for id in &selected_ids {
+        for id in selected_ids {
             let Some(row) = rows_by_id.remove(id) else {
                 continue;
             };
@@ -5592,12 +5741,34 @@ impl ConversationService {
                 mcp_server_ids.push(row.id);
             }
         }
-        Ok(Some(TeamMcpSelection {
-            selected_ids,
+        Ok(TeamMcpSelection {
+            selected_ids: selected_ids.to_vec(),
             mcp_server_ids,
             session_mcp_servers,
             mcp_statuses,
-        }))
+        })
+    }
+
+    pub(crate) async fn build_selected_assistant_mcp_snapshot(
+        &self,
+        user_id: &str,
+        selected_ids: &[String],
+        agent_type: &AgentType,
+        extra: &serde_json::Value,
+    ) -> Result<McpRuntimeSnapshot, ConversationError> {
+        if selected_ids.is_empty() {
+            return Ok(McpRuntimeSnapshot::default());
+        }
+        let selection = self.resolve_selected_assistant_mcp(user_id, selected_ids).await?;
+        self.build_runtime_mcp_snapshot(
+            user_id,
+            Some(&selection.mcp_server_ids),
+            &selection.session_mcp_servers,
+            &selection.mcp_statuses,
+            agent_type,
+            extra,
+        )
+        .await
     }
 
     /// Resolve and classify one assistant's current MCP binding for an existing
@@ -5889,6 +6060,7 @@ pub(crate) async fn persist_session_key(
     };
 
     let update = ConversationRowUpdate {
+        expected_extra: Some(row.extra),
         extra: Some(extra_json),
         updated_at: Some(now_ms()),
         ..Default::default()

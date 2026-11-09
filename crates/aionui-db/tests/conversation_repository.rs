@@ -1,9 +1,11 @@
 use aionui_db::{
-    ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, Database, DbError, IAcpSessionRepository,
-    IConversationRepository, MessagePageCursor, MessagePageDirection, MessagePageParams, MessageRowUpdate,
-    SqliteAcpSessionRepository, SqliteConversationRepository, init_database_memory, models::ConversationRow,
-    models::MessageRow,
+    ApplyAssistantRuntimeConfigParams, AssistantRuntimeMcpSnapshotUpdate, AssistantRuntimePreferenceSnapshotUpdate,
+    AssistantRuntimeSkillSnapshotUpdate, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, Database,
+    DbError, IAcpSessionRepository, IConversationRepository, MessagePageCursor, MessagePageDirection,
+    MessagePageParams, MessageRowUpdate, SqliteAcpSessionRepository, SqliteConversationRepository,
+    UpsertConversationAssistantSnapshotParams, init_database_memory, models::ConversationRow, models::MessageRow,
 };
+use serde_json::{Value, json};
 
 const USER_ID: &str = "system_default_user";
 
@@ -101,6 +103,152 @@ async fn acp_binding_count(db: &Database, id: &str) -> i64 {
         .fetch_one(db.pool())
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn assistant_runtime_update_preserves_unrelated_conversation_and_snapshot_fields() {
+    let (repo, db) = setup().await;
+    create_user_2(&db).await;
+    let mut conversation = make_conversation("assistant-runtime");
+    conversation.r#type = "aionrs".into();
+    conversation.extra = json!({"workspace":"/home/user/project", "preset_rules":"old", "skills":["old"]}).to_string();
+    repo.create(&conversation).await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO assistant_definitions (id, assistant_id, source, owner_type, user_id, name, agent_id, \
+            rule_resource_type, default_model_mode, default_permission_mode, default_skills_mode, \
+            default_mcps_mode, created_at, updated_at) \
+         VALUES ('definition', 'assistant', 'user', 'user', ?, 'Assistant', 'aionrs', \
+            'none', 'auto', 'auto', 'auto', 'auto', 1, 1)",
+    )
+    .bind(USER_ID)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    repo.upsert_assistant_snapshot(
+        USER_ID,
+        &UpsertConversationAssistantSnapshotParams {
+            conversation_id: &conversation.id,
+            assistant_definition_id: "definition",
+            assistant_id: "assistant",
+            assistant_source: "user",
+            agent_id: "aionrs",
+            rules_content: "old",
+            default_model_mode: "auto",
+            resolved_model_id: Some("model"),
+            default_permission_mode: "auto",
+            resolved_permission_value: Some("default"),
+            default_thought_level_mode: "auto",
+            resolved_thought_level_value: Some("medium"),
+            default_skills_mode: "auto",
+            resolved_skill_ids: r#"["old"]"#,
+            resolved_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            resolved_mcp_ids: r#"["old"]"#,
+        },
+    )
+    .await
+    .unwrap();
+    let patch = json!({"skills":["new"], "preset_rules":null, "mcp_server_ids":[]});
+    let updates = ApplyAssistantRuntimeConfigParams {
+        extra_patch: &patch,
+        expected_extra: &conversation.extra,
+        skills: Some(AssistantRuntimeSkillSnapshotUpdate {
+            mode: "fixed",
+            ids_json: r#"["new"]"#,
+            disabled_ids_json: r#"["builtin"]"#,
+        }),
+        mcps: Some(AssistantRuntimeMcpSnapshotUpdate {
+            mode: "fixed",
+            ids_json: "[]",
+        }),
+        rules_content: Some(""),
+    };
+    assert!(matches!(
+        repo.apply_assistant_runtime_config("user_2", &conversation.id, &updates)
+            .await,
+        Err(DbError::NotFound(_))
+    ));
+    assert_eq!(
+        repo.get(USER_ID, &conversation.id).await.unwrap().unwrap().extra,
+        conversation.extra
+    );
+    let updated = repo
+        .apply_assistant_runtime_config(USER_ID, &conversation.id, &updates)
+        .await
+        .unwrap();
+    let extra: Value = serde_json::from_str(&updated.extra).unwrap();
+    assert_eq!(
+        extra,
+        json!({"workspace":"/home/user/project", "skills":["new"], "mcp_server_ids":[]})
+    );
+    assert_eq!(updated.updated_at, conversation.updated_at);
+    let stale_replacement = ConversationRowUpdate {
+        extra: Some(r#"{"workspace":"/new/path","preset_rules":"old","skills":["old"]}"#.into()),
+        expected_extra: Some(conversation.extra.clone()),
+        ..Default::default()
+    };
+    assert!(matches!(
+        repo.update(USER_ID, &conversation.id, &stale_replacement).await,
+        Err(DbError::Conflict(message)) if message == "Conversation metadata changed concurrently"
+    ));
+    assert!(matches!(
+        repo.apply_assistant_runtime_config(USER_ID, &conversation.id, &updates).await,
+        Err(DbError::Conflict(message)) if message == "Conversation metadata changed concurrently"
+    ));
+    assert_eq!(
+        repo.get(USER_ID, &conversation.id).await.unwrap().unwrap().extra,
+        updated.extra
+    );
+    repo.update_assistant_runtime_preferences(
+        USER_ID,
+        &conversation.id,
+        AssistantRuntimePreferenceSnapshotUpdate {
+            permission: Some("plan"),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let snapshot = repo
+        .get_assistant_snapshot(USER_ID, &conversation.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.assistant_definition_id, "definition");
+    assert_eq!(snapshot.resolved_model_id.as_deref(), Some("model"));
+    assert_eq!(snapshot.resolved_permission_value.as_deref(), Some("plan"));
+    assert_eq!(snapshot.rules_content, "");
+    assert_eq!(snapshot.resolved_skill_ids, r#"["new"]"#);
+    assert_eq!(snapshot.resolved_disabled_builtin_skill_ids, r#"["builtin"]"#);
+    assert_eq!(snapshot.resolved_mcp_ids, "[]");
+}
+
+#[tokio::test]
+async fn missing_assistant_snapshot_rolls_back_runtime_extra_patch() {
+    let (repo, _) = setup().await;
+    let conversation = make_conversation("missing-assistant-snapshot");
+    repo.create(&conversation).await.unwrap();
+
+    let error = repo
+        .apply_assistant_runtime_config(
+            USER_ID,
+            &conversation.id,
+            &ApplyAssistantRuntimeConfigParams {
+                extra_patch: &json!({"skills":["new"]}),
+                expected_extra: &conversation.extra,
+                skills: None,
+                mcps: None,
+                rules_content: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, DbError::NotFound(message) if message.contains("Assistant snapshot")));
+    assert_eq!(
+        repo.get(USER_ID, &conversation.id).await.unwrap().unwrap().extra,
+        conversation.extra
+    );
 }
 
 #[tokio::test]

@@ -1,6 +1,7 @@
 mod acp_session;
 mod agent_metadata;
 mod assistant;
+mod assistant_runtime_config;
 mod async_image_job;
 mod channel;
 mod client_preference;
@@ -28,6 +29,7 @@ pub use assistant::{
     CreateAssistantParams, UpdateAssistantParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertOverrideParams,
 };
+pub use assistant_runtime_config::AssistantRuntimeConfig;
 pub use async_image_job::{
     AsyncImageAttachmentRow, AsyncImageJobKey, AsyncImageJobReceiptRow, AsyncImageJobState, ClaimedAsyncImageJob,
     NewAsyncImageJob,
