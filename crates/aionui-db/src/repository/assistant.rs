@@ -198,6 +198,17 @@ pub trait IAssistantOverlayRepository: Send + Sync {
         user_id: &str,
         params: &UpsertAssistantOverlayParams<'_>,
     ) -> Result<AssistantOverlayRow, DbError>;
+    async fn set_mem0_memory_enabled_for_user(
+        &self,
+        _user_id: &str,
+        _assistant_definition_id: &str,
+        _enabled: bool,
+        _initial_state: (i32, bool),
+    ) -> Result<(), DbError> {
+        Err(DbError::Init(
+            "Mem0 assistant settings are not supported by this repository".into(),
+        ))
+    }
     async fn delete(&self, assistant_definition_id: &str) -> Result<bool, DbError>;
     async fn delete_for_user(&self, user_id: &str, assistant_definition_id: &str) -> Result<bool, DbError>;
 }

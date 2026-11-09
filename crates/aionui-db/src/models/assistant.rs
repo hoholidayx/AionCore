@@ -38,7 +38,7 @@ pub struct AssistantOverrideRow {
 }
 
 /// Row mapping for the `assistant_definitions` table.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AssistantDefinitionRow {
     pub id: String,
     pub assistant_id: String,
@@ -80,6 +80,8 @@ pub struct AssistantDefinitionRow {
 pub struct AssistantOverlayRow {
     pub assistant_definition_id: String,
     pub enabled: bool,
+    #[serde(default)]
+    pub mem0_memory_enabled: bool,
     pub sort_order: i32,
     pub agent_id_override: Option<String>,
     pub last_used_at: Option<TimestampMs>,

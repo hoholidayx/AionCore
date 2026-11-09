@@ -14,7 +14,7 @@ use aionui_api_types::{
     ApiResponse, AssistantDetailResponse, AssistantResponse, CreateAssistantRequest, ImportAssistantsRequest,
     ImportAssistantsResult, SetAssistantStateRequest, UpdateAssistantRequest,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{AuthenticatedUserSession, CurrentUser};
 use aionui_common::ApiError;
 
 use crate::error::AssistantError;
@@ -86,10 +86,21 @@ async fn get_one(
 async fn update(
     State(state): State<AssistantRouterState>,
     Extension(current_user): Extension<CurrentUser>,
+    session: Option<Extension<AuthenticatedUserSession>>,
     Path(id): Path<String>,
     body: Result<Json<UpdateAssistantRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AssistantResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    if session.is_none()
+        && req
+            .defaults
+            .as_ref()
+            .is_some_and(|defaults| defaults.mem0_memory_enabled.is_some())
+    {
+        return Err(ApiError::Unauthorized(
+            "A signed-in user session is required to change Mem0 settings".into(),
+        ));
+    }
     let updated = state.service.update_for_user(&current_user.id, &id, req).await?;
     Ok(Json(ApiResponse::ok(updated)))
 }

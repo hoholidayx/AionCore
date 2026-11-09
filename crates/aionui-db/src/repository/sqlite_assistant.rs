@@ -918,6 +918,34 @@ impl IAssistantOverlayRepository for SqliteAssistantOverlayRepository {
             })
     }
 
+    async fn set_mem0_memory_enabled_for_user(
+        &self,
+        user_id: &str,
+        assistant_definition_id: &str,
+        enabled: bool,
+        (initial_sort_order, initial_enabled): (i32, bool),
+    ) -> Result<(), DbError> {
+        let now = now_ms();
+        sqlx::query(
+            "INSERT INTO assistant_overlays (
+                user_id, assistant_definition_id, enabled, sort_order, created_at, updated_at, mem0_memory_enabled
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_id, assistant_definition_id) DO UPDATE SET
+                mem0_memory_enabled = excluded.mem0_memory_enabled,
+                updated_at = excluded.updated_at",
+        )
+        .bind(user_id)
+        .bind(assistant_definition_id)
+        .bind(initial_enabled)
+        .bind(initial_sort_order)
+        .bind(now)
+        .bind(now)
+        .bind(enabled)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn delete(&self, assistant_definition_id: &str) -> Result<bool, DbError> {
         self.delete_for_user(DEFAULT_USER_ID, assistant_definition_id).await
     }

@@ -21,6 +21,11 @@ pub trait IConversationRepository: Send + Sync {
     /// Returns a conversation by user and ID, or `None` if not found.
     async fn get(&self, user_id: &str, id: &str) -> Result<Option<ConversationRow>, DbError>;
 
+    /// Returns an owner-scoped conversation only if it is unarchived.
+    async fn get_unarchived_for_user(&self, _user_id: &str, _id: &str) -> Result<Option<ConversationRow>, DbError> {
+        Ok(None)
+    }
+
     /// Returns the owner user ID for a conversation, or `None` if the conversation does not exist.
     async fn owner_user_id(&self, id: &str) -> Result<Option<String>, DbError>;
 

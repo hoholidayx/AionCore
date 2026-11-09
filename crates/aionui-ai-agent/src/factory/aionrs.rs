@@ -23,7 +23,9 @@ use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
 use crate::manager::aionrs::async_image_tool::AsyncImageTool;
+use crate::manager::aionrs::mem0::Mem0ToolContext;
 use crate::manager::aionrs::{AionrsAgentManager, sanitize_session_messages};
+use crate::mem0_config::Mem0Binding;
 use crate::runtime_status::conversation_runtime_reporter;
 use crate::session_context::AionrsSessionBuildContext;
 use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig};
@@ -53,6 +55,7 @@ pub(super) async fn build(
     model: ProviderWithModel,
     ctx: FactoryContext,
     async_image_enabled: bool,
+    mem0: Option<Mem0Binding>,
 ) -> Result<AgentInstance, AgentError> {
     let mut overrides = build_context.config;
     let resolved_skills = overrides.skills.clone();
@@ -268,13 +271,19 @@ pub(super) async fn build(
         }
     }
 
-    let agent = AionrsAgentManager::new_with_async_image(
+    let mem0 = mem0.map(|binding| Mem0ToolContext {
+        binding,
+        user_id: ctx.user_id.clone(),
+        broadcaster: deps.broadcaster.clone(),
+    });
+    let agent = AionrsAgentManager::new_with_host_tools(
         ctx.conversation_id,
         ctx.workspace,
         config,
         resume_session,
         async_image,
         image_exclusions,
+        mem0,
     )
     .await?
     .with_model_settings_source(

@@ -17,7 +17,8 @@ use aion_protocol::commands::{ApprovalScope, SessionMode};
 use aion_protocol::{ToolApprovalManager, ToolApprovalResult};
 use aionui_api_types::{
     AcpConfigOptionDto, AcpConfigSelectOptionDto, AgentModeResponse, ConfigOptionConfirmation,
-    GetConfigOptionsResponse, ModelSettings, SetConfigOptionResponse, SlashCommandItem,
+    GetConfigOptionsResponse, MEM0_DELETE_CONFIRMATION_PREFIX, ModelSettings, SetConfigOptionResponse,
+    SlashCommandItem,
 };
 use aionui_common::{
     AgentKillReason, AgentType, Confirmation, ConversationStatus, ErrorChain, TimestampMs, generate_short_id, now_ms,
@@ -42,6 +43,8 @@ use crate::types::{AionrsResolvedConfig, SendMessageData};
 use super::async_image_tool::AsyncImageTool;
 use super::content::build_content_blocks;
 use super::error::{aionrs_engine_error_to_send_error, aionrs_runtime_error_summary};
+use super::mem0::{self, Mem0ToolContext};
+use super::mem0_approval::Mem0DeleteApprovals;
 
 fn resolve_aionui_config(cli_args: &CliArgs) -> Result<Config, AgentError> {
     let mut config =
@@ -123,6 +126,7 @@ pub struct AionrsAgentManager {
     mcp_managers: Vec<Arc<McpManager>>,
     approval_manager: Arc<ToolApprovalManager>,
     confirmations: Arc<RwLock<Vec<Confirmation>>>,
+    mem0_approvals: Option<Arc<Mem0DeleteApprovals>>,
     final_input_dump: Option<AionrsFinalInputDumpContext>,
     /// Signalled by `cancel()` to abort an in-flight `engine.run()` via
     /// `tokio::select!` in `send_message()`.
@@ -161,24 +165,26 @@ impl AionrsAgentManager {
         config_extra: AionrsResolvedConfig,
         resume_session: Option<Session>,
     ) -> Result<Self, AgentError> {
-        Self::new_with_async_image(
+        Self::new_with_host_tools(
             conversation_id,
             workspace,
             config_extra,
             resume_session,
             None,
             HashMap::new(),
+            None,
         )
         .await
     }
 
-    pub(crate) async fn new_with_async_image(
+    pub(crate) async fn new_with_host_tools(
         conversation_id: String,
         workspace: String,
         config_extra: AionrsResolvedConfig,
         resume_session: Option<Session>,
         async_image: Option<AsyncImageTool>,
         image_exclusions: HashMap<String, HashSet<String>>,
+        mem0: Option<Mem0ToolContext>,
     ) -> Result<Self, AgentError> {
         let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128);
         let mut output = BackendOutputSink::new(runtime.event_sender());
@@ -267,6 +273,22 @@ impl AionrsAgentManager {
         if let Some(tool) = &async_image {
             bootstrap = bootstrap.host_tool(Box::new(tool.clone()));
         }
+        let confirmations = Arc::new(RwLock::new(Vec::new()));
+        let mem0_approvals = if let Some(context) = mem0 {
+            let approvals = Arc::new(Mem0DeleteApprovals::new(
+                confirmations.clone(),
+                runtime.event_sender(),
+                context.broadcaster,
+                context.user_id,
+                conversation_id.clone(),
+            ));
+            for tool in mem0::tools(context.binding, approvals.clone()) {
+                bootstrap = bootstrap.host_tool(tool);
+            }
+            Some(approvals)
+        } else {
+            None
+        };
         if let Some(has_instructions) = config_extra.custom_prompt_has_instructions {
             bootstrap = bootstrap.custom_prompt_has_instructions(has_instructions);
         }
@@ -306,7 +328,6 @@ impl AionrsAgentManager {
             );
         }
 
-        let confirmations = Arc::new(RwLock::new(Vec::new()));
         let protocol_sink = BackendProtocolSink::new(runtime.event_sender(), confirmations.clone());
         engine.set_approval_manager(approval_manager.clone());
         engine.set_protocol_writer(Arc::new(protocol_sink));
@@ -333,6 +354,7 @@ impl AionrsAgentManager {
             mcp_managers: result.mcp_managers,
             approval_manager,
             confirmations,
+            mem0_approvals,
             final_input_dump,
             cancel_notify: Arc::new(Notify::new()),
             turn_finished_notify: Arc::new(Notify::new()),
@@ -420,6 +442,9 @@ impl AionrsAgentManager {
     fn request_stop(&self, reason: Option<AgentKillReason>, operation: &'static str) -> bool {
         let was_running = self.runtime.status() == Some(ConversationStatus::Running);
 
+        if let Some(approvals) = &self.mem0_approvals {
+            approvals.cancel_all();
+        }
         if let Ok(mut confs) = self.confirmations.write() {
             confs.clear();
         }
@@ -647,6 +672,13 @@ impl AionrsAgentManager {
 /// matches in the routes + services.
 impl AionrsAgentManager {
     pub fn confirm(&self, _msg_id: &str, call_id: &str, data: Value, always_allow: bool) -> Result<(), AgentError> {
+        if call_id.starts_with(MEM0_DELETE_CONFIRMATION_PREFIX) {
+            return self
+                .mem0_approvals
+                .as_ref()
+                .ok_or_else(|| AgentError::conflict("Memory deletion confirmation is no longer pending"))?
+                .resolve(call_id, &data, always_allow);
+        }
         if let Ok(mut confs) = self.confirmations.write() {
             confs.retain(|c| c.call_id != call_id);
         }

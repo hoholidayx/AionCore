@@ -3361,6 +3361,7 @@ async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
         row: AssistantOverlayRow {
             assistant_definition_id: "def-team-lead".into(),
             enabled: true,
+            mem0_memory_enabled: false,
             sort_order: 0,
             agent_id_override: Some("codex".into()),
             last_used_at: None,
@@ -3449,6 +3450,7 @@ async fn tc_create_team_ignores_requested_backend_when_assistant_id_present() {
         row: AssistantOverlayRow {
             assistant_definition_id: "def-team-lead".into(),
             enabled: true,
+            mem0_memory_enabled: false,
             sort_order: 0,
             agent_id_override: Some("codex".into()),
             last_used_at: None,
@@ -4108,6 +4110,7 @@ async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
         row: AssistantOverlayRow {
             assistant_definition_id: "def-team-worker".into(),
             enabled: true,
+            mem0_memory_enabled: false,
             sort_order: 0,
             agent_id_override: Some("codex".into()),
             last_used_at: None,
@@ -4204,6 +4207,7 @@ async fn ta_add_agent_ignores_requested_backend_when_assistant_id_present() {
         row: AssistantOverlayRow {
             assistant_definition_id: "def-team-worker".into(),
             enabled: true,
+            mem0_memory_enabled: false,
             sort_order: 0,
             agent_id_override: Some("codex".into()),
             last_used_at: None,
@@ -6428,6 +6432,7 @@ async fn spawn_agent_in_session_succeeds_without_active_team_run() {
         row: AssistantOverlayRow {
             assistant_definition_id: "def-spawn-worker".into(),
             enabled: true,
+            mem0_memory_enabled: false,
             sort_order: 0,
             agent_id_override: Some("codex".into()),
             last_used_at: None,

@@ -1,6 +1,9 @@
 use aionui_common::Confirmation;
 use serde::{Deserialize, Serialize};
 
+/// A server-generated approval ID that must be resolved by an end-user session.
+pub const MEM0_DELETE_CONFIRMATION_PREFIX: &str = "mem0-delete-";
+
 // ── Request types ──────────────────────────────────────────────────
 
 /// Body for `POST /api/conversations/:id/confirmations/:callId/confirm`.

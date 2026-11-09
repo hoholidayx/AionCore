@@ -1173,6 +1173,7 @@ mod tests {
                 row: AssistantOverlayRow {
                     assistant_definition_id: "def-1".into(),
                     enabled: true,
+                    mem0_memory_enabled: false,
                     sort_order: 0,
                     agent_id_override: None,
                     last_used_at: None,

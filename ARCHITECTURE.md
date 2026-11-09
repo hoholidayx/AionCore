@@ -701,6 +701,39 @@ Before adding a new crate, confirm:
 
 ## Runtime Infrastructure
 
+### Assistant Long-Term Memory
+
+Authenticated WebUI conversations using AionRS can opt in to Mem0 in the assistant's MCP settings. The assistant overlay defaults to disabled. The host resolves the authenticated user and persisted assistant definition before granting the capability. Use separate NAS bearer profiles for distinct user and assistant pairs. Each profile should bind a distinct long-term namespace, without a session ID or bulk deletion permission.
+
+Create `mem0-mcp.json` in the effective AionCore data directory with mode `0600` on Unix. AionCore loads it at startup. Keep it outside agent workspaces. The file uses this format.
+
+```json
+{
+  "url": "http://127.0.0.1:8889/mcp",
+  "profiles": [
+    {
+      "user_id": "aion-user-id",
+      "assistant_definition_id": "assistant-definition-id",
+      "bearer": "replace-with-the-NAS-role-bearer"
+    }
+  ]
+}
+```
+
+Set the URL to the trusted MCP endpoint. AionCore uses direct Streamable HTTP with redirects disabled. It keeps the bearer out of the generic MCP registry, prompts, and agent runtime environment. Import the Memory Triage Skill separately and select it for each assistant through the existing Skills setting.
+
+Use the assistant ID returned by `GET /api/assistants` to find the persisted definition ID. For a local Web installation, open `~/.aionui-web/aionui-backend.db` with `sqlite3 -readonly` and substitute the values in these queries.
+
+```sql
+SELECT id FROM users WHERE username = '<Web login name>';
+SELECT id FROM assistant_definitions
+WHERE assistant_id = '<assistant ID>' AND deleted_at IS NULL
+  AND (user_id = '<Web user ID>' OR user_id IS NULL)
+ORDER BY user_id IS NULL ASC LIMIT 1;
+```
+
+An assistant can preview deletion candidates through search. Deleting an exact ID through the Aion memory tool requires a one-time confirmation from the authenticated Web user, independent of generic tool approval and filesystem permissions. The host checks the role and record again before sending the deletion. Concurrent clients can change the record in the interval between those requests. The config file is protected by operating system permissions, so any process with unrestricted access as the service user can read it. Keep the service account and any general-purpose shell access within the same trust boundary.
+
 ### Managed Node Runtime
 
 Builtin ACP adapters run through the managed Node runtime in

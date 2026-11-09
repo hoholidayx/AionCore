@@ -449,27 +449,35 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
     // the caller does not supply one (ELECTRON-1J1 / 1KV).
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
     let builtin = Arc::new(BuiltinAssistantRegistry::load());
+    let mem0_config = services.conversation_service.mem0_config().cloned();
     // Pin user_data_dir to the runtime-resolved data directory so dev /
     // packaged / multi-instance launches all keep their assistant rule files
     // alongside the matching SQLite database (avoiding the historical bug
     // where dev wrote rules to the release `~/.aionui/` while the db lived
     // under `~/.aionui-dev/`).
-    let service = Arc::new(AssistantService::new(
-        pool,
-        aionui_assistant::service::AssistantServiceDeps {
-            definition_repo,
-            state_repo,
-            preference_repo,
-            repo,
-            override_repo,
-            provider_repo,
-            builtin,
-            agent_catalog: Some(Arc::new(RegistryAssistantAgentCatalog {
-                registry: services.agent_registry.clone(),
-            })),
-        },
-        services.data_dir.clone(),
-    ));
+    let service = Arc::new(
+        AssistantService::new(
+            pool,
+            aionui_assistant::service::AssistantServiceDeps {
+                definition_repo,
+                state_repo,
+                preference_repo,
+                repo,
+                override_repo,
+                provider_repo,
+                builtin,
+                agent_catalog: Some(Arc::new(RegistryAssistantAgentCatalog {
+                    registry: services.agent_registry.clone(),
+                })),
+            },
+            services.data_dir.clone(),
+        )
+        .with_mem0_profile_lookup(move |user_id, definition_id| {
+            mem0_config
+                .as_ref()
+                .is_some_and(|config| config.has_profile(user_id, definition_id))
+        }),
+    );
     service.with_event_broadcaster(services.event_bus.clone());
     AssistantRouterState { service }
 }

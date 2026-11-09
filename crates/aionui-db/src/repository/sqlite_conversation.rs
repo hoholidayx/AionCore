@@ -305,6 +305,17 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(row)
     }
 
+    async fn get_unarchived_for_user(&self, user_id: &str, id: &str) -> Result<Option<ConversationRow>, DbError> {
+        let row = sqlx::query_as::<_, ConversationRow>(
+            "SELECT * FROM conversations WHERE user_id = ? AND id = ? AND archived_at IS NULL",
+        )
+        .bind(user_id)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     async fn owner_user_id(&self, id: &str) -> Result<Option<String>, DbError> {
         let user_id = sqlx::query_scalar::<_, String>("SELECT user_id FROM conversations WHERE id = ?")
             .bind(id)
@@ -1995,6 +2006,12 @@ mod tests {
         let mut archived = sample_conversation(SYSTEM_USER_ID);
         archived.name = "Archived target".to_string();
         repo.create(&archived).await.unwrap();
+        assert!(
+            repo.get_unarchived_for_user(SYSTEM_USER_ID, &archived.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
         sqlx::query("UPDATE conversations SET archived_at = ? WHERE id = ?")
             .bind(1_700_000_000_000_i64)
             .bind(&archived.id)
@@ -2015,6 +2032,13 @@ mod tests {
             .unwrap();
 
         assert!(rows.is_empty(), "an archived conversation is not mentionable");
+        assert!(
+            repo.get_unarchived_for_user(SYSTEM_USER_ID, &archived.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(repo.get(SYSTEM_USER_ID, &archived.id).await.unwrap().is_some());
     }
 
     #[tokio::test]

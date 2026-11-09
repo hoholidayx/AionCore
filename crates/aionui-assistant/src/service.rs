@@ -15,12 +15,13 @@ use aionui_api_types::{
     SetAssistantStateRequest, UpdateAssistantRequest, WebSocketMessage, assistant_avatar_response_value_with_version,
     assistant_mcp_binding_fingerprint, is_local_avatar_value,
 };
-use aionui_common::{generate_prefixed_id, now_ms};
+use aionui_common::{AgentType, generate_prefixed_id, now_ms};
 use aionui_db::{
-    AssistantDefinitionRow, AssistantOverlayRow, AssistantRow, CreateAssistantParams, IAssistantDefinitionRepository,
-    IAssistantOverlayRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
-    IProviderRepository, SqlitePool, UpdateAssistantParams, UpsertAssistantDefinitionParams,
-    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, resolve_agent_binding_for_user,
+    AgentBindingResolution, AssistantDefinitionRow, AssistantOverlayRow, AssistantRow, CreateAssistantParams,
+    IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
+    IAssistantPreferenceRepository, IAssistantRepository, IProviderRepository, SqlitePool, UpdateAssistantParams,
+    UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams,
+    resolve_agent_binding_for_user,
 };
 use aionui_extension::{AssistantClassifier, AssistantRuleDispatcher, ExtensionError};
 use aionui_realtime::EventBroadcaster;
@@ -120,11 +121,14 @@ pub struct AssistantService {
     provider_repo: Arc<dyn IProviderRepository>,
     builtin: Arc<BuiltinAssistantRegistry>,
     agent_catalog: Option<Arc<dyn AssistantAgentCatalogPort>>,
+    mem0_profile_exists: Option<Box<Mem0ProfileLookup>>,
     event_broadcaster: RwLock<Option<Arc<dyn EventBroadcaster>>>,
     /// Root directory holding user-authored rule/skill md files and avatars.
     /// Defaults to `~/.aionui/` but can be overridden for tests.
     user_data_dir: PathBuf,
 }
+
+type Mem0ProfileLookup = dyn Fn(&str, &str) -> bool + Send + Sync;
 
 pub struct AssistantServiceDeps {
     pub definition_repo: Arc<dyn IAssistantDefinitionRepository>,
@@ -182,9 +186,21 @@ impl AssistantService {
             provider_repo,
             builtin,
             agent_catalog,
+            mem0_profile_exists: None,
             event_broadcaster: RwLock::new(None),
             user_data_dir,
         }
+    }
+
+    pub fn with_mem0_profile_lookup(mut self, lookup: impl Fn(&str, &str) -> bool + Send + Sync + 'static) -> Self {
+        self.mem0_profile_exists = Some(Box::new(lookup));
+        self
+    }
+
+    fn has_mem0_profile(&self, user_id: &str, definition_id: &str) -> bool {
+        self.mem0_profile_exists
+            .as_ref()
+            .is_some_and(|lookup| lookup(user_id, definition_id))
     }
 
     pub fn with_event_broadcaster(&self, broadcaster: Arc<dyn EventBroadcaster>) {
@@ -1060,16 +1076,63 @@ impl AssistantService {
         agent_rows: &[AgentManagementRow],
     ) -> Result<AssistantRuntimeProjection, AssistantError> {
         let effective_agent_id = effective_agent_id_for_definition(definition, state);
-        let runtime_backend = resolve_agent_binding_for_user(&self.pool, user_id, effective_agent_id)
+        let binding = resolve_agent_binding_for_user(&self.pool, user_id, effective_agent_id)
             .await
-            .map_err(|e| AssistantError::Internal(format!("resolve agent binding: {e}")))?
-            .map(|binding| binding.runtime_backend);
+            .map_err(|e| AssistantError::Internal(format!("resolve agent binding: {e}")))?;
         Ok(assistant_projection_for_definition(
             definition,
             state,
             agent_rows,
-            runtime_backend.as_deref(),
+            binding.as_ref(),
         ))
+    }
+
+    async fn validate_mem0_enablement(
+        &self,
+        user_id: &str,
+        definition: &AssistantDefinitionRow,
+        requested_agent_id: Option<&str>,
+    ) -> Result<(), AssistantError> {
+        if !self.has_mem0_profile(user_id, &definition.id) {
+            return Err(AssistantError::BadRequest(
+                "No Mem0 profile is configured for this assistant".into(),
+            ));
+        }
+        let state = self.state_repo.get_for_user(user_id, &definition.id).await?;
+        let state_override = state.as_ref().and_then(|row| row.agent_id_override.as_deref());
+        let agent_id = if definition.source == "builtin" {
+            requested_agent_id.or(state_override)
+        } else {
+            state_override.or(requested_agent_id)
+        }
+        .unwrap_or(&definition.agent_id);
+        let binding = resolve_agent_binding_for_user(&self.pool, user_id, agent_id).await?;
+        if !binding.as_ref().is_some_and(mem0_engine_supported) {
+            return Err(AssistantError::BadRequest(
+                "Mem0 memory requires an AionRS assistant".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn apply_mem0_preference(
+        &self,
+        user_id: &str,
+        definition: &AssistantDefinitionRow,
+        preference: Option<bool>,
+    ) -> Result<(), AssistantError> {
+        if let Some(enabled) = preference {
+            if enabled && !self.has_mem0_profile(user_id, &definition.id) {
+                return Err(AssistantError::BadRequest(
+                    "No Mem0 profile is configured for this assistant".into(),
+                ));
+            }
+            let initial_state = self.builtin_listing_default(definition).unwrap_or((0, true));
+            self.state_repo
+                .set_mem0_memory_enabled_for_user(user_id, &definition.id, enabled, initial_state)
+                .await?;
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1146,6 +1209,11 @@ impl AssistantService {
         if name.is_empty() {
             return Err(AssistantError::BadRequest("name is required".into()));
         }
+        if req.defaults.as_ref().and_then(|defaults| defaults.mem0_memory_enabled) == Some(true) {
+            return Err(AssistantError::BadRequest(
+                "Create the assistant before configuring and enabling Mem0 memory".into(),
+            ));
+        }
 
         let id = match req.id.as_deref() {
             Some(s) if !s.is_empty() => s.to_string(),
@@ -1214,6 +1282,7 @@ impl AssistantService {
         req: UpdateAssistantRequest,
     ) -> Result<AssistantResponse, AssistantError> {
         let mcp_binding_changed = req.defaults.as_ref().is_some_and(|defaults| defaults.mcps.is_some());
+        let mem0_preference = req.defaults.as_ref().and_then(|defaults| defaults.mem0_memory_enabled);
         match self.classify_source_for_user(user_id, id).await {
             AssistantSource::Builtin => {
                 let detail_overrides = SerializedDetailOverrides::from_update(&req)?;
@@ -1243,7 +1312,7 @@ impl AssistantService {
                     || builtin_defaults_forbidden
                 {
                     return Err(AssistantError::Forbidden(
-                        "Only 'agent_id', 'defaults.model', 'defaults.permission', 'defaults.thought_level', 'defaults.async_image_enabled', and 'defaults.async_image_backend_ids' can be overridden on built-in assistants".into(),
+                        "Only 'agent_id', 'defaults.model', 'defaults.permission', 'defaults.thought_level', 'defaults.async_image_enabled', 'defaults.async_image_backend_ids', and 'defaults.mem0_memory_enabled' can be overridden on built-in assistants".into(),
                     ));
                 }
 
@@ -1257,7 +1326,7 @@ impl AssistantService {
                 let enabled = existing.as_ref().is_none_or(|o| o.enabled);
                 let sort_order = existing.as_ref().map(|o| o.sort_order).unwrap_or(0);
                 let last_used_at = existing.as_ref().and_then(|o| o.last_used_at);
-                let requested_agent_id = req.agent_id.as_deref().map(|agent_id| agent_id.trim().to_string());
+                let mut requested_agent_id = req.agent_id.as_deref().map(|agent_id| agent_id.trim().to_string());
                 let current_agent_id = self
                     .state_repo
                     .get_for_user(user_id, &definition.id)
@@ -1265,15 +1334,38 @@ impl AssistantService {
                     .map_err(|e| AssistantError::Internal(format!("get assistant overlay: {e}")))?
                     .and_then(|row| row.agent_id_override)
                     .unwrap_or_else(|| definition.agent_id.clone());
-                let reset_model_and_permission = requested_agent_id
-                    .as_deref()
-                    .is_some_and(|agent_id| agent_id != current_agent_id);
                 if let Some(requested_agent_id) = requested_agent_id.as_deref() {
                     self.resolve_runtime_backend_for_agent_id(user_id, requested_agent_id)
                         .await?;
                 }
-                self.apply_detail_overrides_for_user(user_id, id, detail_overrides, reset_model_and_permission)
-                    .await?;
+                let global_builtin = definition.owner_type == "system";
+                let preserve_mem0_scope =
+                    global_builtin && (mem0_preference.is_some() || self.has_mem0_profile(user_id, &definition.id));
+                if preserve_mem0_scope && let Some(requested_id) = requested_agent_id.as_deref() {
+                    let requested = resolve_agent_binding_for_user(&self.pool, user_id, requested_id).await?;
+                    let current = resolve_agent_binding_for_user(&self.pool, user_id, &current_agent_id).await?;
+                    if requested == current {
+                        requested_agent_id = None;
+                    }
+                }
+                let reset_model_and_permission = requested_agent_id
+                    .as_deref()
+                    .is_some_and(|agent_id| agent_id != current_agent_id);
+                let definition_changes =
+                    reset_model_and_permission || detail_overrides.changes_builtin_definition(&definition);
+                if mem0_preference == Some(true) {
+                    self.validate_mem0_enablement(user_id, &definition, requested_agent_id.as_deref())
+                        .await?;
+                    if global_builtin && definition_changes {
+                        return Err(AssistantError::BadRequest(
+                            "Save the built-in assistant defaults before configuring and enabling Mem0 memory".into(),
+                        ));
+                    }
+                }
+                if !preserve_mem0_scope || definition_changes {
+                    self.apply_detail_overrides_for_user(user_id, id, detail_overrides, reset_model_and_permission)
+                        .await?;
+                }
                 let definition = self
                     .definition_repo
                     .get_by_assistant_id_for_user(user_id, id)
@@ -1301,6 +1393,8 @@ impl AssistantService {
                     req.defaults.as_ref(),
                 )
                 .await?;
+                self.apply_mem0_preference(user_id, &definition, mem0_preference)
+                    .await?;
                 return self.finish_assistant_mutation(user_id, id, mcp_binding_changed).await;
             }
             AssistantSource::Generated => {
@@ -1327,6 +1421,10 @@ impl AssistantService {
                     .get_by_assistant_id_for_user(user_id, id)
                     .await?
                     .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
+                if mem0_preference == Some(true) {
+                    self.validate_mem0_enablement(user_id, &current_definition, None)
+                        .await?;
+                }
                 let mut patched = current_definition.clone();
 
                 if let Some(description) = req.description {
@@ -1369,6 +1467,7 @@ impl AssistantService {
                     req.defaults.as_ref(),
                 )
                 .await?;
+                self.apply_mem0_preference(user_id, &patched, mem0_preference).await?;
                 return self.finish_assistant_mutation(user_id, id, mcp_binding_changed).await;
             }
             AssistantSource::User => {}
@@ -1388,6 +1487,10 @@ impl AssistantService {
         };
         if let Some(agent_id) = requested_agent_id.as_deref() {
             self.resolve_runtime_backend_for_agent_id(user_id, agent_id).await?;
+        }
+        if mem0_preference == Some(true) {
+            self.validate_mem0_enablement(user_id, &current_definition, requested_agent_id.as_deref())
+                .await?;
         }
         let reset_model_and_permission = requested_agent_id
             .as_deref()
@@ -1428,6 +1531,8 @@ impl AssistantService {
                 req.defaults.as_ref(),
             )
             .await?;
+            self.apply_mem0_preference(user_id, &definition, mem0_preference)
+                .await?;
         }
         self.finish_assistant_mutation(user_id, id, mcp_binding_changed).await
     }
@@ -2732,6 +2837,9 @@ impl AssistantService {
                     .as_deref()
                     .map(|ids| decode_str_list(Some(ids)))
                     .transpose()?,
+                mem0_memory_enabled: state.is_some_and(|row| row.mem0_memory_enabled),
+                mem0_memory_configured: projection.mem0_engine_supported
+                    && self.has_mem0_profile(user_id, &definition.id),
             },
             capabilities: AssistantCapabilitiesResponse {
                 default_skill_ids,
@@ -2827,6 +2935,7 @@ fn parse_assistant_avatar_route(value: &str) -> Option<String> {
 struct AssistantRuntimeProjection {
     agent_id: String,
     agent: Option<AssistantAgentResponse>,
+    mem0_engine_supported: bool,
     agent_status: AgentManagementStatus,
     agent_status_message: Option<String>,
     team_selectable: bool,
@@ -2838,7 +2947,7 @@ fn assistant_projection_for_definition(
     definition: &AssistantDefinitionRow,
     state: Option<&AssistantOverlayRow>,
     agent_rows: &[AgentManagementRow],
-    resolved_runtime_backend: Option<&str>,
+    binding: Option<&AgentBindingResolution>,
 ) -> AssistantRuntimeProjection {
     let enabled = state.is_none_or(|row| row.enabled);
     let source = match definition.source.as_str() {
@@ -2847,7 +2956,7 @@ fn assistant_projection_for_definition(
         _ => AssistantSource::User,
     };
     let effective_agent_id = effective_agent_id_for_definition(definition, state);
-    let fallback_runtime_backend = resolved_runtime_backend.unwrap_or(effective_agent_id);
+    let fallback_runtime_backend = binding.map_or(effective_agent_id, |binding| binding.runtime_backend.as_str());
 
     // An agent row identifies its runtime key by `backend` for vendor ACP
     // agents, but aionrs (the built-in Rust agent) has a NULL `backend` and is
@@ -2917,6 +3026,7 @@ fn assistant_projection_for_definition(
     AssistantRuntimeProjection {
         agent_id,
         agent,
+        mem0_engine_supported: binding.is_some_and(mem0_engine_supported),
         agent_status,
         agent_status_message,
         team_selectable: enabled
@@ -2929,6 +3039,10 @@ fn assistant_projection_for_definition(
         team_block_reason,
         deletable: matches!(source, AssistantSource::User),
     }
+}
+
+fn mem0_engine_supported(binding: &AgentBindingResolution) -> bool {
+    binding.agent_type == AgentType::Aionrs.serde_name() && binding.runtime_backend == AgentType::Aionrs.serde_name()
 }
 
 fn generated_definition_is_uninstalled(definition: &AssistantDefinitionRow, agent_rows: &[AgentManagementRow]) -> bool {
@@ -3021,6 +3135,18 @@ struct SerializedDetailOverrides {
 }
 
 impl SerializedDetailOverrides {
+    fn changes_builtin_definition(&self, definition: &AssistantDefinitionRow) -> bool {
+        let mut patched = definition.clone();
+        apply_detail_patch_to_definition(&mut patched, self, false);
+        if let Some(enabled) = self.async_image_enabled {
+            patched.async_image_enabled = enabled;
+        }
+        if let Some(ids) = self.async_image_backend_ids.as_ref() {
+            patched.async_image_backend_ids = Some(ids.clone());
+        }
+        patched != *definition
+    }
+
     fn from_create(req: &CreateAssistantRequest) -> Result<Self, AssistantError> {
         Self::from_parts(
             req.recommended_prompts.as_deref(),
@@ -5798,6 +5924,7 @@ mod tests {
                         }),
                         async_image_enabled: None,
                         async_image_backend_ids: None,
+                        mem0_memory_enabled: None,
                     }),
                     ..Default::default()
                 },
@@ -6104,6 +6231,7 @@ mod tests {
                     }),
                     async_image_enabled: None,
                     async_image_backend_ids: None,
+                    mem0_memory_enabled: None,
                 }),
                 ..req_default()
             })
@@ -6206,6 +6334,7 @@ mod tests {
                         }),
                         async_image_enabled: None,
                         async_image_backend_ids: None,
+                        mem0_memory_enabled: None,
                     }),
                     ..Default::default()
                 },
@@ -6261,6 +6390,7 @@ mod tests {
                         }),
                         async_image_enabled: None,
                         async_image_backend_ids: None,
+                        mem0_memory_enabled: None,
                     }),
                     ..Default::default()
                 },
@@ -6303,6 +6433,7 @@ mod tests {
                     }),
                     async_image_enabled: None,
                     async_image_backend_ids: None,
+                    mem0_memory_enabled: None,
                 }),
                 ..req_default()
             })
@@ -6333,6 +6464,7 @@ mod tests {
                         }),
                         async_image_enabled: None,
                         async_image_backend_ids: None,
+                        mem0_memory_enabled: None,
                     }),
                     ..Default::default()
                 },
@@ -7044,6 +7176,92 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(created.agent_id, "8e1acf31");
+    }
+
+    #[tokio::test]
+    async fn mem0_setting_checks_the_profile_and_engine_and_persists_only_for_its_owner() {
+        use aionui_db::{IUserRepository, SqliteUserRepository};
+
+        async fn get_defaults(service: &AssistantService) -> AssistantDefaultsResponse {
+            service
+                .get_detail_for_user(DEFAULT_USER_ID, "mine", None)
+                .await
+                .unwrap()
+                .defaults
+        }
+
+        let mut fx = fixture().await;
+        let users = SqliteUserRepository::new(fx._db.pool().clone());
+        let other_user = users.create_user("other-user", "test-password-hash").await.unwrap();
+        let assistant = |id: &str| CreateAssistantRequest {
+            id: Some(id.into()),
+            name: "Mine".into(),
+            agent_id: Some("aionrs".into()),
+            ..req_default()
+        };
+        fx.service.create(assistant("mine")).await.unwrap();
+        fx.service
+            .create_for_user(&other_user.id, assistant("theirs"))
+            .await
+            .unwrap();
+        let definition = fx.definition_repo.get_by_assistant_id("mine").await.unwrap().unwrap();
+        let set_mem0 = |enabled| UpdateAssistantRequest {
+            defaults: Some(AssistantDefaultsRequest {
+                mem0_memory_enabled: Some(enabled),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let before = get_defaults(&fx.service).await;
+        assert!(!before.mem0_memory_enabled);
+        assert!(!before.mem0_memory_configured);
+        let error = fx.service.update("mine", set_mem0(true)).await.unwrap_err();
+        assert!(matches!(error, AssistantError::BadRequest(message) if message.contains("No Mem0 profile")));
+
+        let definition_id = definition.id.clone();
+        fx.service.mem0_profile_exists = Some(Box::new(move |user, id| user == DEFAULT_USER_ID && id == definition_id));
+        let mut wrong_engine = set_mem0(true);
+        wrong_engine.agent_id = Some("claude".into());
+        let error = fx.service.update("mine", wrong_engine).await.unwrap_err();
+        assert!(matches!(error, AssistantError::BadRequest(message) if message.contains("AionRS assistant")));
+        assert!(!get_defaults(&fx.service).await.mem0_memory_enabled);
+
+        fx.service.update("mine", set_mem0(true)).await.unwrap();
+        fx.service
+            .set_state(
+                "mine",
+                SetAssistantStateRequest {
+                    sort_order: Some(5),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let enabled = get_defaults(&fx.service).await;
+        assert!(enabled.mem0_memory_enabled && enabled.mem0_memory_configured);
+        let other = fx
+            .service
+            .get_detail_for_user(&other_user.id, "theirs", None)
+            .await
+            .unwrap()
+            .defaults;
+        assert!(!other.mem0_memory_enabled && !other.mem0_memory_configured);
+        assert!(matches!(
+            fx.service
+                .update_for_user(&other_user.id, "mine", set_mem0(true))
+                .await
+                .unwrap_err(),
+            AssistantError::NotFound(_)
+        ));
+        assert!(matches!(
+            fx.service.update_for_user(&other_user.id, "theirs", set_mem0(true)).await.unwrap_err(),
+            AssistantError::BadRequest(message) if message.contains("No Mem0 profile")
+        ));
+
+        fx.service.mem0_profile_exists = None;
+        assert!(get_defaults(&fx.service).await.mem0_memory_enabled);
+        fx.service.update("mine", set_mem0(false)).await.unwrap();
+        assert!(!get_defaults(&fx.service).await.mem0_memory_enabled);
     }
 
     fn req_default() -> CreateAssistantRequest {

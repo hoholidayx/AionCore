@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::{AppConfig, IdentityMode, derive_encryption_key};
+use aionui_ai_agent::mem0_config::{Mem0Config, Mem0Repositories};
 use aionui_ai_agent::{
     AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager,
     RuntimeTokenService, WorkerTaskManagerImpl, build_agent_factory,
@@ -137,6 +138,8 @@ impl AppServices {
             runtime_token_service: self.runtime_token_service.clone(),
             project_service: self.project_service.clone(),
             user_order_store: self.user_order_store.clone(),
+            mem0_config: self.conversation_service.mem0_config().cloned(),
+            user_repo: self.user_repo.clone(),
         });
         self
     }
@@ -167,6 +170,17 @@ impl AppServices {
         let data_dir = config.data_dir.clone();
         let work_dir = config.work_dir.clone();
         let identity_mode = config.effective_identity_mode();
+        let mem0_config = if identity_mode == IdentityMode::WebUi {
+            match Mem0Config::load(&data_dir) {
+                Ok(config) => config.map(Arc::new),
+                Err(error) => {
+                    tracing::warn!(%error, "Mem0 private configuration rejected");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let local = identity_mode.is_local();
         let dump_prompts = config.dump_prompts;
         let app_version = config.app_version.clone();
@@ -415,6 +429,8 @@ impl AppServices {
             runtime_token_service: runtime_token_service.clone(),
             project_service: project_service.clone(),
             user_order_store: user_order_store.clone(),
+            mem0_config,
+            user_repo: user_repo.clone(),
         });
 
         let session_message_queue = Arc::new(DeliveryQueue::new(Arc::new(SystemClock)));
@@ -494,6 +510,8 @@ struct ConversationServiceDeps<'a> {
     /// conversation cascades away its `user_order` rows (sidebar design §4.3,
     /// path 1).
     user_order_store: Arc<dyn IUserOrderStore>,
+    mem0_config: Option<Arc<Mem0Config>>,
+    user_repo: Arc<dyn IUserRepository>,
 }
 
 fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> ConversationService {
@@ -501,25 +519,37 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
         deps.skill_paths,
         deps.skill_repo,
     ));
-    let service = ConversationService::new(
+    let pool = deps.database.pool();
+    let agents = Arc::new(SqliteAgentMetadataRepository::new(pool.clone()));
+    let definitions = Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone()));
+    let overlays = Arc::new(SqliteAssistantOverlayRepository::new(pool.clone()));
+    let mut service = ConversationService::new(
         deps.work_dir,
         deps.event_bus,
         skill_resolver,
         deps.worker_task_manager,
-        deps.conversation_repo,
-        Arc::new(SqliteAgentMetadataRepository::new(deps.database.pool().clone())),
-        Arc::new(SqliteAcpSessionRepository::new(deps.database.pool().clone())),
+        deps.conversation_repo.clone(),
+        agents.clone(),
+        Arc::new(SqliteAcpSessionRepository::new(pool.clone())),
     )
     .with_runtime_state(deps.conversation_runtime_state)
     .with_runtime_helper_context(deps.runtime_helper_bin, deps.runtime_base_url)
     .with_runtime_token_service(deps.runtime_token_service);
+    if let Some(config) = deps.mem0_config {
+        service = service.with_mem0_config(
+            config,
+            Mem0Repositories {
+                users: deps.user_repo,
+                conversations: deps.conversation_repo,
+                definitions: definitions.clone(),
+                overlays: overlays.clone(),
+                agents,
+            },
+        );
+    }
     service.with_mcp_server_repo(Arc::new(SqliteMcpServerRepository::new(deps.database.pool().clone())));
-    service.with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(
-        deps.database.pool().clone(),
-    )));
-    service.with_assistant_state_repo(Arc::new(SqliteAssistantOverlayRepository::new(
-        deps.database.pool().clone(),
-    )));
+    service.with_assistant_definition_repo(definitions);
+    service.with_assistant_state_repo(overlays);
     service.with_assistant_preference_repo(Arc::new(SqliteAssistantPreferenceRepository::new(
         deps.database.pool().clone(),
     )));

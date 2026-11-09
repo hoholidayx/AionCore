@@ -175,6 +175,8 @@ pub struct AssistantDefaultsRequest {
     pub async_image_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub async_image_backend_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem0_memory_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +190,10 @@ pub struct AssistantDefaultsResponse {
     pub async_image_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub async_image_backend_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub mem0_memory_enabled: bool,
+    #[serde(default)]
+    pub mem0_memory_configured: bool,
 }
 
 fn default_true() -> bool {

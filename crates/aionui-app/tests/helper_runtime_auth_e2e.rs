@@ -266,3 +266,26 @@ async fn helper_write_request_is_exempt_from_csrf() {
 
     services.database.close().await;
 }
+
+#[tokio::test]
+async fn helper_token_cannot_approve_a_memory_deletion() {
+    let (app, services, user_id) = build_aionpro_app().await;
+    let issue = services.runtime_token_service.issue(
+        user_id.as_str(),
+        CONVERSATION_ID,
+        TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+        [RuntimeTokenScope::ConversationHelper],
+    );
+    let request = Request::post(format!(
+        "/api/conversations/{CONVERSATION_ID}/confirmations/mem0-delete-example/confirm"
+    ))
+    .header("content-type", "application/json")
+    .header("x-aionui-user-id", &user_id)
+    .header("x-aionui-conversation-id", CONVERSATION_ID)
+    .header("x-aionui-runtime-token", &issue.token)
+    .body(Body::from(r#"{"msg_id":"","data":{"value":"proceed_once"}}"#))
+    .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    services.database.close().await;
+}

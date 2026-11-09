@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 
@@ -14,10 +14,11 @@ use aionui_api_types::{
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
     CreateConversationRequest, EnsureConversationRuntimeResponse, ForkConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
-    SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    ListMessagesQuery, MEM0_DELETE_CONFIRMATION_PREFIX, MessageListResponse, MessageResponse, MessageSearchResponse,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest,
+    UpdateConversationRequest,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{AuthenticatedUserSession, CurrentUser, RUNTIME_TOKEN_HEADER};
 use aionui_common::ApiError;
 
 use crate::ConversationError;
@@ -366,13 +367,14 @@ async fn get_msg(
 async fn send_msg(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
+    session: Option<Extension<AuthenticatedUserSession>>,
     Path(id): Path<String>,
     body: Result<Json<SendMessageRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<SendMessageResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let response = state
         .service
-        .send_message(&user.id, &id, req, &state.task_manager)
+        .send_message_for_session(&user.id, &id, req, &state.task_manager, session.is_some())
         .await
         .map_err(ApiError::from)?;
     // B5: a mid-turn delivery already handed the message to the RUNNING turn —
@@ -505,13 +507,18 @@ async fn search_messages(
 async fn list_confirmations(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
+    session: Option<Extension<AuthenticatedUserSession>>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<ApiResponse<ConfirmationListResponse>>, ApiError> {
-    let items = state
+    let mut items = state
         .service
         .list_confirmations(&user.id, &id, &state.task_manager)
         .await
         .map_err(ApiError::from)?;
+    if session.is_none() || headers.contains_key(RUNTIME_TOKEN_HEADER) {
+        items.retain(|item| !item.call_id.starts_with(MEM0_DELETE_CONFIRMATION_PREFIX));
+    }
     Ok(Json(ApiResponse::ok(items)))
 }
 
@@ -525,9 +532,18 @@ struct ConfirmPathParams {
 async fn confirm(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
+    session: Option<Extension<AuthenticatedUserSession>>,
     Path(params): Path<ConfirmPathParams>,
+    headers: HeaderMap,
     body: Result<Json<ConfirmRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
+    if params.call_id.starts_with(MEM0_DELETE_CONFIRMATION_PREFIX)
+        && (session.is_none() || headers.contains_key(RUNTIME_TOKEN_HEADER))
+    {
+        return Err(ApiError::Forbidden(
+            "Memory deletion requires an authenticated Web user session".into(),
+        ));
+    }
     let Json(req) = body.map_err(ApiError::from)?;
     state
         .service

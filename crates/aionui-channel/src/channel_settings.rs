@@ -862,6 +862,7 @@ mod tests {
         AssistantOverlayRow {
             assistant_definition_id: definition_id.to_owned(),
             enabled: true,
+            mem0_memory_enabled: false,
             sort_order: 0,
             agent_id_override: Some(agent_id_override.to_owned()),
             last_used_at: None,

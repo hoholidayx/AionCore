@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aionui_ai_agent::async_image::IMAGE_BACKEND_OVERRIDE_KEY;
+use aionui_ai_agent::mem0_config::{Mem0Config, Mem0Repositories};
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{
@@ -343,6 +344,7 @@ pub struct ConversationService {
     runtime_state: Arc<ConversationRuntimeStateService>,
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
+    mem0_runtime: Option<(Arc<Mem0Config>, Arc<Mem0Repositories>)>,
     runtime_token_service: Option<Arc<RuntimeTokenService>>,
 
     /// One background-stream watcher per LIVE Session instance (keyed by
@@ -427,6 +429,7 @@ impl ConversationService {
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
             runtime_helper_bin: None,
             runtime_base_url: None,
+            mem0_runtime: None,
             runtime_token_service: None,
             background_watchers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
 
@@ -450,6 +453,15 @@ impl ConversationService {
     pub fn with_runtime_token_service(mut self, runtime_token_service: Arc<RuntimeTokenService>) -> Self {
         self.runtime_token_service = Some(runtime_token_service);
         self
+    }
+
+    pub fn with_mem0_config(mut self, config: Arc<Mem0Config>, repos: Mem0Repositories) -> Self {
+        self.mem0_runtime = Some((config, Arc::new(repos)));
+        self
+    }
+
+    pub fn mem0_config(&self) -> Option<&Arc<Mem0Config>> {
+        self.mem0_runtime.as_ref().map(|(config, _)| config)
     }
 
     pub fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, ConversationError> {
@@ -3913,6 +3925,19 @@ impl ConversationService {
         req: SendMessageRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<SendMessageResponse, ConversationError> {
+        self.send_message_for_session(user_id, conversation_id, req, task_manager, false)
+            .await
+    }
+
+    /// Only the authenticated end-user route grants host-private conversation tools.
+    pub(crate) async fn send_message_for_session(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        req: SendMessageRequest,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+        end_user_session: bool,
+    ) -> Result<SendMessageResponse, ConversationError> {
         if req.content.trim().is_empty() {
             return Err(ConversationError::BadRequest {
                 reason: "Message content must not be empty".into(),
@@ -4098,7 +4123,10 @@ impl ConversationService {
         }
 
         // Build task options from conversation row
-        let mut build_opts = match self.build_task_options(&row).await {
+        let mut build_opts = match self
+            .build_task_options_for_session(&row, None, end_user_session && !req.hidden)
+            .await
+        {
             Ok(opts) => opts,
             Err(err) => {
                 error!(
@@ -4857,6 +4885,16 @@ impl ConversationService {
         row: &ConversationRow,
         workspace_override: Option<&str>,
     ) -> Result<BuildTaskOptions, ConversationError> {
+        self.build_task_options_for_session(row, workspace_override, false)
+            .await
+    }
+
+    async fn build_task_options_for_session(
+        &self,
+        row: &ConversationRow,
+        workspace_override: Option<&str>,
+        end_user_session: bool,
+    ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
         let is_aionrs = row.r#type == AgentType::Aionrs.serde_name();
         let snapshot = if is_aionrs {
@@ -4877,6 +4915,11 @@ impl ConversationService {
         if is_aionrs {
             options.runtime_capabilities.async_image_enabled =
                 Some(self.resolve_async_image_enabled(row, snapshot.as_ref()).await?);
+        }
+        if end_user_session
+            && let (Some((config, repos)), Some(snapshot)) = (self.mem0_runtime.as_ref(), snapshot.as_ref())
+        {
+            options.runtime_capabilities.mem0 = config.binding_for(row, snapshot, repos).await;
         }
         Ok(options)
     }

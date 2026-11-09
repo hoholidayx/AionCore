@@ -54,6 +54,10 @@ pub struct CurrentUser {
     pub status: UserStatus,
 }
 
+/// Inserted only after validating an end-user access token, never for runtime helpers or local mode.
+#[derive(Clone, Copy)]
+pub struct AuthenticatedUserSession;
+
 impl CurrentUser {
     pub fn local_default() -> Self {
         Self {
@@ -135,6 +139,7 @@ pub async fn auth_middleware(
         return Err(ApiError::Unauthorized("Invalid authentication session".into()));
     }
 
+    request.extensions_mut().insert(AuthenticatedUserSession);
     request.extensions_mut().insert(CurrentUser {
         id: user.id,
         username: user.username.unwrap_or_else(|| "external_user".to_string()),

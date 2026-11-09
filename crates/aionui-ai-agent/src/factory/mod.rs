@@ -194,6 +194,7 @@ async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> 
                 model,
                 ctx,
                 options.runtime_capabilities.async_image_enabled.unwrap_or(true),
+                options.runtime_capabilities.mem0,
             )
             .await
         }

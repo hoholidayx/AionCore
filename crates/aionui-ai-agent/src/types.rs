@@ -5,6 +5,7 @@ use aion_config::compat::OpenAiApiMode;
 use aion_types::message::ImageInputCapability;
 use serde::{Deserialize, Serialize};
 
+use crate::mem0_config::Mem0Binding;
 use crate::session_context::AgentSessionContext;
 
 /// Data payload for sending a user message to an Agent.
@@ -107,10 +108,14 @@ pub struct RuntimeCapabilities {
     pub conversation_runtime_context_version: Option<u32>,
     /// Assistant setting for the host image tool. Unspecified builds default to enabled.
     pub async_image_enabled: Option<bool>,
+    pub mem0: Option<Mem0Binding>,
 }
 
 impl RuntimeCapabilities {
     pub fn satisfies(&self, requested: &Self) -> bool {
+        if self.mem0 != requested.mem0 {
+            return false;
+        }
         if requested
             .async_image_enabled
             .is_some_and(|enabled| self.async_image_enabled.unwrap_or(true) != enabled)
