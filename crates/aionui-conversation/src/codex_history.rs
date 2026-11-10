@@ -2,14 +2,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use aionui_api_types::ConversationDeleteOptions;
-use aionui_common::AgentKillReason;
+use aionui_auth::SYSTEM_DEFAULT_USER_ID;
+use aionui_common::{AgentKillReason, AgentType};
 use aionui_db::models::ConversationRow;
 use serde_json::Value;
 
 use super::{ConversationService, is_ordinary_assistant_extra};
 use crate::ConversationError;
-
-const LOCAL_OWNER: &str = "system_default_user";
 
 #[async_trait::async_trait]
 pub trait CodexHistoryDeletion: Send + Sync {
@@ -28,7 +27,7 @@ impl ConversationService {
 
     pub(super) async fn enable_codex_history_deletion_for_new_conversation(&self, row: &ConversationRow) {
         if self.codex_history_deletion.is_some()
-            && row.user_id == LOCAL_OWNER
+            && row.user_id == SYSTEM_DEFAULT_USER_ID
             && eligible_row(row)
             && let Err(error) = self
                 .acp_session_repo
@@ -45,15 +44,15 @@ impl ConversationService {
         id: &str,
         interactive: bool,
     ) -> Result<ConversationDeleteOptions, ConversationError> {
-        let row = self.owned_delete_row(user_id, id).await?;
-        if !interactive || user_id != LOCAL_OWNER || self.codex_history_deletion.is_none() || !eligible_row(&row) {
+        let row = self.require_conversation(user_id, id).await?;
+        if !interactive
+            || user_id != SYSTEM_DEFAULT_USER_ID
+            || self.codex_history_deletion.is_none()
+            || !eligible_row(&row)
+        {
             return Ok(ConversationDeleteOptions::Unavailable);
         }
-        if self
-            .acp_session_repo
-            .is_codex_history_deletion_pending(user_id, id)
-            .await?
-        {
+        if self.pending_codex_delete(&row).await? {
             return Ok(ConversationDeleteOptions::RetryRequired);
         }
         Ok(
@@ -71,13 +70,13 @@ impl ConversationService {
         id: &str,
         interactive: bool,
     ) -> Result<(), ConversationError> {
-        if !interactive || user_id != LOCAL_OWNER {
+        if !interactive || user_id != SYSTEM_DEFAULT_USER_ID {
             return Err(ConversationError::Forbidden {
                 reason: "Codex history deletion requires the interactive local owner".into(),
             });
         }
         let _lifecycle = self.runtime_state.lock_lifecycle(id).await?;
-        let row = self.owned_delete_row(user_id, id).await?;
+        let row = self.require_conversation(user_id, id).await?;
         let deletion = self
             .codex_history_deletion
             .as_ref()
@@ -105,12 +104,10 @@ impl ConversationService {
         self.delete_local(user_id, id).await
     }
 
-    pub(super) async fn reject_pending_codex_delete(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
-        if user_id == LOCAL_OWNER
-            && self
-                .acp_session_repo
-                .is_codex_history_deletion_pending(user_id, id)
-                .await?
+    pub(super) async fn reject_pending_codex_delete(&self, row: &ConversationRow) -> Result<(), ConversationError> {
+        if row.user_id == SYSTEM_DEFAULT_USER_ID
+            && row.r#type == AgentType::Acp.serde_name()
+            && self.pending_codex_delete(row).await?
         {
             return Err(ConversationError::Busy {
                 reason: "Codex history deletion is pending".into(),
@@ -119,11 +116,11 @@ impl ConversationService {
         Ok(())
     }
 
-    async fn owned_delete_row(&self, user_id: &str, id: &str) -> Result<ConversationRow, ConversationError> {
-        self.conversation_repo
-            .get(user_id, id)
+    async fn pending_codex_delete(&self, row: &ConversationRow) -> Result<bool, ConversationError> {
+        self.acp_session_repo
+            .codex_history_deletion_pending(&row.user_id, &row.id)
             .await?
-            .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })
+            .ok_or_else(|| ConversationError::NotFound { id: row.id.clone() })
     }
 }
 
@@ -134,7 +131,7 @@ fn unavailable() -> ConversationError {
 }
 
 fn eligible_row(row: &ConversationRow) -> bool {
-    row.r#type == "acp"
+    row.r#type == AgentType::Acp.serde_name()
         && row.source.as_deref() == Some("aionui")
         && row.channel_chat_id.is_none()
         && serde_json::from_str::<Value>(&row.extra).is_ok_and(|extra| standalone(&extra))

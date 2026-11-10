@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use aionui_app::{AppConfig, AppServices, create_router};
+use aionui_auth::SYSTEM_DEFAULT_USER_ID as OWNER;
+use aionui_conversation::ConversationError;
 use aionui_conversation::service::CodexHistoryDeletion;
 use aionui_db::{IAcpSessionRepository, SqliteAcpSessionRepository, init_database_memory};
 use axum::http::StatusCode;
@@ -14,7 +16,6 @@ use tower::ServiceExt;
 use common::{body_json, delete_with_token, get_with_token, json_with_token, setup_and_login};
 
 const THREAD: &str = "00000000-0000-4000-8000-000000000001";
-const OWNER: &str = "system_default_user";
 
 #[derive(Default)]
 struct CodexDeleteProbe {
@@ -85,6 +86,7 @@ async fn failed_codex_and_local_deletion_resume_at_the_correct_stage() {
     let id = create_bound(&app, &services, &token, &csrf, temp.path()).await;
     let uri = format!("/api/conversations/{id}");
     let both = format!("{uri}/with-codex-history");
+    let stale_row = services.conversation_repo.get(OWNER, &id).await.unwrap().unwrap();
     let pool = services.database.pool().clone();
     sqlx::query("INSERT INTO messages (id, conversation_id, type, created_at) VALUES ('msg-retained', ?, 'text', 1)")
         .bind(&id)
@@ -159,6 +161,13 @@ async fn failed_codex_and_local_deletion_resume_at_the_correct_stage() {
     let response = app.oneshot(delete_with_token(&both, &token, &csrf)).await.unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        services
+            .conversation_service
+            .build_task_options_for_runtime(&stale_row, None)
+            .await,
+        Err(ConversationError::NotFound { id: missing }) if missing == id
+    ));
 }
 
 #[tokio::test]

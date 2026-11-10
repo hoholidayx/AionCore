@@ -18,7 +18,7 @@ use crate::validation::{validate_password, validate_username};
 /// [`set_local_password`] runs without an explicit username — the fresh-deploy
 /// bootstrap path. Also the single row that carries the process-wide JWT
 /// secret, so [`crate::secret`] provisioning targets the same id.
-pub(crate) const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
+pub const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
 
 /// Which account [`set_local_password`] acted on, so callers can report the
 /// result without re-querying. Carries no secret material (never the password

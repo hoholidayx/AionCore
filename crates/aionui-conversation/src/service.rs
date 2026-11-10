@@ -2382,12 +2382,8 @@ impl ConversationService {
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<ConversationResponse, ConversationError> {
         let _lifecycle = self.runtime_state.lock_lifecycle(id).await?;
-        self.reject_pending_codex_delete(user_id, id).await?;
-        let existing = self
-            .conversation_repo
-            .get(user_id, id)
-            .await?
-            .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
+        let existing = self.require_conversation(user_id, id).await?;
+        self.reject_pending_codex_delete(&existing).await?;
 
         let existing_type: AgentType = string_to_enum(&existing.r#type)?;
 
@@ -2760,13 +2756,15 @@ impl ConversationService {
         self.delete_local(user_id, id).await
     }
 
-    async fn delete_local(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
-        // Get existing to retrieve source for broadcast and verify ownership
-        let existing = self
-            .conversation_repo
+    async fn require_conversation(&self, user_id: &str, id: &str) -> Result<ConversationRow, ConversationError> {
+        self.conversation_repo
             .get(user_id, id)
             .await?
-            .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
+            .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })
+    }
+
+    async fn delete_local(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
+        let existing = self.require_conversation(user_id, id).await?;
 
         let source: Option<ConversationSource> = existing
             .source
@@ -2895,12 +2893,8 @@ impl ConversationService {
         req: ForkConversationRequest,
     ) -> Result<ConversationResponse, ConversationError> {
         let _lifecycle = self.runtime_state.lock_lifecycle(id).await?;
-        self.reject_pending_codex_delete(user_id, id).await?;
-        let parent = self
-            .conversation_repo
-            .get(user_id, id)
-            .await?
-            .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
+        let parent = self.require_conversation(user_id, id).await?;
+        self.reject_pending_codex_delete(&parent).await?;
 
         if team_id_from_extra(&parent.extra).is_some() {
             return Err(ConversationError::Forbidden {
@@ -3231,12 +3225,8 @@ impl ConversationService {
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
     pub async fn reset(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
         let _lifecycle = self.runtime_state.lock_lifecycle(id).await?;
-        self.reject_pending_codex_delete(user_id, id).await?;
-        // Verify existence and ownership
-        self.conversation_repo
-            .get(user_id, id)
-            .await?
-            .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
+        let row = self.require_conversation(user_id, id).await?;
+        self.reject_pending_codex_delete(&row).await?;
 
         // Delete all messages
         self.conversation_repo
@@ -4187,7 +4177,7 @@ impl ConversationService {
             let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
             (turn_id, turn_claim)
         };
-        self.reject_pending_codex_delete(user_id, conversation_id).await?;
+        self.reject_pending_codex_delete(&row).await?;
 
         // Store user message. `msg_id` is server-generated so the WebSocket
         // stream, DB row, and client-side message index all agree on the same
@@ -4343,8 +4333,7 @@ impl ConversationService {
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(&request.conversation_id, &turn_id)?;
-        self.reject_pending_codex_delete(&request.user_id, &request.conversation_id)
-            .await?;
+        self.reject_pending_codex_delete(&row).await?;
         if request.persist_user_message {
             let user_msg_id = Self::mint_msg_id();
             let user_msg = aionui_db::models::MessageRow {
@@ -4384,7 +4373,7 @@ impl ConversationService {
             .await;
         }
 
-        let mut build_opts = match self.build_task_options(&row).await {
+        let mut build_opts = match self.build_task_options_for_session(&row, None, false).await {
             Ok(opts) => opts,
             Err(err) => {
                 let top_level_code = err.error_code();
@@ -4756,14 +4745,8 @@ impl ConversationService {
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<EnsureConversationRuntimeResponse, ConversationError> {
         let _lifecycle = self.runtime_state.lock_lifecycle(conversation_id).await?;
-        self.reject_pending_codex_delete(user_id, conversation_id).await?;
-        let row = self
-            .conversation_repo
-            .get(user_id, conversation_id)
-            .await?
-            .ok_or_else(|| ConversationError::NotFound {
-                id: conversation_id.to_owned(),
-            })?;
+        let row = self.require_conversation(user_id, conversation_id).await?;
+        self.reject_pending_codex_delete(&row).await?;
         if let Some(team_id) = team_id_from_extra(&row.extra) {
             info!(
                 conversation_id,
@@ -4804,14 +4787,8 @@ impl ConversationService {
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<EnsureConversationRuntimeResponse, ConversationError> {
         let lifecycle = self.runtime_state.lock_lifecycle(conversation_id).await?;
-        self.reject_pending_codex_delete(user_id, conversation_id).await?;
-        let row = self
-            .conversation_repo
-            .get(user_id, conversation_id)
-            .await?
-            .ok_or_else(|| ConversationError::NotFound {
-                id: conversation_id.to_owned(),
-            })?;
+        let row = self.require_conversation(user_id, conversation_id).await?;
+        self.reject_pending_codex_delete(&row).await?;
         if let Some(team_id) = team_id_from_extra(&row.extra) {
             info!(
                 conversation_id,
@@ -5039,6 +5016,7 @@ impl ConversationService {
         row: &ConversationRow,
         workspace_override: Option<&str>,
     ) -> Result<BuildTaskOptions, ConversationError> {
+        self.reject_pending_codex_delete(row).await?;
         self.build_task_options_for_session(row, workspace_override, false)
             .await
     }
@@ -5049,7 +5027,6 @@ impl ConversationService {
         workspace_override: Option<&str>,
         end_user_session: bool,
     ) -> Result<BuildTaskOptions, ConversationError> {
-        self.reject_pending_codex_delete(&row.user_id, &row.id).await?;
         reject_deprecated_runtime_row(row)?;
         let is_aionrs = row.r#type == AgentType::Aionrs.serde_name();
         let snapshot = if is_aionrs {

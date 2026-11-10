@@ -301,14 +301,15 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         Ok(result.rows_affected() == 1)
     }
 
-    async fn is_codex_history_deletion_pending(&self, user_id: &str, id: &str) -> Result<bool, DbError> {
+    async fn codex_history_deletion_pending(&self, user_id: &str, id: &str) -> Result<Option<bool>, DbError> {
         Ok(sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM acp_session a JOIN conversations c ON c.id = a.conversation_id
-                            WHERE c.id = ? AND c.user_id = ? AND a.codex_delete_phase <> 'ready')",
+            "SELECT COALESCE(a.codex_delete_phase <> 'ready', 0)
+             FROM conversations c LEFT JOIN acp_session a ON a.conversation_id = c.id
+             WHERE c.id = ? AND c.user_id = ?",
         )
         .bind(id)
         .bind(user_id)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await?)
     }
 

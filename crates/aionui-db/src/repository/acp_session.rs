@@ -104,8 +104,9 @@ pub trait IAcpSessionRepository: Send + Sync {
         Ok(false)
     }
 
-    async fn is_codex_history_deletion_pending(&self, _user_id: &str, _id: &str) -> Result<bool, DbError> {
-        Ok(false)
+    /// Returns `None` if the owner no longer has the conversation.
+    async fn codex_history_deletion_pending(&self, _user_id: &str, _id: &str) -> Result<Option<bool>, DbError> {
+        Ok(Some(false))
     }
 
     /// Fetch the full row only when the owning conversation belongs to `user_id`.

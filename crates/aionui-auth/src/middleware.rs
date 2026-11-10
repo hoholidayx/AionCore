@@ -11,6 +11,7 @@ use aionui_common::ApiError;
 use aionui_db::{IUserRepository, UserStatus, UserType};
 
 use crate::JwtService;
+use crate::account::SYSTEM_DEFAULT_USER_ID;
 use crate::extract::extract_token_from_headers;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,8 +66,8 @@ pub struct LocalUserSession;
 impl CurrentUser {
     pub fn local_default() -> Self {
         Self {
-            id: "system_default_user".to_string(),
-            username: "system_default_user".to_string(),
+            id: SYSTEM_DEFAULT_USER_ID.to_owned(),
+            username: SYSTEM_DEFAULT_USER_ID.to_owned(),
             user_type: UserType::Local,
             status: UserStatus::Active,
         }

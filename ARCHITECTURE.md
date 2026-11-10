@@ -274,6 +274,12 @@ layer removes the inline `result` while retaining small structured fields such a
 already stored on disk, the tool status is normalized to `completed`. Clients load
 the image from its file path on demand and must not depend on inline base64.
 
+### Optional Codex History Deletion
+
+Single-conversation deletion can also remove the associated Codex history when the authenticated WebUI default account explicitly requests it. The ACP binding records the thread ID and canonical Codex data directory from the built-in agent's fresh app-server handshake. Existing, imported, and shared threads are ineligible.
+
+The conversation service serializes deletion with runtime changes and reuses its ordinary local cleanup after Codex confirms the deletion. The ACP binding persists the request and confirmation so a retry can resume after a restart. A separate management connection uses the registered process spawner and checks the Codex data directory before sending `thread/delete`. See the [real app-server integration test](crates/aionui-session/src/backend/codex_history_test.rs) for the protocol and the [HTTP integration tests](crates/aionui-app/tests/codex_history_e2e.rs) for authorization and partial failures.
+
 ## Data Layer
 
 ### Repository Trait Pattern
