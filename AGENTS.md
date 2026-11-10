@@ -154,7 +154,7 @@ New subprocess spawn sites must go through `aionui_runtime`'s spawn Builder — 
 
 Always use `just push` instead of `git push`.
 It runs the full pre-push gate (migration check, lint, format, tests) before pushing, preventing CI failures.
-Supports the same arguments as `git push` (e.g. `just push -u origin feat/branch`).
+In the owner's Aion workspace, commit on local `main` by default. When the user requests a push, verify that `origin` is the owner's repository and run `just push origin main`. Use a feature branch or pull request only when requested.
 
 ### Add Endpoint to Existing Crate
 
