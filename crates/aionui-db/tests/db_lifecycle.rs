@@ -1,8 +1,12 @@
+use std::path::Path;
+
 use aionui_db::{
     DatabaseInitOptions, init_database, init_database_memory, init_database_staged_with_options,
-    init_database_with_options, maybe_copy_legacy_database,
+    init_database_with_options, maybe_copy_legacy_database, models::AcpSessionRow,
 };
 use sqlx::Row;
+use sqlx::migrate::Migrator;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 // -- T1.1 Initialization --
 
@@ -106,6 +110,71 @@ async fn migrations_applied() {
         .unwrap();
 
     assert!(count.0 >= 1, "at least one migration should be applied");
+}
+
+#[tokio::test]
+async fn upgrading_v52_removes_only_orphaned_acp_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aionui-backend.db");
+    let options = SqliteConnectOptions::new()
+        .filename(&path)
+        .create_if_missing(true)
+        .foreign_keys(false)
+        .pragma("legacy_alter_table", "ON");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let mut migrator = Migrator::new(Path::new("migrations")).await.unwrap();
+    migrator.migrations.to_mut().retain(|migration| migration.version <= 52);
+    migrator.run(&pool).await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON").execute(&pool).await.unwrap();
+
+    sqlx::raw_sql(
+        "INSERT INTO users (id, username, password_hash, created_at, updated_at) VALUES
+             ('owner-a', 'alice', 'hash', 1, 1), ('owner-b', 'bob', 'hash', 1, 1);
+         INSERT INTO conversations (id, user_id, name, type, created_at, updated_at, archived_at) VALUES
+             ('active', 'owner-a', 'Active', 'acp', 1, 1, NULL),
+             ('archived', 'owner-b', 'Archived', 'acp', 1, 1, 2),
+             ('deleted', 'owner-a', 'Deleted', 'acp', 1, 1, NULL);
+         INSERT INTO acp_session
+             (conversation_id, agent_source, agent_id, session_id, session_status, session_config, last_active_at)
+         VALUES ('active', 'builtin', 'agent-a', 'anchor-a', 'running', '{\"runtime\":{}}', 9),
+                ('archived', 'custom', 'agent-b', NULL, 'suspended', '{}', 8),
+                ('deleted', 'builtin', 'agent-a', 'anchor-old', 'idle', '{}', 7),
+                ('missing', 'custom', 'agent-b', NULL, 'idle', '{}', NULL);
+         DELETE FROM conversations WHERE id = 'deleted';",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let all_bindings = "SELECT * FROM acp_session ORDER BY conversation_id";
+    let mut before = sqlx::query_as::<_, AcpSessionRow>(all_bindings)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(before.len(), 4);
+    before.retain(|binding| matches!(binding.conversation_id.as_str(), "active" | "archived"));
+    pool.close().await;
+
+    let db = init_database(&path).await.unwrap();
+    let after = sqlx::query_as::<_, AcpSessionRow>(all_bindings)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(after).unwrap(),
+        serde_json::to_value(before).unwrap()
+    );
+    let applied: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = 53 AND success)")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(applied);
+    db.close().await;
 }
 
 // -- T1.5 System default user --
