@@ -43,6 +43,8 @@ async fn codex_image_is_served_only_to_the_message_owner() {
     std::fs::write(&path, &png).unwrap();
     let invalid = image_dir.join("invalid.png");
     std::fs::write(&invalid, b"<svg onload='alert(1)'>").unwrap();
+    let mismatched = image_dir.join("mismatched.png");
+    std::fs::write(&mismatched, b"\xff\xd8\xff\xe0").unwrap();
     let oversized = image_dir.join("oversized.png");
     let file = std::fs::File::create(&oversized).unwrap();
     file.set_len(33 * 1024 * 1024).unwrap();
@@ -84,6 +86,7 @@ async fn codex_image_is_served_only_to_the_message_owner() {
         row("text", "text", "finish", content(&path)),
         row("unfinished", "tool_call", "work", content(&path)),
         row("invalid", "tool_call", "finish", content(&invalid)),
+        row("mismatched", "tool_call", "finish", content(&mismatched)),
         row("oversized", "tool_call", "finish", content(&oversized)),
         row(
             "missing",

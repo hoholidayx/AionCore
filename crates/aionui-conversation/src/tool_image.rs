@@ -2,6 +2,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::path::{Component, Path};
 
+use aion_types::message::detect_image_media_type;
+
 const MAX_TOOL_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 
 pub(crate) struct ToolImage {
@@ -38,12 +40,12 @@ pub(crate) fn read_tool_image_file(path: &Path, mime_type: &str) -> Option<ToolI
     if bytes.len() as u64 > MAX_TOOL_IMAGE_BYTES {
         return None;
     }
-    let mime_type = match mime_type {
-        "image/png" if bytes.starts_with(b"\x89PNG\r\n\x1a\n") => "image/png",
-        "image/jpeg" if bytes.starts_with(b"\xff\xd8\xff") => "image/jpeg",
-        "image/gif" if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") => "image/gif",
-        "image/webp" if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") => "image/webp",
-        _ => return None,
-    };
-    Some(ToolImage { mime_type, bytes })
+    let detected_mime_type = detect_image_media_type(&bytes)?;
+    if detected_mime_type != mime_type {
+        return None;
+    }
+    Some(ToolImage {
+        mime_type: detected_mime_type,
+        bytes,
+    })
 }

@@ -570,6 +570,7 @@ version = "0.2.2"
 dependencies = [
  "aion-config",
  "aion-mcp",
+ "aion-types",
  "aionui-ai-agent",
  "aionui-api-types",
  "aionui-auth",

@@ -565,6 +565,7 @@ mod tests {
     #[test]
     fn codex_image_tool_update_detects_image_mime_types_from_saved_path() {
         let cases = [
+            ("photo.png", "image/png", "iVBORw0KGgo"),
             ("photo.jpg", "image/jpeg", "/9j/"),
             ("photo.webp", "image/webp", "UklGR"),
             ("photo.gif", "image/gif", "data:image/gif;base64,"),
@@ -590,6 +591,26 @@ mod tests {
             assert_eq!(json["data"]["update"]["rawOutput"]["image"]["mime_type"], expected_mime);
             assert!(json["data"]["update"]["rawOutput"].get("result").is_none());
         }
+    }
+
+    #[test]
+    fn codex_image_tool_update_accepts_mixed_case_extension_without_inline_result() {
+        let saved_path = "/tmp/result.JpEg";
+        let notif = SessionNotification::new(
+            "sess-1",
+            SessionUpdate::ToolCallUpdate(SdkToolCallUpdate::new(
+                "ig_saved_path",
+                ToolCallUpdateFields::new().raw_output(json!({"saved_path": saved_path})),
+            )),
+        );
+
+        let events = session_notification_to_events(&notif);
+        let json = serde_json::to_value(&events[0]).unwrap();
+        let raw_output = &json["data"]["update"]["rawOutput"];
+
+        assert_eq!(raw_output["image"]["path"], saved_path);
+        assert_eq!(raw_output["image"]["mime_type"], "image/jpeg");
+        assert!(raw_output.get("result_omitted").is_none());
     }
 
     #[test]

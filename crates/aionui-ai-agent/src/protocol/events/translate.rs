@@ -3,6 +3,7 @@ use agent_client_protocol::schema::v1::{
     SessionNotification, SessionUpdate, ToolCallContent as SdkToolCallContent, ToolCallLocation as SdkToolCallLocation,
     ToolCallStatus as SdkToolCallStatus, ToolCallUpdate as SdkToolCallUpdate, ToolKind as SdkToolKind,
 };
+use aion_types::message::extension_to_image_media_type;
 use tracing::debug;
 
 use super::permission::{
@@ -179,6 +180,10 @@ fn sanitize_inline_image_result(value: &mut serde_json::Value) {
         .and_then(|v| v.as_str())
         .filter(|path| !path.is_empty())
         .map(str::to_owned);
+    let saved_mime_type = saved_path
+        .as_deref()
+        .and_then(|path| path.rsplit_once('.'))
+        .and_then(|(_, extension)| extension_to_image_media_type(extension));
     // Strip any oversized inline-image `result` regardless of whether the image was
     // saved to disk. Older codex versions and interrupted/failed generations may emit
     // the multi-MB base64 without a `saved_path`; that payload must never reach the
@@ -192,9 +197,9 @@ fn sanitize_inline_image_result(value: &mut serde_json::Value) {
 
     if !should_omit {
         if obj.get("image").is_none()
-            && let Some(path) = saved_path.as_deref().filter(|path| is_probably_image_path(path))
+            && let (Some(path), Some(mime_type)) = (saved_path.as_deref(), saved_mime_type)
         {
-            insert_image_output(obj, path);
+            insert_image_output(obj, path, mime_type);
         }
         return;
     }
@@ -212,7 +217,8 @@ fn sanitize_inline_image_result(value: &mut serde_json::Value) {
     );
 
     if let Some(path) = saved_path {
-        insert_image_output(obj, &path);
+        // Preserve the PNG fallback for legacy output without a recognized suffix.
+        insert_image_output(obj, &path, saved_mime_type.unwrap_or("image/png"));
     }
 }
 
@@ -224,30 +230,7 @@ fn is_probably_inline_image_result(value: &str) -> bool {
             || value.starts_with("data:image/"))
 }
 
-fn mime_type_from_image_path(path: &str) -> &'static str {
-    let lower = path.to_ascii_lowercase();
-    if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-        "image/jpeg"
-    } else if lower.ends_with(".webp") {
-        "image/webp"
-    } else if lower.ends_with(".gif") {
-        "image/gif"
-    } else {
-        "image/png"
-    }
-}
-
-fn is_probably_image_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.ends_with(".png")
-        || lower.ends_with(".jpg")
-        || lower.ends_with(".jpeg")
-        || lower.ends_with(".webp")
-        || lower.ends_with(".gif")
-}
-
-fn insert_image_output(obj: &mut serde_json::Map<String, serde_json::Value>, path: &str) {
-    let mime_type = mime_type_from_image_path(path);
+fn insert_image_output(obj: &mut serde_json::Map<String, serde_json::Value>, path: &str, mime_type: &str) {
     obj.insert(
         "image".to_owned(),
         serde_json::json!({

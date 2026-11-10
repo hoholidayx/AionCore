@@ -16,6 +16,7 @@ aionui-mcp.workspace = true
 aionui-runtime.workspace = true
 aion-config.workspace = true
 aion-mcp.workspace = true
+aion-types.workspace = true
 axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
