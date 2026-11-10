@@ -127,14 +127,20 @@ pub struct AssistantService {
     provider_repo: Arc<dyn IProviderRepository>,
     builtin: Arc<BuiltinAssistantRegistry>,
     agent_catalog: Option<Arc<dyn AssistantAgentCatalogPort>>,
-    mem0_profile_exists: Option<Box<Mem0ProfileLookup>>,
+    mem0_profile_lookup: Option<Box<Mem0ProfileLookup>>,
     event_broadcaster: RwLock<Option<Arc<dyn EventBroadcaster>>>,
     /// Root directory holding user-authored rule/skill md files and avatars.
     /// Defaults to `~/.aionui/` but can be overridden for tests.
     user_data_dir: PathBuf,
 }
 
-type Mem0ProfileLookup = dyn Fn(&str, &str) -> bool + Send + Sync;
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mem0ProfileKind {
+    Automatic,
+    Explicit,
+}
+
+type Mem0ProfileLookup = dyn Fn(&str, &str) -> Option<Mem0ProfileKind> + Send + Sync;
 
 pub struct AssistantServiceDeps {
     pub definition_repo: Arc<dyn IAssistantDefinitionRepository>,
@@ -196,21 +202,24 @@ impl AssistantService {
             provider_repo,
             builtin,
             agent_catalog,
-            mem0_profile_exists: None,
+            mem0_profile_lookup: None,
             event_broadcaster: RwLock::new(None),
             user_data_dir,
         }
     }
 
-    pub fn with_mem0_profile_lookup(mut self, lookup: impl Fn(&str, &str) -> bool + Send + Sync + 'static) -> Self {
-        self.mem0_profile_exists = Some(Box::new(lookup));
+    pub fn with_mem0_profile_lookup(
+        mut self,
+        lookup: impl Fn(&str, &str) -> Option<Mem0ProfileKind> + Send + Sync + 'static,
+    ) -> Self {
+        self.mem0_profile_lookup = Some(Box::new(lookup));
         self
     }
 
-    fn has_mem0_profile(&self, user_id: &str, definition_id: &str) -> bool {
-        self.mem0_profile_exists
+    fn mem0_profile(&self, user_id: &str, definition_id: &str) -> Option<Mem0ProfileKind> {
+        self.mem0_profile_lookup
             .as_ref()
-            .is_some_and(|lookup| lookup(user_id, definition_id))
+            .and_then(|lookup| lookup(user_id, definition_id))
     }
 
     pub fn with_event_broadcaster(&self, broadcaster: Arc<dyn EventBroadcaster>) {
@@ -1103,7 +1112,7 @@ impl AssistantService {
         definition: &AssistantDefinitionRow,
         requested_agent_id: Option<&str>,
     ) -> Result<(), AssistantError> {
-        if !self.has_mem0_profile(user_id, &definition.id) {
+        if self.mem0_profile(user_id, &definition.id).is_none() {
             return Err(AssistantError::BadRequest(
                 "No Mem0 profile is configured for this assistant".into(),
             ));
@@ -1132,7 +1141,7 @@ impl AssistantService {
         preference: Option<bool>,
     ) -> Result<(), AssistantError> {
         if let Some(enabled) = preference {
-            if enabled && !self.has_mem0_profile(user_id, &definition.id) {
+            if enabled && self.mem0_profile(user_id, &definition.id).is_none() {
                 return Err(AssistantError::BadRequest(
                     "No Mem0 profile is configured for this assistant".into(),
                 ));
@@ -1377,23 +1386,27 @@ impl AssistantService {
                 let sort_order = existing.as_ref().map(|o| o.sort_order).unwrap_or(0);
                 let last_used_at = existing.as_ref().and_then(|o| o.last_used_at);
                 let mut requested_agent_id = req.agent_id.as_deref().map(|agent_id| agent_id.trim().to_string());
-                let current_agent_id = self
+                let overlay = self
                     .state_repo
                     .get_for_user(user_id, &definition.id)
                     .await
-                    .map_err(|e| AssistantError::Internal(format!("get assistant overlay: {e}")))?
-                    .and_then(|row| row.agent_id_override)
-                    .unwrap_or_else(|| definition.agent_id.clone());
+                    .map_err(|e| AssistantError::Internal(format!("get assistant overlay: {e}")))?;
+                let current_agent_id = overlay
+                    .as_ref()
+                    .and_then(|row| row.agent_id_override.as_deref())
+                    .unwrap_or(&definition.agent_id);
                 if let Some(requested_agent_id) = requested_agent_id.as_deref() {
                     self.resolve_runtime_backend_for_agent_id(user_id, requested_agent_id)
                         .await?;
                 }
                 let global_builtin = definition.owner_type == "system";
-                let preserve_mem0_scope =
-                    global_builtin && (mem0_preference.is_some() || self.has_mem0_profile(user_id, &definition.id));
+                let preserve_mem0_scope = global_builtin
+                    && (mem0_preference.is_some()
+                        || self.mem0_profile(user_id, &definition.id) == Some(Mem0ProfileKind::Explicit)
+                        || overlay.as_ref().is_some_and(|row| row.mem0_memory_enabled));
                 if preserve_mem0_scope && let Some(requested_id) = requested_agent_id.as_deref() {
                     let requested = resolve_agent_binding_for_user(&self.pool, user_id, requested_id).await?;
-                    let current = resolve_agent_binding_for_user(&self.pool, user_id, &current_agent_id).await?;
+                    let current = resolve_agent_binding_for_user(&self.pool, user_id, current_agent_id).await?;
                     if requested == current {
                         requested_agent_id = None;
                     }
@@ -2877,7 +2890,7 @@ impl AssistantService {
                     .transpose()?,
                 mem0_memory_enabled: state.is_some_and(|row| row.mem0_memory_enabled),
                 mem0_memory_configured: projection.mem0_engine_supported
-                    && self.has_mem0_profile(user_id, &definition.id),
+                    && self.mem0_profile(user_id, &definition.id).is_some(),
             },
             capabilities: AssistantCapabilitiesResponse {
                 default_skill_ids,
@@ -7463,7 +7476,9 @@ mod tests {
         assert!(matches!(error, AssistantError::BadRequest(message) if message.contains("No Mem0 profile")));
 
         let definition_id = definition.id.clone();
-        fx.service.mem0_profile_exists = Some(Box::new(move |user, id| user == DEFAULT_USER_ID && id == definition_id));
+        fx.service.mem0_profile_lookup = Some(Box::new(move |user, id| {
+            (user == DEFAULT_USER_ID && id == definition_id).then_some(Mem0ProfileKind::Explicit)
+        }));
         let mut wrong_engine = set_mem0(true);
         wrong_engine.agent_id = Some("claude".into());
         let error = fx.service.update("mine", wrong_engine).await.unwrap_err();
@@ -7502,7 +7517,7 @@ mod tests {
             AssistantError::BadRequest(message) if message.contains("No Mem0 profile")
         ));
 
-        fx.service.mem0_profile_exists = None;
+        fx.service.mem0_profile_lookup = None;
         assert!(get_defaults(&fx.service).await.mem0_memory_enabled);
         fx.service.update("mine", set_mem0(false)).await.unwrap();
         assert!(!get_defaults(&fx.service).await.mem0_memory_enabled);

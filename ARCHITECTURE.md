@@ -715,24 +715,22 @@ The conversation stores user overrides and the applied revision for each compone
 
 ### Assistant Long-Term Memory
 
-Authenticated WebUI conversations using AionRS can opt in to Mem0 in the assistant's MCP settings. The assistant overlay defaults to disabled. The host resolves the authenticated user and persisted assistant definition before granting the capability. Use separate NAS bearer profiles for distinct user and assistant pairs. Each profile should bind a distinct long-term namespace, without a session ID or bulk deletion permission.
+Authenticated WebUI conversations using AionRS can opt in to Mem0 in the assistant's MCP settings. The assistant overlay defaults to disabled. AionCore resolves the authenticated user and persisted assistant definition before granting the capability. One service bearer authenticates AionCore to the MCP. For each connection AionCore sets `X-Mem0-User-Id` to `aion-user-<user-id>` and `X-Mem0-Agent-Id` to `aion-assistant-<assistant-definition-id>`. The MCP trusts AionCore to supply these IDs and scopes each operation to that pair. Tool arguments cannot set the IDs. The service connection grants long-term memory without session access or bulk deletion.
+
+The standalone Web CLI selects authenticated WebUI mode with `AIONUI_ALLOW_REMOTE=1`. With `AIONUI_ALLOW_REMOTE=0` it uses the embedded local identity mode and the Mem0 configuration is unavailable.
 
 Create `mem0-mcp.json` in the effective AionCore data directory with mode `0600` on Unix. AionCore loads it at startup. Keep it outside agent workspaces. The file uses this format.
 
 ```json
 {
   "url": "http://127.0.0.1:8889/mcp",
-  "profiles": [
-    {
-      "user_id": "aion-user-id",
-      "assistant_definition_id": "assistant-definition-id",
-      "bearer": "replace-with-the-NAS-role-bearer"
-    }
-  ]
+  "service_bearer": "replace-with-the-shared-service-bearer"
 }
 ```
 
-Set the URL to the trusted MCP endpoint. AionCore uses direct Streamable HTTP with redirects disabled. It keeps the bearer out of the generic MCP registry, prompts, and agent runtime environment. Import the Memory Triage Skill separately and select it for each assistant through the existing Skills setting.
+Set the same `service_bearer` on the trusted MCP endpoint. AionCore uses direct Streamable HTTP with redirects disabled. It keeps the bearer out of the generic MCP registry, prompts, and agent runtime environment. Import the Memory Triage Skill separately and select it for each assistant through the existing Skills setting.
+
+When migrating a role with stored memories, add an optional `namespace_aliases` array to the service configuration. Each entry contains `user_id`, `assistant_definition_id`, `mem0_user_id`, and `mem0_agent_id`. The first pair identifies the assistant in Aion. The second pair is the legacy Mem0 namespace. Each alias must target a unique pair outside the automatic namespace prefix pair. Both Mem0 IDs must contain 1–128 ASCII letters, digits, underscores, or hyphens. Legacy AionCore `profiles` configurations still use role-specific bearers and work with an MCP that has matching profiles. Use either `service_bearer` with optional aliases or `profiles` in the AionCore configuration.
 
 Use the assistant ID returned by `GET /api/assistants` to find the persisted definition ID. For a local Web installation, open `~/.aionui-web/aionui-backend.db` with `sqlite3 -readonly` and substitute the values in these queries.
 

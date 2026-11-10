@@ -475,9 +475,16 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
             services.data_dir.clone(),
         )
         .with_mem0_profile_lookup(move |user_id, definition_id| {
-            mem0_config
-                .as_ref()
-                .is_some_and(|config| config.has_profile(user_id, definition_id))
+            use aionui_assistant::service::Mem0ProfileKind;
+
+            let config = mem0_config.as_ref()?;
+            if config.has_explicit_namespace(user_id, definition_id) {
+                Some(Mem0ProfileKind::Explicit)
+            } else {
+                config
+                    .has_profile(user_id, definition_id)
+                    .then_some(Mem0ProfileKind::Automatic)
+            }
         }),
     );
     service.with_event_broadcaster(services.event_bus.clone());

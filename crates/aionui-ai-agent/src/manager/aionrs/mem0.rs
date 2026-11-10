@@ -182,13 +182,15 @@ impl Mem0Client {
     }
 
     async fn connect(&self) -> Result<McpManager, ()> {
+        let mut headers = HashMap::from([("Authorization".into(), format!("Bearer {}", self.binding.bearer()))]);
+        if let Some((user_id, agent_id)) = self.binding.namespace() {
+            headers.insert("X-Mem0-User-Id".into(), user_id.into());
+            headers.insert("X-Mem0-Agent-Id".into(), agent_id.into());
+        }
         let config = McpServerConfig {
             transport: TransportType::StreamableHttp,
             url: Some(self.binding.url().to_string()),
-            headers: Some(HashMap::from([(
-                "Authorization".into(),
-                format!("Bearer {}", self.binding.bearer()),
-            )])),
+            headers: Some(headers),
             command: None,
             args: None,
             env: None,

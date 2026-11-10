@@ -1,4 +1,4 @@
-//! Host-private Mem0 endpoint and assistant credentials.
+//! Host-private Mem0 endpoint, credentials, and assistant namespaces.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -19,10 +19,29 @@ use serde::Deserialize;
 use url::{Host, Url};
 
 const MAX_CONFIG_BYTES: u64 = 128 * 1024;
+const USER_NAMESPACE_PREFIX: &str = "aion-user-";
+const ASSISTANT_NAMESPACE_PREFIX: &str = "aion-assistant-";
+const MAX_NAMESPACE_ID_BYTES: usize = 128;
+
+type AssistantKey = (String, String);
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Mem0Namespace {
+    user_id: String,
+    agent_id: String,
+}
+
+enum Credentials {
+    Legacy(HashMap<AssistantKey, Arc<str>>),
+    Service {
+        bearer: Arc<str>,
+        aliases: HashMap<AssistantKey, Mem0Namespace>,
+    },
+}
 
 pub struct Mem0Config {
     url: Arc<Url>,
-    profiles: HashMap<(String, String), Arc<str>>,
+    credentials: Credentials,
 }
 
 pub struct Mem0Repositories {
@@ -45,13 +64,19 @@ pub enum Mem0ConfigError {
     Endpoint,
     #[error("invalid or duplicate Mem0 profile")]
     Profile,
+    #[error("invalid Mem0 service bearer")]
+    ServiceBearer,
+    #[error("invalid or conflicting Mem0 namespace alias")]
+    NamespaceAlias,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
     url: String,
-    profiles: Vec<ProfileFile>,
+    profiles: Option<Vec<ProfileFile>>,
+    service_bearer: Option<String>,
+    namespace_aliases: Option<Vec<NamespaceAliasFile>>,
 }
 
 #[derive(Deserialize)]
@@ -60,6 +85,15 @@ struct ProfileFile {
     user_id: String,
     assistant_definition_id: String,
     bearer: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NamespaceAliasFile {
+    user_id: String,
+    assistant_definition_id: String,
+    mem0_user_id: String,
+    mem0_agent_id: String,
 }
 
 impl Mem0Config {
@@ -83,35 +117,39 @@ impl Mem0Config {
             return Err(Mem0ConfigError::Schema);
         }
         let file: ConfigFile = serde_json::from_slice(&bytes).map_err(|_| Mem0ConfigError::Schema)?;
+        Self::from_file(file).map(Some)
+    }
+
+    fn from_file(file: ConfigFile) -> Result<Self, Mem0ConfigError> {
         let url = parse_endpoint(&file.url).ok_or(Mem0ConfigError::Endpoint)?;
-        let mut profiles = HashMap::new();
-        let mut bearers = HashSet::new();
-        for profile in file.profiles {
-            if !valid_id(&profile.user_id)
-                || !valid_id(&profile.assistant_definition_id)
-                || !(24..=256).contains(&profile.bearer.len())
-                || !profile.bearer.bytes().all(|byte| byte.is_ascii_graphic())
-            {
-                return Err(Mem0ConfigError::Profile);
-            }
-            let bearer: Arc<str> = Arc::from(profile.bearer);
-            if !bearers.insert(bearer.clone())
-                || profiles
-                    .insert((profile.user_id, profile.assistant_definition_id), bearer)
-                    .is_some()
-            {
-                return Err(Mem0ConfigError::Profile);
-            }
-        }
-        Ok(Some(Self {
+        let credentials = match (file.profiles, file.service_bearer, file.namespace_aliases) {
+            (Some(profiles), None, None) => Credentials::Legacy(load_profiles(profiles)?),
+            (None, Some(bearer), aliases) if valid_bearer(&bearer) => Credentials::Service {
+                bearer: Arc::from(bearer),
+                aliases: load_namespace_aliases(aliases.unwrap_or_default())?,
+            },
+            (None, Some(_), _) => return Err(Mem0ConfigError::ServiceBearer),
+            _ => return Err(Mem0ConfigError::Schema),
+        };
+        Ok(Self {
             url: Arc::new(url),
-            profiles,
-        }))
+            credentials,
+        })
     }
 
     pub fn has_profile(&self, user_id: &str, assistant_definition_id: &str) -> bool {
-        self.profiles
-            .contains_key(&(user_id.to_owned(), assistant_definition_id.to_owned()))
+        match &self.credentials {
+            Credentials::Legacy(_) => self.has_explicit_namespace(user_id, assistant_definition_id),
+            Credentials::Service { .. } => valid_assistant_scope(user_id, assistant_definition_id),
+        }
+    }
+
+    pub fn has_explicit_namespace(&self, user_id: &str, assistant_definition_id: &str) -> bool {
+        let key = (user_id.to_owned(), assistant_definition_id.to_owned());
+        match &self.credentials {
+            Credentials::Legacy(profiles) => profiles.contains_key(&key),
+            Credentials::Service { aliases, .. } => aliases.contains_key(&key),
+        }
     }
 
     pub async fn binding_for(
@@ -123,12 +161,24 @@ impl Mem0Config {
         if !eligible_conversation(row) || row.id != snapshot.conversation_id {
             return None;
         }
-        let bearer = self
-            .profiles
-            .get(&(row.user_id.clone(), snapshot.assistant_definition_id.clone()))?;
+        let key = (row.user_id.clone(), snapshot.assistant_definition_id.clone());
+        let (bearer, namespace) = match &self.credentials {
+            Credentials::Legacy(profiles) => (profiles.get(&key)?.clone(), None),
+            Credentials::Service { bearer, aliases } => {
+                if !valid_assistant_scope(&key.0, &key.1) {
+                    return None;
+                }
+                let namespace = aliases.get(&key).cloned().unwrap_or_else(|| Mem0Namespace {
+                    user_id: format!("{USER_NAMESPACE_PREFIX}{}", key.0),
+                    agent_id: format!("{ASSISTANT_NAMESPACE_PREFIX}{}", key.1),
+                });
+                (bearer.clone(), Some(namespace))
+            }
+        };
         let binding = Mem0Binding {
             url: self.url.clone(),
-            bearer: bearer.clone(),
+            bearer,
+            namespace,
             user_id: row.user_id.clone(),
             assistant_definition_id: snapshot.assistant_definition_id.clone(),
             conversation_id: row.id.clone(),
@@ -138,10 +188,60 @@ impl Mem0Config {
     }
 }
 
+fn load_profiles(entries: Vec<ProfileFile>) -> Result<HashMap<AssistantKey, Arc<str>>, Mem0ConfigError> {
+    let mut profiles = HashMap::new();
+    let mut bearers = HashSet::new();
+    for profile in entries {
+        if !valid_id(&profile.user_id) || !valid_id(&profile.assistant_definition_id) || !valid_bearer(&profile.bearer)
+        {
+            return Err(Mem0ConfigError::Profile);
+        }
+        let bearer: Arc<str> = Arc::from(profile.bearer);
+        if !bearers.insert(bearer.clone())
+            || profiles
+                .insert((profile.user_id, profile.assistant_definition_id), bearer)
+                .is_some()
+        {
+            return Err(Mem0ConfigError::Profile);
+        }
+    }
+    Ok(profiles)
+}
+
+fn load_namespace_aliases(
+    entries: Vec<NamespaceAliasFile>,
+) -> Result<HashMap<AssistantKey, Mem0Namespace>, Mem0ConfigError> {
+    let mut aliases = HashMap::new();
+    let mut targets = HashSet::new();
+    for entry in entries {
+        if !valid_assistant_scope(&entry.user_id, &entry.assistant_definition_id)
+            || !valid_namespace_id(&entry.mem0_user_id, MAX_NAMESPACE_ID_BYTES)
+            || !valid_namespace_id(&entry.mem0_agent_id, MAX_NAMESPACE_ID_BYTES)
+            || (entry.mem0_user_id.starts_with(USER_NAMESPACE_PREFIX)
+                && entry.mem0_agent_id.starts_with(ASSISTANT_NAMESPACE_PREFIX))
+        {
+            return Err(Mem0ConfigError::NamespaceAlias);
+        }
+        let namespace = Mem0Namespace {
+            user_id: entry.mem0_user_id,
+            agent_id: entry.mem0_agent_id,
+        };
+        if !targets.insert(namespace.clone())
+            || aliases
+                .insert((entry.user_id, entry.assistant_definition_id), namespace)
+                .is_some()
+        {
+            return Err(Mem0ConfigError::NamespaceAlias);
+        }
+    }
+    Ok(aliases)
+}
+
 #[derive(Clone)]
 pub struct Mem0Binding {
     url: Arc<Url>,
     bearer: Arc<str>,
+    namespace: Option<Mem0Namespace>,
     user_id: String,
     assistant_definition_id: String,
     conversation_id: String,
@@ -158,6 +258,7 @@ impl PartialEq for Mem0Binding {
     fn eq(&self, other: &Self) -> bool {
         self.url == other.url
             && self.bearer == other.bearer
+            && self.namespace == other.namespace
             && self.user_id == other.user_id
             && self.assistant_definition_id == other.assistant_definition_id
             && self.conversation_id == other.conversation_id
@@ -173,6 +274,12 @@ impl Mem0Binding {
 
     pub(crate) fn bearer(&self) -> &str {
         &self.bearer
+    }
+
+    pub(crate) fn namespace(&self) -> Option<(&str, &str)> {
+        self.namespace
+            .as_ref()
+            .map(|namespace| (namespace.user_id.as_str(), namespace.agent_id.as_str()))
     }
 
     /// Recheck the live owner, conversation scope, assistant binding, and opt-in before tool calls.
@@ -251,6 +358,26 @@ fn valid_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 255 && !value.chars().any(char::is_whitespace)
 }
 
+fn valid_bearer(value: &str) -> bool {
+    (24..=256).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+fn valid_namespace_id(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn valid_assistant_scope(user_id: &str, assistant_definition_id: &str) -> bool {
+    valid_namespace_id(user_id, MAX_NAMESPACE_ID_BYTES - USER_NAMESPACE_PREFIX.len())
+        && valid_namespace_id(
+            assistant_definition_id,
+            MAX_NAMESPACE_ID_BYTES - ASSISTANT_NAMESPACE_PREFIX.len(),
+        )
+}
+
 fn parse_endpoint(value: &str) -> Option<Url> {
     let (scheme, rest) = value.split_once("://")?;
     let (authority, path) = rest.split_once('/')?;
@@ -290,6 +417,12 @@ fn parse_endpoint(value: &str) -> Option<Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn parse_config(value: serde_json::Value) -> Result<Mem0Config, Mem0ConfigError> {
+        let file = serde_json::from_value(value).map_err(|_| Mem0ConfigError::Schema)?;
+        Mem0Config::from_file(file)
+    }
 
     #[test]
     fn accepts_only_literal_private_or_loopback_mcp_endpoints() {
@@ -468,29 +601,68 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let dummy_bearer = "x".repeat(24);
-        let config = Mem0Config {
-            url: Arc::new(parse_endpoint("http://127.0.0.1/mcp").unwrap()),
-            profiles: HashMap::from([(
-                (user.id.clone(), definition.id.clone()),
-                Arc::from(dummy_bearer.as_str()),
-            )]),
-        };
-        assert!(config.binding_for(&row, &snapshot, &repos).await.is_none());
+        let legacy_bearer = "x".repeat(24);
+        let service_bearer = "y".repeat(24);
+        let legacy = parse_config(json!({
+            "url": "http://127.0.0.1/mcp",
+            "profiles": [{"user_id": user.id, "assistant_definition_id": definition.id, "bearer": legacy_bearer}]
+        }))
+        .unwrap();
+        let shared = parse_config(json!({
+            "url": "http://127.0.0.1/mcp",
+            "service_bearer": service_bearer,
+        }))
+        .unwrap();
+        let aliased = parse_config(json!({
+            "url": "http://127.0.0.1/mcp",
+            "service_bearer": service_bearer,
+            "namespace_aliases": [{
+                "user_id": user.id, "assistant_definition_id": definition.id,
+                "mem0_user_id": "previous-owner", "mem0_agent_id": "previous-assistant"
+            }]
+        }))
+        .unwrap();
+        assert!(legacy.binding_for(&row, &snapshot, &repos).await.is_none());
+        assert!(shared.binding_for(&row, &snapshot, &repos).await.is_none());
         repos
             .overlays
             .set_mem0_memory_enabled_for_user(&user.id, &definition.id, true, (0, true))
             .await
             .unwrap();
-        let binding = config.binding_for(&row, &snapshot, &repos).await.unwrap();
+        let legacy_binding = legacy.binding_for(&row, &snapshot, &repos).await.unwrap();
+        assert_eq!(legacy_binding.bearer(), legacy_bearer);
+        assert_eq!(legacy_binding.namespace(), None);
+        let binding = shared.binding_for(&row, &snapshot, &repos).await.unwrap();
+        assert_eq!(binding.bearer(), service_bearer);
+        let expected_user = format!("aion-user-{}", user.id);
+        assert_eq!(
+            binding.namespace(),
+            Some((expected_user.as_str(), "aion-assistant-def-memory"))
+        );
+        let aliased_binding = aliased.binding_for(&row, &snapshot, &repos).await.unwrap();
+        assert_eq!(aliased_binding.bearer(), service_bearer);
+        assert_eq!(
+            aliased_binding.namespace(),
+            Some(("previous-owner", "previous-assistant"))
+        );
+        assert_ne!(binding, aliased_binding);
         assert!(binding.is_entitled().await);
-        assert!(!format!("{binding:?}").contains(&dummy_bearer));
+        assert!(legacy_binding.is_entitled().await);
+        let debug = format!("{binding:?}");
+        assert!(!debug.contains(&service_bearer));
+        assert!(!debug.contains(&expected_user));
+        let other_user = ConversationRow {
+            user_id: "other-user".into(),
+            ..row.clone()
+        };
+        assert!(shared.binding_for(&other_user, &snapshot, &repos).await.is_none());
         repos
             .overlays
             .set_mem0_memory_enabled_for_user(&user.id, &definition.id, false, (0, true))
             .await
             .unwrap();
         assert!(!binding.is_entitled().await);
+        assert!(!legacy_binding.is_entitled().await);
         repos
             .overlays
             .set_mem0_memory_enabled_for_user(&user.id, &definition.id, true, (0, true))
@@ -502,13 +674,59 @@ mod tests {
             .await
             .unwrap();
         assert!(!binding.is_entitled().await);
+        assert!(!legacy_binding.is_entitled().await);
         sidebar
             .set_conversation_archived(&user.id, &row.id, None)
             .await
             .unwrap();
         assert!(binding.is_entitled().await);
+        assert!(legacy_binding.is_entitled().await);
         repos.users.set_status(&user.id, UserStatus::Disabled).await.unwrap();
         assert!(!binding.is_entitled().await);
+        assert!(!legacy_binding.is_entitled().await);
+    }
+
+    #[test]
+    fn shared_config_requires_one_valid_bearer_and_disjoint_namespaces() {
+        let alias = json!({
+            "user_id": "user-a", "assistant_definition_id": "definition-a",
+            "mem0_user_id": "old-user", "mem0_agent_id": "old-assistant"
+        });
+        let mut payload = json!({
+            "url": "http://127.0.0.1/mcp", "service_bearer": "x".repeat(24),
+            "namespace_aliases": [alias]
+        });
+        let config = parse_config(payload.clone()).unwrap();
+        assert!(config.has_profile("user-a", "definition-a"));
+        assert!(config.has_profile("user-b", "definition-b"));
+        assert!(!config.has_profile("user\n", "definition-a"));
+        assert!(config.has_explicit_namespace("user-a", "definition-a"));
+        assert!(!config.has_explicit_namespace("user-b", "definition-b"));
+
+        let mut mixed = payload.clone();
+        mixed["profiles"] = json!([]);
+        assert!(matches!(parse_config(mixed), Err(Mem0ConfigError::Schema)));
+        let mut short_bearer = payload.clone();
+        short_bearer["service_bearer"] = json!("too-short");
+        assert!(matches!(
+            parse_config(short_bearer),
+            Err(Mem0ConfigError::ServiceBearer)
+        ));
+
+        let mut conflicting = payload.clone();
+        conflicting["namespace_aliases"][0]["mem0_user_id"] = json!("aion-user-user-b");
+        conflicting["namespace_aliases"][0]["mem0_agent_id"] = json!("aion-assistant-definition-b");
+        assert!(matches!(
+            parse_config(conflicting),
+            Err(Mem0ConfigError::NamespaceAlias)
+        ));
+        let mut duplicate_target = alias;
+        duplicate_target["assistant_definition_id"] = json!("definition-b");
+        payload["namespace_aliases"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate_target);
+        assert!(matches!(parse_config(payload), Err(Mem0ConfigError::NamespaceAlias)));
     }
 
     #[cfg(unix)]
