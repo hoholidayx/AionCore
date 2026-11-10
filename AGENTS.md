@@ -85,6 +85,12 @@ Cargo workspace organized in four layers: Foundation → Capability → Domain �
 - ❌ No circular dependencies
 - Changes to foundation crates require impact assessment
 
+### Reuse and Scope
+
+- Trace the route, service, and repository call sites before adding logic. Reuse the owning crate's identity constants, contract types, scoped lookups, and lifecycle operations. Extend the existing cleanup path when its ownership and transaction semantics fit.
+- Scope feature-specific queries and locks to the operations and records they protect. Reuse rows already loaded by the caller. Before adding a persistent phase or another guard, identify the restart, partial failure, or race that the existing lifecycle cannot handle.
+- For irreversible operations, verify the middleware used by each supported identity mode. Recheck ownership and existence after any gap in which the row could disappear. Exercise stale reads, concurrent requests, and existing runtime error behavior before committing.
+
 ### Domain Crate Structure
 
 Every domain crate must follow:
