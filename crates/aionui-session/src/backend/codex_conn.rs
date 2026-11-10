@@ -63,7 +63,7 @@ pub fn codex_shell_environment_policy_args() -> [&'static str; 4] {
 /// Build the process-level app-server argv shared by initial open and idle
 /// wake. `codex app-server --help` documents the config override and uses
 /// `shell_environment_policy.inherit=all` as its example.
-fn codex_app_server_args(extra_args: &[String]) -> Vec<String> {
+pub(super) fn codex_app_server_args(extra_args: &[String]) -> Vec<String> {
     let mut args = vec!["app-server".to_owned()];
     args.extend(extra_args.iter().cloned());
     // Append the compatibility policy after user/configured extras, matching
@@ -94,12 +94,22 @@ fn log_codex_runtime_policy(spawn_env: &[aionui_common::EnvVar]) {
 pub struct CodexConnection {
     /// Injected spawner (S14 — never raw-spawn) used by `open_session` to launch
     /// `codex app-server`.
-    spawner: Arc<dyn Spawner>,
+    pub(super) spawner: Arc<dyn Spawner>,
+    record_history_provenance: bool,
 }
 
 impl CodexConnection {
     pub fn new(spawner: Arc<dyn Spawner>) -> Self {
-        Self { spawner }
+        Self {
+            spawner,
+            record_history_provenance: false,
+        }
+    }
+
+    /// Enable creation proof for a trusted, local built-in Codex launch.
+    pub fn with_history_provenance(mut self, enabled: bool) -> Self {
+        self.record_history_provenance = enabled;
+        self
     }
 }
 
@@ -146,6 +156,7 @@ impl BackendConnection for CodexConnection {
         let wake = CodexWakeRecipe {
             spawner: Some(self.spawner.clone()),
             config: config.clone(),
+            record_history_provenance: self.record_history_provenance,
         };
         // First-turn title latch: armed only for a Fresh open (a brand-new
         // conversation). Its runs go to a THROWAWAY process built from the same
@@ -443,10 +454,10 @@ async fn reconcile_codex_mode(backend: &CodexSessionBackend, requested: String) 
 /// A pure params object that knows how to wrap itself in a JSON-RPC request frame.
 /// Extracted so the handshake wire shapes are unit-testable WITHOUT a live process
 /// (open_session's spawn path needs a real codex binary).
-struct HandshakeParams(Value);
+pub(super) struct HandshakeParams(Value);
 
 impl HandshakeParams {
-    fn into_frame(self, id: u64, method: &str) -> Value {
+    pub(super) fn into_frame(self, id: u64, method: &str) -> Value {
         json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": self.0 })
     }
 }
@@ -470,7 +481,7 @@ const ELICIT_PREFIX: &str = "elicit:";
 /// `thread_settings_update_requires_experimental_api_capability`). The field is
 /// NESTED under `capabilities` (InitializeParams schema — a top-level
 /// `experimentalApi` is silently ignored), serialized camelCase.
-fn initialize_params() -> HandshakeParams {
+pub(super) fn initialize_params() -> HandshakeParams {
     HandshakeParams(json!({
         "clientInfo": { "name": "aionui-session", "version": "0.1.0" },
         "capabilities": { "experimentalApi": true, "requestAttestation": false }
@@ -976,6 +987,7 @@ struct Discovered {
 struct CodexWakeRecipe {
     spawner: Option<Arc<dyn Spawner>>,
     config: SessionConfig,
+    record_history_provenance: bool,
 }
 
 impl CodexWakeRecipe {
@@ -986,6 +998,7 @@ impl CodexWakeRecipe {
         Self {
             spawner: None,
             config: SessionConfig::default(),
+            record_history_provenance: false,
         }
     }
 }
@@ -1009,6 +1022,7 @@ struct CodexReaderState {
     pending_resume: Arc<Mutex<Option<u64>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
     pending_fork: Arc<Mutex<Option<u64>>>,
+    creation: Arc<std::sync::Mutex<CodexCreation>>,
     discovered: Arc<std::sync::Mutex<Discovered>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     /// F-4 turn-active flag: set on dispatch(Send), cleared by the reader at a turn
@@ -1019,6 +1033,40 @@ struct CodexReaderState {
     /// terminal; runs on its OWN process (see `codex_title`), so nothing here
     /// touches `thread_binding` / `turn_in_flight` / the R8 `terminated` flag.
     title_gen: Arc<TitleGen>,
+}
+
+#[derive(Default)]
+struct CodexCreation {
+    initialize_id: Option<u64>,
+    start_id: Option<u64>,
+    codex_home: Option<String>,
+    created: Option<SessionEvent>,
+}
+
+impl CodexCreation {
+    fn receive(&mut self, id: u64, frame: &Value) -> Option<SessionEvent> {
+        if self.initialize_id == Some(id) {
+            self.initialize_id = None;
+            self.codex_home = frame
+                .pointer("/result/codexHome")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+        }
+        if self.start_id != Some(id) {
+            return None;
+        }
+        self.start_id = None;
+        let thread = frame.pointer("/result/thread")?;
+        if thread.get("ephemeral").and_then(Value::as_bool) != Some(false) {
+            return None;
+        }
+        let event = SessionEvent::CodexThreadCreated {
+            thread_id: thread.get("id")?.as_str()?.to_owned(),
+            codex_home: self.codex_home.clone()?,
+        };
+        self.created = Some(event.clone());
+        Some(event)
+    }
 }
 
 /// Spawn a codex JSON-RPC reader over `stdout`/`io` using the shared state. Used
@@ -1047,6 +1095,7 @@ fn start_codex_reader(
             state.pending_resume,
             state.resume_poison,
             state.pending_fork,
+            state.creation,
             state.discovered,
             state.stdin,
             state.turn_in_flight,
@@ -1145,6 +1194,7 @@ impl CodexSessionBackend {
         let wake = CodexWakeRecipe {
             spawner: Some(spawner),
             config: SessionConfig::default(),
+            record_history_provenance: false,
         };
         Self::spawn_with_wake(
             session_id.into(),
@@ -1283,6 +1333,7 @@ impl CodexSessionBackend {
             pending_resume: pending_resume.clone(),
             resume_poison: resume_poison.clone(),
             pending_fork: pending_fork.clone(),
+            creation: Arc::new(std::sync::Mutex::new(CodexCreation::default())),
             discovered: discovered.clone(),
             stdin: stdin.clone(),
             turn_in_flight: turn_in_flight.clone(),
@@ -1422,7 +1473,14 @@ impl CodexSessionBackend {
         // A handshake is a fresh chance: any prior resume rejection belonged to
         // the previous process/attempt.
         *self.resume_poison.lock().await = None;
-        self.write_frame(initialize_params().into_frame(self.next_rpc_id(), "initialize"))
+        let initialize_id = self.next_rpc_id();
+        if let Ok(mut creation) = self.reader_state.creation.lock() {
+            *creation = CodexCreation {
+                initialize_id: Some(initialize_id),
+                ..Default::default()
+            };
+        }
+        self.write_frame(initialize_params().into_frame(initialize_id, "initialize"))
             .await?;
 
         // Layer 1 (protocol): register this conversation's skill view. Sent after
@@ -1483,7 +1541,13 @@ impl CodexSessionBackend {
                 .await?;
             }
             HandshakeMode::Fresh => {
-                self.write_frame(thread_start_params(&self.wake.config).into_frame(self.next_rpc_id(), "thread/start"))
+                let start_id = self.next_rpc_id();
+                if self.wake.record_history_provenance
+                    && let Ok(mut creation) = self.reader_state.creation.lock()
+                {
+                    creation.start_id = Some(start_id);
+                }
+                self.write_frame(thread_start_params(&self.wake.config).into_frame(start_id, "thread/start"))
                     .await?;
             }
         }
@@ -1597,6 +1661,7 @@ async fn reader_task(
     pending_resume: Arc<Mutex<Option<u64>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
     pending_fork: Arc<Mutex<Option<u64>>>,
+    creation: Arc<std::sync::Mutex<CodexCreation>>,
     discovered: Arc<std::sync::Mutex<Discovered>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
@@ -1892,6 +1957,11 @@ async fn reader_task(
                         // never a silent drop. Other responses (settings/rollback/etc)
                         // flow via notifications; diagnostic only.
                         if let Some(rid) = frame.get("id").and_then(Value::as_u64) {
+                            if let Ok(mut creation) = creation.lock()
+                                && let Some(event) = creation.receive(rid, &frame)
+                            {
+                                emit(&event_tx, &session_id, turn_gen.load(Ordering::SeqCst), event);
+                            }
                             let error_message = frame.get("error").map(|e| {
                                 e.get("message")
                                     .and_then(Value::as_str)
@@ -4561,7 +4631,7 @@ impl SessionBackend for CodexSessionBackend {
         // caught-up subscriber is harmless. try_lock: the binding mutex is
         // held only for point writes/reads; on contention we just skip the
         // preface (the caller is racing the live event, which it will get).
-        let preface: Vec<SessionEnvelope> = self
+        let mut preface: Vec<SessionEnvelope> = self
             .thread_binding
             .try_lock()
             .ok()
@@ -4575,6 +4645,15 @@ impl SessionBackend for CodexSessionBackend {
             })
             .into_iter()
             .collect();
+        if let Ok(creation) = self.reader_state.creation.lock()
+            && let Some(event) = creation.created.clone()
+        {
+            preface.push(SessionEnvelope {
+                session_id: self.session_id.clone(),
+                turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                event,
+            });
+        }
         let live = futures_util::stream::unfold(rx, |mut rx| async move {
             loop {
                 match rx.recv().await {

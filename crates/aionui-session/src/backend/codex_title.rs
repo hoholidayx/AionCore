@@ -133,7 +133,7 @@ async fn run_exchange(io: &dyn AgentIo, req: &TitleRequest) -> Option<String> {
     read_agent_message(&mut lines).await
 }
 
-async fn write_frame(stdin: &mut aionui_process::BoxedStdin, frame: &Value) -> Option<()> {
+pub(super) async fn write_frame(stdin: &mut aionui_process::BoxedStdin, frame: &Value) -> Option<()> {
     let mut line = serde_json::to_vec(frame).ok()?;
     line.push(b'\n');
     stdin.write_all(&line).await.ok()?;
@@ -147,12 +147,19 @@ async fn read_response<R>(lines: &mut tokio::io::Lines<R>, id: u64) -> Option<Va
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
+    read_rpc_frame(lines, id).await?.get("result").cloned()
+}
+
+pub(super) async fn read_rpc_frame<R>(lines: &mut tokio::io::Lines<R>, id: u64) -> Option<Value>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
     while let Ok(Some(line)) = lines.next_line().await {
         let Ok(frame) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        if frame.get("id").and_then(Value::as_u64) == Some(id) {
-            return frame.get("result").cloned();
+        if frame.get("id").and_then(Value::as_u64) == Some(id) && frame.get("method").is_none() {
+            return Some(frame);
         }
     }
     None

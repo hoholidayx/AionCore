@@ -594,6 +594,9 @@ pub enum SessionEvent {
     /// not yet established.
     BackendBound { backend_session_id: Option<String> },
 
+    /// A persistent thread created by this Codex app-server connection.
+    CodexThreadCreated { thread_id: String, codex_home: String },
+
     /// Fork anchoring (BackendBound's turn-scoped sibling): the adapter lowers
     /// the backend's OWN id for the turn that just started (codex
     /// `turn/started` → `Turn.id`) so the conversation layer can stamp it onto
@@ -951,6 +954,7 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | Snapshot { .. }
         | Lagged { .. }
         | BackendBound { .. }
+        | CodexThreadCreated { .. }
         | BackendTurnBound { .. }
         | BackendSuspended => EventClass::OrchestrationLowered,
         // backend-produced (self-describing; PERSISTED — tier decided separately, §7.2)
@@ -1051,6 +1055,7 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             | Snapshot { .. }
             | Lagged { .. }
             | BackendBound { .. }
+            | CodexThreadCreated { .. }
             | BackendTurnBound { .. }
             | BackendSuspended => PersistTier::Ephemeral,
         },

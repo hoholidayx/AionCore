@@ -28,6 +28,13 @@ pub struct CreateAcpSessionParams<'a> {
     pub agent_id: &'a str,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CodexDeleteTarget {
+    pub thread_id: String,
+    pub codex_home: String,
+    pub phase: String,
+}
+
 /// The decoded `session_config.runtime` payload. See module docs.
 ///
 /// All fields are optional because we persist partials — the service
@@ -67,6 +74,40 @@ impl SaveRuntimeStateParams<'_> {
 
 #[async_trait::async_trait]
 pub trait IAcpSessionRepository: Send + Sync {
+    async fn enable_codex_history_deletion(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn record_fresh_codex_thread(
+        &self,
+        _user_id: &str,
+        _id: &str,
+        _thread_id: &str,
+        _codex_home: &str,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn codex_delete_target(&self, _user_id: &str, _id: &str) -> Result<Option<CodexDeleteTarget>, DbError> {
+        Ok(None)
+    }
+
+    async fn begin_codex_history_deletion(
+        &self,
+        _user_id: &str,
+        _id: &str,
+    ) -> Result<Option<CodexDeleteTarget>, DbError> {
+        Ok(None)
+    }
+
+    async fn mark_codex_history_deleted(&self, _user_id: &str, _id: &str) -> Result<bool, DbError> {
+        Ok(false)
+    }
+
+    async fn is_codex_history_deletion_pending(&self, _user_id: &str, _id: &str) -> Result<bool, DbError> {
+        Ok(false)
+    }
+
     /// Fetch the full row only when the owning conversation belongs to `user_id`.
     async fn get_for_user(&self, user_id: &str, conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError>;
 

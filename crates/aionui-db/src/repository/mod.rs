@@ -42,7 +42,9 @@ pub mod team;
 mod user;
 pub mod user_order;
 
-pub use acp_session::{CreateAcpSessionParams, IAcpSessionRepository, PersistedSessionState, SaveRuntimeStateParams};
+pub use acp_session::{
+    CodexDeleteTarget, CreateAcpSessionParams, IAcpSessionRepository, PersistedSessionState, SaveRuntimeStateParams,
+};
 pub use agent_metadata::IAgentMetadataRepository;
 pub use assistant::{
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,

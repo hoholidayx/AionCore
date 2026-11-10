@@ -1890,7 +1890,10 @@ pub async fn build_session_instance(
 
     let connection: Box<dyn BackendConnection> = match backend_label {
         "claude" => Box::new(ClaudeConnection::new(spawner)),
-        "codex" => Box::new(CodexConnection::new(spawner)),
+        "codex" => Box::new(CodexConnection::new(spawner).with_history_provenance(
+            inputs.metadata.agent_source == aionui_api_types::AgentSource::Builtin
+                && !inputs.metadata.has_command_override,
+        )),
         _ => return Ok(None),
     };
 
@@ -2610,6 +2613,7 @@ fn session_event_name(e: &SessionEvent) -> &'static str {
         SessionEvent::UsageDelta { .. } => "UsageDelta",
         SessionEvent::ConfigChanged { .. } => "ConfigChanged",
         SessionEvent::BackendBound { .. } => "BackendBound",
+        SessionEvent::CodexThreadCreated { .. } => "CodexThreadCreated",
         SessionEvent::PromptAccepted { .. } => "PromptAccepted",
         SessionEvent::Snapshot { .. } => "Snapshot",
         other => {
@@ -3544,6 +3548,19 @@ async fn persist_side_effects(
         }
     }
     match event {
+        SessionEvent::CodexThreadCreated { thread_id, codex_home } => {
+            let path = std::path::Path::new(codex_home);
+            if uuid::Uuid::parse_str(thread_id).is_ok()
+                && path.is_absolute()
+                && let Ok(home) = tokio::fs::canonicalize(path).await
+                && let Some(home) = home.to_str()
+                && let Err(err) = repo
+                    .record_fresh_codex_thread(user_id, conversation_id, thread_id, home)
+                    .await
+            {
+                tracing::warn!(conversation_id, error = %err, "Failed to record Codex thread ownership");
+            }
+        }
         // The CLI-echoed backend session id — written immediately (no debounce) so
         // the next turn takes the resume path even if the process crashes. `None`
         // (lost-backend self-heal) leaves the stored anchor as-is; a fresh rebind

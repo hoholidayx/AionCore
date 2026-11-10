@@ -7,16 +7,16 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post};
 
 use aionui_api_types::{
     ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
-    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
-    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, MEM0_DELETE_CONFIRMATION_PREFIX, MessageListResponse, MessageResponse, MessageSearchResponse,
-    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest,
-    UpdateConversationRequest,
+    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationDeleteOptions,
+    ConversationListResponse, ConversationResponse, CreateConversationRequest, EnsureConversationRuntimeResponse,
+    ForkConversationRequest, ListConversationsQuery, ListMessagesQuery, MEM0_DELETE_CONFIRMATION_PREFIX,
+    MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest,
+    SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::{AuthenticatedUserSession, CurrentUser, LocalUserSession};
 use aionui_common::ApiError;
@@ -124,6 +124,11 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
     Router::new()
         .route("/api/conversations", post(create).get(list))
         .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
+        .route("/api/conversations/{id}/delete-options", get(delete_options))
+        .route(
+            "/api/conversations/{id}/with-codex-history",
+            delete(delete_with_codex_history),
+        )
         .route("/api/conversations/{id}/reset", post(reset))
         .route("/api/conversations/{id}/fork", post(fork))
         .route("/api/conversations/{id}/associated", get(associated))
@@ -215,10 +220,14 @@ async fn read_tool_image(
 async fn create(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
+    session: Option<Extension<AuthenticatedUserSession>>,
     body: Result<Json<CreateConversationRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<ConversationResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let conversation = state.service.create(&user.id, req).await.map_err(ApiError::from)?;
+    let conversation = state
+        .service
+        .create_for_session(&user.id, req, session.is_some())
+        .await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(conversation))))
 }
 
@@ -275,6 +284,29 @@ async fn delete_one(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     state.service.delete(&user.id, &id).await.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn delete_options(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    session: Option<Extension<AuthenticatedUserSession>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<ConversationDeleteOptions>>, ApiError> {
+    let options = state.service.delete_options(&user.id, &id, session.is_some()).await?;
+    Ok(Json(ApiResponse::ok(options)))
+}
+
+async fn delete_with_codex_history(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    session: Option<Extension<AuthenticatedUserSession>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .delete_with_codex_history(&user.id, &id, session.is_some())
+        .await?;
     Ok(Json(ApiResponse::success()))
 }
 

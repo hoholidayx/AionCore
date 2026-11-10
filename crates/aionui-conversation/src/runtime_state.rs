@@ -14,6 +14,18 @@ use crate::ConversationError;
 pub struct ConversationRuntimeStateService {
     state: Mutex<ConversationRuntimeState>,
     release_notify: Notify,
+    lifecycle_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+}
+
+pub(crate) struct IdleDeletionGuard<'a> {
+    state: &'a ConversationRuntimeStateService,
+    id: &'a str,
+}
+
+impl Drop for IdleDeletionGuard<'_> {
+    fn drop(&mut self) {
+        self.state.clear_deleting(self.id);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -62,6 +74,43 @@ pub enum RuntimeLifecycleState {
 }
 
 impl ConversationRuntimeStateService {
+    pub(crate) async fn lock_lifecycle(&self, id: &str) -> Result<tokio::sync::OwnedMutexGuard<()>, ConversationError> {
+        let lock = {
+            let mut locks = self
+                .lifecycle_locks
+                .lock()
+                .map_err(|_| ConversationError::internal("conversation lifecycle lock poisoned"))?;
+            if let Some(lock) = locks.get(id).and_then(Weak::upgrade) {
+                lock
+            } else {
+                locks.retain(|_, lock| lock.strong_count() > 0);
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(id.to_owned(), Arc::downgrade(&lock));
+                lock
+            }
+        };
+        Ok(lock.lock_owned().await)
+    }
+
+    pub(crate) fn begin_idle_deletion<'a>(&'a self, id: &'a str) -> Result<IdleDeletionGuard<'a>, ConversationError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ConversationError::internal("conversation runtime state lock poisoned"))?;
+        if state.shutting_down
+            || state.active_turns.contains_key(id)
+            || state.cancelling_conversations.contains(id)
+            || state.restarting_conversations.contains(id)
+            || state.deleting_conversations.contains(id)
+        {
+            return Err(ConversationError::Busy {
+                reason: "Wait for the conversation runtime to become idle".into(),
+            });
+        }
+        state.deleting_conversations.insert(id.to_owned());
+        Ok(IdleDeletionGuard { state: self, id })
+    }
+
     pub fn try_claim_turn(
         self: &Arc<Self>,
         conversation_id: &str,

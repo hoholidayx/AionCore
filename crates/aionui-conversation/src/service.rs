@@ -3,6 +3,10 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
+#[path = "codex_history.rs"]
+mod codex_history;
+pub use codex_history::CodexHistoryDeletion;
+
 use aionui_ai_agent::async_image::IMAGE_BACKEND_OVERRIDE_KEY;
 use aionui_ai_agent::mem0_config::{Mem0Config, Mem0Repositories};
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
@@ -348,6 +352,7 @@ pub struct ConversationService {
     broadcaster: Arc<dyn EventBroadcaster>,
     skill_resolver: Arc<dyn SkillResolver>,
     task_manager: Arc<dyn IWorkerTaskManager>,
+    codex_history_deletion: Option<Arc<dyn CodexHistoryDeletion>>,
     /// Hooks invoked during `delete()` before the DB row is removed so other services
     /// (`WorkerTaskManagerImpl`, `CronService`, …) can clean up their
     /// per-conversation state. Wrapped in `Arc<RwLock<…>>` so registration
@@ -452,6 +457,7 @@ impl ConversationService {
             broadcaster,
             skill_resolver,
             task_manager,
+            codex_history_deletion: None,
             delete_hooks: Arc::new(RwLock::new(Vec::new())),
             turn_cancelled_hooks: Arc::new(RwLock::new(Vec::new())),
             mcp_server_repo: Arc::new(RwLock::new(None)),
@@ -1095,11 +1101,20 @@ impl ConversationService {
     ///
     /// Generates a UUID v7, sets status to `pending`, defaults source
     /// to `aionui`, and broadcasts `conversation.listChanged(created)`.
-    #[tracing::instrument(skip_all, fields(user_id = %user_id, req_type = ?req.r#type))]
     pub async fn create(
         &self,
         user_id: &str,
         req: CreateConversationRequest,
+    ) -> Result<ConversationResponse, ConversationError> {
+        self.create_for_session(user_id, req, false).await
+    }
+
+    #[tracing::instrument(skip_all, fields(user_id = %user_id, req_type = ?req.r#type))]
+    pub(crate) async fn create_for_session(
+        &self,
+        user_id: &str,
+        req: CreateConversationRequest,
+        authenticated_session: bool,
     ) -> Result<ConversationResponse, ConversationError> {
         let id = generate_short_id();
         let now = now_ms();
@@ -1650,6 +1665,9 @@ impl ConversationService {
         if matches!(effective_type, AgentType::Acp | AgentType::Antigravity) {
             self.create_acp_session_row(user_id, &id, &extra, assistant_snapshot.as_ref())
                 .await?;
+            if authenticated_session {
+                self.enable_codex_history_deletion_for_new_conversation(&row).await;
+            }
         }
 
         if let Some(snapshot) = assistant_snapshot.as_ref() {
@@ -2363,6 +2381,8 @@ impl ConversationService {
         req: UpdateConversationRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<ConversationResponse, ConversationError> {
+        let _lifecycle = self.runtime_state.lock_lifecycle(id).await?;
+        self.reject_pending_codex_delete(user_id, id).await?;
         let existing = self
             .conversation_repo
             .get(user_id, id)
@@ -2736,6 +2756,11 @@ impl ConversationService {
     /// Broadcasts `conversation.listChanged(deleted)`.
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
     pub async fn delete(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
+        let _lifecycle = self.runtime_state.lock_lifecycle(id).await?;
+        self.delete_local(user_id, id).await
+    }
+
+    async fn delete_local(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
         // Get existing to retrieve source for broadcast and verify ownership
         let existing = self
             .conversation_repo
@@ -2869,6 +2894,8 @@ impl ConversationService {
         id: &str,
         req: ForkConversationRequest,
     ) -> Result<ConversationResponse, ConversationError> {
+        let _lifecycle = self.runtime_state.lock_lifecycle(id).await?;
+        self.reject_pending_codex_delete(user_id, id).await?;
         let parent = self
             .conversation_repo
             .get(user_id, id)
@@ -3203,6 +3230,8 @@ impl ConversationService {
     /// Reset a conversation: clear messages and set status back to pending.
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
     pub async fn reset(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
+        let _lifecycle = self.runtime_state.lock_lifecycle(id).await?;
+        self.reject_pending_codex_delete(user_id, id).await?;
         // Verify existence and ownership
         self.conversation_repo
             .get(user_id, id)
@@ -4158,6 +4187,7 @@ impl ConversationService {
             let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
             (turn_id, turn_claim)
         };
+        self.reject_pending_codex_delete(user_id, conversation_id).await?;
 
         // Store user message. `msg_id` is server-generated so the WebSocket
         // stream, DB row, and client-side message index all agree on the same
@@ -4313,6 +4343,8 @@ impl ConversationService {
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(&request.conversation_id, &turn_id)?;
+        self.reject_pending_codex_delete(&request.user_id, &request.conversation_id)
+            .await?;
         if request.persist_user_message {
             let user_msg_id = Self::mint_msg_id();
             let user_msg = aionui_db::models::MessageRow {
@@ -4723,6 +4755,8 @@ impl ConversationService {
         conversation_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<EnsureConversationRuntimeResponse, ConversationError> {
+        let _lifecycle = self.runtime_state.lock_lifecycle(conversation_id).await?;
+        self.reject_pending_codex_delete(user_id, conversation_id).await?;
         let row = self
             .conversation_repo
             .get(user_id, conversation_id)
@@ -4769,6 +4803,8 @@ impl ConversationService {
         conversation_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<EnsureConversationRuntimeResponse, ConversationError> {
+        let lifecycle = self.runtime_state.lock_lifecycle(conversation_id).await?;
+        self.reject_pending_codex_delete(user_id, conversation_id).await?;
         let row = self
             .conversation_repo
             .get(user_id, conversation_id)
@@ -4805,6 +4841,7 @@ impl ConversationService {
         }
 
         self.runtime_state.begin_restart(conversation_id)?;
+        drop(lifecycle);
         let restart_result = async {
             if let Some(turn_id) = self.runtime_state.active_turn_id_for(conversation_id) {
                 // `RuntimeRestart`, not a user stop: cancelling here is only a
@@ -5012,6 +5049,7 @@ impl ConversationService {
         workspace_override: Option<&str>,
         end_user_session: bool,
     ) -> Result<BuildTaskOptions, ConversationError> {
+        self.reject_pending_codex_delete(&row.user_id, &row.id).await?;
         reject_deprecated_runtime_row(row)?;
         let is_aionrs = row.r#type == AgentType::Aionrs.serde_name();
         let snapshot = if is_aionrs {

@@ -441,6 +441,7 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
         // (persist backend_session_id). The reducer NEVER touches SessionState for
         // it — it is not a turn signal, not a requires-action, not a roster update.
         | SessionEvent::BackendBound { .. }
+        | SessionEvent::CodexThreadCreated { .. }
         // BackendTurnBound is BackendBound's turn-scoped sibling (fork anchor
         // pass-through for message stamping). Same contract: reducer no-op.
         | SessionEvent::BackendTurnBound { .. }

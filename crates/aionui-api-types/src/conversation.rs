@@ -365,6 +365,15 @@ pub struct ConversationResponse {
 /// Paginated list of conversations.
 pub type ConversationListResponse = PaginatedResult<ConversationResponse>;
 
+/// Whether a single conversation deletion can include its Codex history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationDeleteOptions {
+    Unavailable,
+    Available,
+    RetryRequired,
+}
+
 /// Single message object returned in API responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageResponse {

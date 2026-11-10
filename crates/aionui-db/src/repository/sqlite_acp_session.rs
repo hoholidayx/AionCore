@@ -7,7 +7,7 @@ use sqlx::{SqliteExecutor, SqlitePool};
 use crate::error::DbError;
 use crate::models::AcpSessionRow;
 use crate::repository::acp_session::{
-    CreateAcpSessionParams, IAcpSessionRepository, PersistedSessionState, SaveRuntimeStateParams,
+    CodexDeleteTarget, CreateAcpSessionParams, IAcpSessionRepository, PersistedSessionState, SaveRuntimeStateParams,
 };
 
 #[derive(Clone, Debug)]
@@ -127,6 +127,28 @@ pub(super) async fn delete_acp_session_for_user<'e>(
     Ok(result.rows_affected() > 0)
 }
 
+async fn load_codex_delete_target<'e>(
+    executor: impl SqliteExecutor<'e>,
+    user_id: &str,
+    id: &str,
+) -> Result<Option<CodexDeleteTarget>, DbError> {
+    Ok(sqlx::query_as(
+        "SELECT a.codex_delete_thread_id AS thread_id, a.codex_delete_home AS codex_home,
+                a.codex_delete_phase AS phase
+         FROM acp_session a JOIN conversations c ON c.id = a.conversation_id
+         WHERE c.id = ? AND c.user_id = ? AND a.codex_delete_eligible = 1
+           AND a.codex_delete_home IS NOT NULL AND a.codex_delete_thread_id = a.session_id
+           AND (a.codex_delete_phase = 'codex_deleted' OR NOT EXISTS (
+               SELECT 1 FROM acp_session other WHERE other.session_id = a.session_id
+                 AND other.conversation_id <> a.conversation_id
+           ))",
+    )
+    .bind(id)
+    .bind(user_id)
+    .fetch_optional(executor)
+    .await?)
+}
+
 fn decode_runtime_state(raw: &str) -> Result<PersistedSessionState, DbError> {
     let parsed: Value =
         serde_json::from_str(raw).map_err(|e| DbError::Init(format!("invalid session_config JSON: {e}")))?;
@@ -206,6 +228,90 @@ fn merge_runtime_state(raw: &str, params: &SaveRuntimeStateParams<'_>) -> Result
 
 #[async_trait::async_trait]
 impl IAcpSessionRepository for SqliteAcpSessionRepository {
+    async fn enable_codex_history_deletion(&self, user_id: &str, id: &str) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE acp_session SET codex_delete_eligible = 1
+             WHERE conversation_id = ? AND agent_source = 'builtin'
+               AND EXISTS (SELECT 1 FROM agent_metadata m WHERE m.id = acp_session.agent_id
+                           AND m.agent_source = 'builtin' AND m.backend = 'codex'
+                           AND NULLIF(TRIM(m.command_override), '') IS NULL)
+               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = acp_session.conversation_id AND c.user_id = ?)",
+        )
+        .bind(id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn record_fresh_codex_thread(
+        &self,
+        user_id: &str,
+        id: &str,
+        thread_id: &str,
+        codex_home: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE acp_session SET codex_delete_thread_id = ?, codex_delete_home = ?
+             WHERE conversation_id = ? AND codex_delete_eligible = 1 AND codex_delete_phase = 'ready'
+               AND EXISTS (SELECT 1 FROM agent_metadata m WHERE m.id = acp_session.agent_id
+                           AND NULLIF(TRIM(m.command_override), '') IS NULL)
+               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = acp_session.conversation_id AND c.user_id = ?)",
+        )
+        .bind(thread_id)
+        .bind(codex_home)
+        .bind(id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn codex_delete_target(&self, user_id: &str, id: &str) -> Result<Option<CodexDeleteTarget>, DbError> {
+        load_codex_delete_target(&self.pool, user_id, id).await
+    }
+
+    async fn begin_codex_history_deletion(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<Option<CodexDeleteTarget>, DbError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let target = load_codex_delete_target(&mut *tx, user_id, id).await?;
+        if target.as_ref().is_some_and(|target| target.phase == "ready") {
+            sqlx::query("UPDATE acp_session SET codex_delete_phase = 'requested' WHERE conversation_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(target)
+    }
+
+    async fn mark_codex_history_deleted(&self, user_id: &str, id: &str) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE acp_session SET codex_delete_phase = 'codex_deleted'
+             WHERE conversation_id = ? AND codex_delete_phase = 'requested'
+               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = acp_session.conversation_id AND c.user_id = ?)",
+        )
+        .bind(id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn is_codex_history_deletion_pending(&self, user_id: &str, id: &str) -> Result<bool, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM acp_session a JOIN conversations c ON c.id = a.conversation_id
+                            WHERE c.id = ? AND c.user_id = ? AND a.codex_delete_phase <> 'ready')",
+        )
+        .bind(id)
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     async fn get_for_user(&self, user_id: &str, conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
         let row = sqlx::query_as::<_, AcpSessionRow>(
             "SELECT a.* FROM acp_session a \
@@ -285,7 +391,7 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         let now = now_ms();
         let result = sqlx::query(
             "UPDATE acp_session SET session_id = ?, last_active_at = ? \
-             WHERE conversation_id = ? \
+             WHERE conversation_id = ? AND codex_delete_phase = 'ready' \
                AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = acp_session.conversation_id AND c.user_id = ?)",
         )
         .bind(session_id)
@@ -300,8 +406,9 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
     async fn clear_session_id_for_user(&self, user_id: &str, conversation_id: &str) -> Result<bool, DbError> {
         let now = now_ms();
         let result = sqlx::query(
-            "UPDATE acp_session SET session_id = NULL, last_active_at = ? \
-             WHERE conversation_id = ? \
+            "UPDATE acp_session SET session_id = NULL, last_active_at = ?, \
+             codex_delete_thread_id = NULL, codex_delete_home = NULL \
+             WHERE conversation_id = ? AND codex_delete_phase = 'ready' \
                AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = acp_session.conversation_id AND c.user_id = ?)",
         )
         .bind(now)

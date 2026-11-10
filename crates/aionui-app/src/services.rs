@@ -12,6 +12,7 @@ use aionui_ai_agent::{
 use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_encryption_secret, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
 use aionui_conversation::image_jobs::AsyncImageJobs;
+use aionui_conversation::service::CodexHistoryDeletion;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::SqliteAsyncImageJobRepository;
 use aionui_db::{
@@ -123,6 +124,7 @@ impl AppServices {
     /// Primarily used by tests to inject mock implementations.
     pub fn with_worker_task_manager(mut self, wtm: Arc<dyn IWorkerTaskManager>) -> Self {
         self.worker_task_manager = wtm;
+        let codex_history_deletion = self.conversation_service.codex_history_deletion();
         self.conversation_service = build_conversation_service(ConversationServiceDeps {
             database: &self.database,
             work_dir: self.work_dir.clone(),
@@ -141,7 +143,8 @@ impl AppServices {
             mem0_config: self.conversation_service.mem0_config().cloned(),
             user_repo: self.user_repo.clone(),
             identity_mode: self.identity_mode,
-        });
+        })
+        .with_codex_history_deletion(codex_history_deletion);
         self
     }
 
@@ -383,6 +386,12 @@ impl AppServices {
             machine_id,
         ));
 
+        // The embedded local router bypasses login and CSRF validation.
+        let codex_history_deletion = (identity_mode == IdentityMode::WebUi).then(|| {
+            Arc::new(LocalCodexHistoryDeletion(aionui_session::CodexConnection::new(
+                session_spawner.clone(),
+            ))) as Arc<dyn CodexHistoryDeletion>
+        });
         let factory = build_agent_factory(AgentFactoryDeps {
             skill_manager: AcpSkillManager::new_with_repo(skill_paths.clone(), skill_repo.clone()),
             provider_repo,
@@ -435,6 +444,7 @@ impl AppServices {
             identity_mode,
         });
 
+        let conversation_service = conversation_service.with_codex_history_deletion(codex_history_deletion);
         let session_message_queue = Arc::new(DeliveryQueue::new(Arc::new(SystemClock)));
         let session_message_notify = Arc::new(Notify::new());
         let session_message_service = Arc::new(SessionMessageService::new(SessionMessageDeps {
@@ -491,6 +501,20 @@ impl AppServices {
             runtime_helper_bin,
             runtime_base_url,
         })
+    }
+}
+
+struct LocalCodexHistoryDeletion(aionui_session::CodexConnection);
+
+#[async_trait::async_trait]
+impl CodexHistoryDeletion for LocalCodexHistoryDeletion {
+    async fn delete(&self, thread_id: &str, codex_home: &std::path::Path) -> Result<(), String> {
+        let program = aionui_runtime::resolve_command_path("codex")
+            .ok_or_else(|| "Codex is not installed on the Aion host".to_owned())?;
+        self.0
+            .delete_history(program, thread_id, codex_home)
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 
