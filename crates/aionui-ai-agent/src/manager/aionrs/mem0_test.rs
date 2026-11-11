@@ -66,6 +66,27 @@ fn model_cannot_override_identity_or_request_session_or_bulk_memory() {
 }
 
 #[test]
+fn memory_delete_filters_require_a_long_term_preview() {
+    assert!(
+        Action::Delete
+            .argument_issue(&json!({"query":"fixture","categories":["work.todo"],"scope":"long-term"}))
+            .is_none()
+    );
+    assert_eq!(
+        Action::Delete.argument_issue(&json!({"query":"fixture","scope":"session"})),
+        Some(json!({"path":["scope"],"reason":"invalid_value"}))
+    );
+    assert_eq!(
+        Action::Delete.argument_issue(&json!({"memoryId":"fixture","scope":"all"})),
+        Some(json!({"path":["scope"],"reason":"preview_only"}))
+    );
+    assert_eq!(
+        Action::Delete.argument_issue(&json!({"memoryId":"fixture","categories":null})),
+        Some(json!({"path":["categories"],"reason":"preview_only"}))
+    );
+}
+
+#[test]
 fn memory_update_accepts_metadata_patches_for_a_valid_id() {
     assert!(
         Action::Update

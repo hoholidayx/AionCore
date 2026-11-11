@@ -71,7 +71,7 @@ impl Action {
                 "Update a long-term memory in place by ID. Provide text, category, importance, or metadata. Omit secrets."
             }
             Self::Delete => {
-                "Preview candidates with query, or propose deleting one memory with memoryId. Wait for the user's confirmation and the tool result."
+                "Preview long-term candidates with query and optional categories or scope. Use memoryId on its own to propose a deletion. Wait for the user's confirmation and the tool result."
             }
         }
     }
@@ -120,11 +120,13 @@ impl Action {
             ),
             Self::Delete => (json!({"memoryId":id(),"query":text()}), vec![]),
         };
+        if matches!(self, Self::Search | Self::List | Self::Delete) {
+            properties["categories"] = json!({"type":"array","items":{"type":"string"},"minItems":1,"maxItems":20});
+            properties["scope"] = json!({"type":"string","enum":["all","long-term"]});
+        }
         if matches!(self, Self::Search | Self::List) {
-            properties["categories"] = json!({"type":"array","items":{"type":"string"}});
             properties["filters"] =
                 json!({"type":"object","description":"Flat metadata fields and comparison operators."});
-            properties["scope"] = json!({"type":"string","enum":["all","long-term"]});
             properties["includeExpired"] = json!({"type":"boolean","default":false});
             properties["since"] =
                 json!({"type":"string","description":"Inclusive record time (UTC date or timestamp with an offset)."});
@@ -179,7 +181,11 @@ impl Action {
                     Some(_) => Some(field_issue("query", "invalid_value")),
                     None => Some(field_issue("query", "invalid_type")),
                 },
-                (None, Some(id)) => memory_id_issue(id),
+                (None, Some(id)) => ["categories", "scope"]
+                    .into_iter()
+                    .find(|field| args.contains_key(*field))
+                    .map(|field| field_issue(field, "preview_only"))
+                    .or_else(|| memory_id_issue(id)),
                 (query, _) => {
                     let reason = if query.is_some() {
                         "conflicting_fields"
@@ -371,7 +377,7 @@ fn error_result(data: Value) -> ToolResult {
 }
 
 impl Mem0Tool {
-    async fn run(&self, input: Value) -> Result<Value, ToolResult> {
+    async fn run(&self, mut input: Value) -> Result<Value, ToolResult> {
         if let Some(issue) = self.action.argument_issue(&input) {
             return Err(error_result(json!({
                 "code":"invalid_memory_arguments",
@@ -407,6 +413,10 @@ impl Mem0Tool {
                 ));
             }
             return self.client.request(Action::Delete, json!({"memoryId":id}), true).await;
+        }
+        if self.action == Action::Delete {
+            // A role credential may also have a session binding.
+            input["scope"] = json!("long-term");
         }
         self.client
             .request(self.action, input, matches!(self.action, Action::Add | Action::Update))

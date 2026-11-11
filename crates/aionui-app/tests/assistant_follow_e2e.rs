@@ -345,6 +345,7 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
     use std::os::unix::fs::OpenOptionsExt;
     use std::sync::Mutex;
 
+    use aionui_api_types::MEM0_DELETE_CONFIRMATION_PREFIX;
     use aionui_db::{IAssistantDefinitionRepository, SqliteAssistantDefinitionRepository};
     use axum::http::HeaderMap;
 
@@ -355,6 +356,14 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
         r#"{"categories":["work.todo"],"filters":{"priority":{"gte":2}},"limit":2,"cursor":"fixture-cursor"}"#;
     const INVALID_SEARCH_ARGS: &str = r#"{"query":"fixture preference","limit":"fixture-private-value"}"#;
     const CONFLICTING_DELETE_ARGS: &str = r#"{"memoryId":"fixture-id","query":"fixture-private-value"}"#;
+    const PREVIEW_ARGS: &str = r#"{"query":"fixture","categories":["work.todo"],"scope":"all"}"#;
+    const PREVIEW_REQUEST: &str = r#"{"query":"fixture","categories":["work.todo"],"scope":"long-term"}"#;
+    const DELETE_ARGS: &str = r#"{"memoryId":"fixture-id"}"#;
+    const INVALID_DELETE_FILTER: &str = r#"{"memoryId":"fixture-id","categories":["work.todo"]}"#;
+    const PREVIEW: &str = "Preview matching deletion candidates";
+    const INVALID_FILTER: &str = "Reject a filter on deletion by ID";
+    const CANCEL: &str = "Cancel deletion by ID";
+    const APPROVE: &str = "Approve deletion by ID";
     const PRIVATE_MARKER: &str = "fixture-private-remote-value";
     let (calls, mut captured) = mpsc::unbounded_channel();
     let (results, mut captured_results) = mpsc::unbounded_channel();
@@ -373,6 +382,12 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
                         ("memory_search", INVALID_SEARCH_ARGS)
                     } else if prompt.contains("Conflicting deletion") {
                         ("memory_delete", CONFLICTING_DELETE_ARGS)
+                    } else if prompt.contains(PREVIEW) {
+                        ("memory_delete", PREVIEW_ARGS)
+                    } else if prompt.contains(INVALID_FILTER) {
+                        ("memory_delete", INVALID_DELETE_FILTER)
+                    } else if prompt.contains(CANCEL) || prompt.contains(APPROVE) {
+                        ("memory_delete", DELETE_ARGS)
                     } else if prompt.contains("Continue listing") {
                         ("memory_list", LIST_ARGS)
                     } else {
@@ -403,6 +418,10 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
                         assert_eq!(parameters["properties"]["filters"]["type"], "object");
                         assert_eq!(parameters["properties"]["cursor"]["type"], "string");
                         assert_eq!(parameters["properties"]["limit"]["maximum"], 1000);
+                    } else if tool_name == "memory_delete" {
+                        assert_eq!(parameters["properties"]["categories"]["type"], "array");
+                        assert_eq!(parameters["properties"]["scope"]["enum"], json!(["all", "long-term"]));
+                        assert!(parameters["properties"].get("all").is_none());
                     }
                     model_stream(
                         json!({"tool_calls":[{
@@ -463,6 +482,7 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
                         }
                         "tools/call" => {
                             let action = request["params"]["name"].as_str().unwrap();
+                            let arguments = &request["params"]["arguments"];
                             let expected = match action {
                                 "memory_search" if failure == Some(("tools/call", StatusCode::OK)) => {
                                     INVALID_SEARCH_ARGS
@@ -470,12 +490,12 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
                                 "memory_search" => SEARCH_ARGS,
                                 "memory_list" => LIST_ARGS,
                                 "memory_update" => UPDATE_ARGS,
+                                "memory_get" => DELETE_ARGS,
+                                "memory_delete" if arguments.get("query").is_some() => PREVIEW_REQUEST,
+                                "memory_delete" => DELETE_ARGS,
                                 other => panic!("unexpected memory tool {other}"),
                             };
-                            assert_eq!(
-                                request["params"]["arguments"],
-                                serde_json::from_str::<Value>(expected).unwrap()
-                            );
+                            assert_eq!(*arguments, serde_json::from_str::<Value>(expected).unwrap());
                             calls
                                 .send((user.to_owned(), agent.to_owned(), action.to_owned()))
                                 .unwrap();
@@ -494,7 +514,15 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
                                     json!({"memories":[],"count":0,"truncated":true,"nextCursor":"fixture-next"});
                                 json!({"content":[{"type":"text","text":page.to_string()}]})
                             } else {
-                                json!({"content":[{"type":"text","text":"{\"memory\":\"fixture memory result\"}"}]})
+                                let result = match action {
+                                    "memory_get" => json!({"memory":{"id":"fixture-id","memory":"fixture fact"}}),
+                                    "memory_delete" if arguments.get("query").is_some() => {
+                                        json!({"mode":"preview","candidates":[{"id":"fixture-id"}]})
+                                    }
+                                    "memory_delete" => json!({"mode":"single","deleted":["fixture-id"],"failed":[]}),
+                                    _ => json!({"memory":"fixture memory result"}),
+                                };
+                                json!({"content":[{"type":"text","text":result.to_string()}]})
                             }
                         }
                         method => panic!("unexpected MCP method {method}"),
@@ -544,7 +572,7 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
     )
     .await;
 
-    for (index, (failure, action, expected_code)) in [
+    for (index, (failure, action, expected_code, prompt)) in [
         (None, "memory_search", None),
         (None, "memory_update", None),
         (None, "memory_list", None),
@@ -585,9 +613,7 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
         ),
     ]
     .into_iter()
-    .enumerate()
-    {
-        *rejection.lock().unwrap() = failure;
+    .map(|(failure, action, expected_code)| {
         let prompt = match (action, expected_code) {
             ("memory_search", Some("invalid_arguments")) => "Invalid search limit",
             ("memory_search", _) => "Recall a fixture preference",
@@ -595,6 +621,17 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
             ("memory_delete", _) => "Conflicting deletion arguments",
             _ => "Reclassify a fixture preference",
         };
+        (failure, action, expected_code, prompt)
+    })
+    .chain([
+        (None, "memory_delete", None, PREVIEW),
+        (None, "memory_delete", Some("invalid_memory_arguments"), INVALID_FILTER),
+        (None, "memory_delete", Some("memory_deletion_not_approved"), CANCEL),
+        (None, "memory_delete", None, APPROVE),
+    ])
+    .enumerate()
+    {
+        *rejection.lock().unwrap() = failure;
         let assistant = send_json(
             &app,
             "POST",
@@ -652,28 +689,51 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
         )
         .await;
         let confirmations = format!("{path}/confirmations");
-        let pending = wait_for_confirmation(&app, &confirmations, &token).await;
-        send_json(
-            &app,
-            "POST",
-            &format!("{confirmations}/{pending}/confirm"),
-            json!({"msg_id":"", "data":{"value":"proceed_once"}}),
-            auth,
-            StatusCode::OK,
-        )
-        .await;
+        if !matches!(prompt, CANCEL | APPROVE | INVALID_FILTER) {
+            let pending = wait_for_confirmation(&app, &confirmations, &token).await;
+            assert!(!pending.starts_with(MEM0_DELETE_CONFIRMATION_PREFIX));
+            send_json(
+                &app,
+                "POST",
+                &format!("{confirmations}/{pending}/confirm"),
+                json!({"msg_id":"", "data":{"value":"proceed_once"}}),
+                auth,
+                StatusCode::OK,
+            )
+            .await;
+        }
         let user_scope = format!("aion-user-{}", user.id);
         let agent_scope = format!("aion-assistant-{}", definition.id);
-        if action != "memory_delete" {
+        if matches!(prompt, CANCEL | APPROVE) {
+            let pending = wait_for_confirmation(&app, &confirmations, &token).await;
+            assert!(pending.starts_with(MEM0_DELETE_CONFIRMATION_PREFIX));
+            assert_eq!(
+                captured.try_recv().unwrap(),
+                (user_scope.clone(), agent_scope.clone(), "memory_get".into())
+            );
+            assert!(matches!(captured.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+            let choice = if prompt == CANCEL { "cancel" } else { "proceed_once" };
+            send_json(
+                &app,
+                "POST",
+                &format!("{confirmations}/{pending}/confirm"),
+                json!({"msg_id":"", "data":{"value":choice}}),
+                auth,
+                StatusCode::OK,
+            )
+            .await;
+        }
+        let methods: &[&str] = match prompt {
+            APPROVE => &["memory_get", "memory_delete"],
+            CANCEL | INVALID_FILTER | "Conflicting deletion arguments" => &[],
+            _ if matches!(failure, Some(("initialize", _))) => &["initialize"],
+            _ => std::slice::from_ref(&action),
+        };
+        for &method in methods {
             let scope = tokio::time::timeout(Duration::from_secs(12), captured.recv())
                 .await
                 .unwrap()
                 .unwrap();
-            let method = if matches!(failure, Some(("initialize", _))) {
-                "initialize"
-            } else {
-                action
-            };
             assert_eq!(scope, (user_scope.clone(), agent_scope.clone(), method.to_owned()));
         }
         let result = tokio::time::timeout(Duration::from_secs(12), captured_results.recv())
@@ -695,12 +755,20 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
                 );
             }
             if code == "invalid_memory_arguments" {
-                assert_eq!(
-                    result_json["issues"],
-                    json!([{"path":[],"reason":"conflicting_fields","fields":["memoryId","query"]}])
-                );
-                assert!(matches!(captured.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+                let issue = if prompt == INVALID_FILTER {
+                    json!({"path":["categories"],"reason":"preview_only"})
+                } else {
+                    json!({"path":[],"reason":"conflicting_fields","fields":["memoryId","query"]})
+                };
+                assert_eq!(result_json["issues"], json!([issue]));
             }
+        } else if prompt == PREVIEW {
+            assert_eq!(
+                result_json,
+                json!({"mode":"preview","candidates":[{"id":"fixture-id"}]})
+            );
+        } else if prompt == APPROVE {
+            assert_eq!(result_json["deleted"], json!(["fixture-id"]));
         } else if action == "memory_list" {
             assert_eq!(result_json["nextCursor"], "fixture-next");
             assert_eq!(result_json["truncated"], true);
@@ -708,6 +776,7 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
             assert_eq!(result_json["memory"], "fixture memory result");
         }
         wait_for_finished_turn(&app, &path, &token).await;
+        assert!(matches!(captured.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
     }
     server.abort();
 }
