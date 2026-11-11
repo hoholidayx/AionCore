@@ -57,12 +57,12 @@ impl Action {
     fn description(self) -> &'static str {
         match self {
             Self::Search => {
-                "Search this assistant's long-term memories by meaning, optionally filtered by categories or flat metadata."
+                "Search this assistant's long-term memories by meaning, optionally filtered by categories or flat metadata. Set includeExpired to view expired memories."
             }
-            Self::List => "List this assistant's long-term memories.",
+            Self::List => "List this assistant's long-term memories. Set includeExpired to view expired memories.",
             Self::Get => "Read a long-term memory by its exact ID.",
             Self::Add => {
-                "Save durable facts. Follow the Memory Triage Skill, search first, and pass either facts or text. Omit secrets."
+                "Save durable facts. Follow the Memory Triage Skill, search first, and pass either facts or text. Optionally set expirationDate (YYYY-MM-DD, UTC). Omit secrets."
             }
             Self::Update => {
                 "Update a long-term memory in place by ID. Provide text, category, importance, or metadata. Omit secrets."
@@ -81,18 +81,23 @@ impl Action {
             Self::Search => (
                 json!({
                     "query":text(), "limit":{"type":"integer","minimum":1,"maximum":50},
-                    "scope":scope(), "categories":{"type":"array","items":{"type":"string"}},
+                    "scope":scope(), "includeExpired":{"type":"boolean","default":false},
+                    "categories":{"type":"array","items":{"type":"string"}},
                     "filters":{"type":"object","description":"Flat metadata fields and comparison operators."}
                 }),
                 vec!["query"],
             ),
-            Self::List => (json!({"scope":scope()}), vec![]),
+            Self::List => (
+                json!({"scope":scope(),"includeExpired":{"type":"boolean","default":false}}),
+                vec![],
+            ),
             Self::Get => (json!({"memoryId":id()}), vec!["memoryId"]),
             Self::Add => (
                 json!({
                     "facts":{"type":"array","items":text(),"minItems":1,"maxItems":25},
                     "text":text(), "category":{"type":"string"}, "importance":{"type":"number","minimum":0,"maximum":1},
-                    "metadata":{"type":"object"}, "longTerm":{"type":"boolean","enum":[true]}
+                    "metadata":{"type":"object"}, "longTerm":{"type":"boolean","enum":[true]},
+                    "expirationDate":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"Last visible date in UTC (YYYY-MM-DD)."}
                 }),
                 vec![],
             ),

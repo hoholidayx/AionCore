@@ -22,3 +22,13 @@ fn memory_update_accepts_metadata_patches_for_a_valid_id() {
     assert!(!Action::Update.accepts(&json!({"memoryId":"invalid/id","category":"rp.habit"})));
     assert!(!Action::Update.accepts(&json!({"memoryId":"id-a","category":"rp.habit","agentId":"another"})));
 }
+
+#[test]
+fn memory_expiry_arguments_preserve_the_tool_and_scope_boundaries() {
+    assert!(Action::Add.accepts(&json!({"text":"Fixture","expirationDate":"2030-02-01"})));
+    assert!(Action::Search.accepts(&json!({"query":"Fixture","includeExpired":true})));
+    assert!(Action::List.accepts(&json!({"scope":"long-term","includeExpired":true})));
+    assert!(!Action::List.accepts(&json!({"scope":"session","includeExpired":true})));
+    assert!(!Action::Get.accepts(&json!({"memoryId":"id-a","includeExpired":true})));
+    assert!(!Action::Update.accepts(&json!({"memoryId":"id-a","expirationDate":"2030-02-01"})));
+}

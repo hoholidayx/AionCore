@@ -348,7 +348,7 @@ async fn two_assistants_share_one_mem0_key_with_distinct_host_scopes() {
     use axum::http::HeaderMap;
 
     const KEY: &str = "fixture-mem0-service-key-not-for-production";
-    const SEARCH_ARGS: &str = r#"{"query":"fixture preference"}"#;
+    const SEARCH_ARGS: &str = r#"{"query":"fixture preference","includeExpired":true}"#;
     const UPDATE_ARGS: &str = r#"{"memoryId":"fixture-id","category":"rp.habit"}"#;
     let (calls, mut captured) = mpsc::unbounded_channel();
     let router = Router::new()
@@ -373,6 +373,8 @@ async fn two_assistants_share_one_mem0_key_with_distinct_host_scopes() {
                     if tool_name == "memory_update" {
                         assert_eq!(parameters["properties"]["category"]["type"], "string");
                         assert_eq!(parameters["required"], json!(["memoryId"]));
+                    } else {
+                        assert_eq!(parameters["properties"]["includeExpired"]["type"], "boolean");
                     }
                     model_stream(
                         json!({"tool_calls":[{
