@@ -1,34 +1,130 @@
 use super::*;
 
 #[test]
+fn memory_argument_issues_only_report_trusted_fields() {
+    assert_eq!(
+        Action::Search.argument_issue(&json!({"qurey":"private fixture"})),
+        Some(json!({"path":[],"reason":"unknown_field","suggestion":"query"}))
+    );
+    assert_eq!(
+        Action::Search.argument_issue(&json!({("fixture-private-field".repeat(8)):"private fixture"})),
+        Some(json!({"path":[],"reason":"unknown_field"}))
+    );
+    assert_eq!(
+        Action::Search.argument_issue(&json!({"scope":"session","query":"fixture"})),
+        Some(json!({"path":["scope"],"reason":"invalid_value"}))
+    );
+    assert_eq!(
+        Action::Delete.argument_issue(&json!({"memoryId":"fixture","query":"private fixture"})),
+        Some(json!({"path":[],"reason":"conflicting_fields","fields":["memoryId","query"]}))
+    );
+}
+
+#[test]
 fn model_cannot_override_identity_or_request_session_or_bulk_memory() {
-    assert!(!Action::Search.accepts(&json!({"query":"test","agentId":"another"})));
-    assert!(!Action::Search.accepts(&json!({"query":"test","scope":"session"})));
-    assert!(!Action::Add.accepts(&json!({"text":"test","longTerm":false})));
-    assert!(!Action::Delete.accepts(&json!({"all":true,"confirm":true})));
-    assert!(!Action::Delete.accepts(&json!({"memoryId":"id-a","confirm":true})));
-    assert!(!Action::Delete.accepts(&json!({"memoryId":"id-a","query":"test"})));
-    assert!(!Action::Delete.accepts(&json!({"memoryId":"invalid/path"})));
-    assert!(Action::Delete.accepts(&json!({"memoryId":"id-a"})));
-    assert!(Action::Delete.accepts(&json!({"query":"duplicate preference"})));
+    assert!(
+        Action::Search
+            .argument_issue(&json!({"query":"test","agentId":"another"}))
+            .is_some()
+    );
+    assert!(
+        Action::Search
+            .argument_issue(&json!({"query":"test","scope":"session"}))
+            .is_some()
+    );
+    assert!(
+        Action::Add
+            .argument_issue(&json!({"text":"test","longTerm":false}))
+            .is_some()
+    );
+    assert!(
+        Action::Delete
+            .argument_issue(&json!({"all":true,"confirm":true}))
+            .is_some()
+    );
+    assert!(
+        Action::Delete
+            .argument_issue(&json!({"memoryId":"id-a","confirm":true}))
+            .is_some()
+    );
+    assert!(
+        Action::Delete
+            .argument_issue(&json!({"memoryId":"id-a","query":"test"}))
+            .is_some()
+    );
+    assert!(
+        Action::Delete
+            .argument_issue(&json!({"memoryId":"invalid/path"}))
+            .is_some()
+    );
+    assert!(Action::Delete.argument_issue(&json!({"memoryId":"id-a"})).is_none());
+    assert!(
+        Action::Delete
+            .argument_issue(&json!({"query":"duplicate preference"}))
+            .is_none()
+    );
 }
 
 #[test]
 fn memory_update_accepts_metadata_patches_for_a_valid_id() {
-    assert!(Action::Update.accepts(&json!({"memoryId":"id-a","text":"Corrected fact"})));
-    assert!(Action::Update.accepts(&json!({"memoryId":"id-a","category":"rp.habit","importance":0})));
-    assert!(Action::Update.accepts(&json!({"memoryId":"id-a","metadata":{"topic":"reading"}})));
-    assert!(!Action::Update.accepts(&json!({"memoryId":"id-a"})));
-    assert!(!Action::Update.accepts(&json!({"memoryId":"invalid/id","category":"rp.habit"})));
-    assert!(!Action::Update.accepts(&json!({"memoryId":"id-a","category":"rp.habit","agentId":"another"})));
+    assert!(
+        Action::Update
+            .argument_issue(&json!({"memoryId":"id-a","text":"Corrected fact"}))
+            .is_none()
+    );
+    assert!(
+        Action::Update
+            .argument_issue(&json!({"memoryId":"id-a","category":"rp.habit","importance":0}))
+            .is_none()
+    );
+    assert!(
+        Action::Update
+            .argument_issue(&json!({"memoryId":"id-a","metadata":{"topic":"reading"}}))
+            .is_none()
+    );
+    assert!(Action::Update.argument_issue(&json!({"memoryId":"id-a"})).is_some());
+    assert!(
+        Action::Update
+            .argument_issue(&json!({"memoryId":"invalid/id","category":"rp.habit"}))
+            .is_some()
+    );
+    assert!(
+        Action::Update
+            .argument_issue(&json!({"memoryId":"id-a","category":"rp.habit","agentId":"another"}))
+            .is_some()
+    );
 }
 
 #[test]
 fn memory_expiry_arguments_preserve_the_tool_and_scope_boundaries() {
-    assert!(Action::Add.accepts(&json!({"text":"Fixture","expirationDate":"2030-02-01"})));
-    assert!(Action::Search.accepts(&json!({"query":"Fixture","includeExpired":true})));
-    assert!(Action::List.accepts(&json!({"scope":"long-term","includeExpired":true})));
-    assert!(!Action::List.accepts(&json!({"scope":"session","includeExpired":true})));
-    assert!(!Action::Get.accepts(&json!({"memoryId":"id-a","includeExpired":true})));
-    assert!(!Action::Update.accepts(&json!({"memoryId":"id-a","expirationDate":"2030-02-01"})));
+    assert!(
+        Action::Add
+            .argument_issue(&json!({"text":"Fixture","expirationDate":"2030-02-01"}))
+            .is_none()
+    );
+    assert!(
+        Action::Search
+            .argument_issue(&json!({"query":"Fixture","includeExpired":true}))
+            .is_none()
+    );
+    assert!(
+        Action::List
+            .argument_issue(&json!({"scope":"long-term","includeExpired":true}))
+            .is_none()
+    );
+    assert!(
+        Action::List
+            .argument_issue(&json!({"scope":"session","includeExpired":true}))
+            .is_some()
+    );
+    assert!(
+        Action::Get
+            .argument_issue(&json!({"memoryId":"id-a","includeExpired":true}))
+            .is_some()
+    );
+    assert!(
+        Action::Update
+            .argument_issue(&json!({"memoryId":"id-a","expirationDate":"2030-02-01"}))
+            .is_some()
+    );
 }

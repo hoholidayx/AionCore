@@ -129,28 +129,95 @@ impl Action {
         json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
     }
 
-    fn accepts(self, input: &Value) -> bool {
-        let Some(args) = input.as_object() else { return false };
+    fn argument_issue(self, input: &Value) -> Option<Value> {
+        let Some(args) = input.as_object() else {
+            return Some(json!({"path":[],"reason":"invalid_type"}));
+        };
         let schema = self.schema();
-        if args.keys().any(|key| schema["properties"].get(key).is_none()) {
-            return false;
+        let properties = schema["properties"].as_object().expect("tool schema properties");
+        if let Some(unknown) = args.keys().find(|key| !properties.contains_key(*key)) {
+            let mut issue = json!({"path":[],"reason":"unknown_field"});
+            if unknown.len() <= 32
+                && unknown.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+                && unknown.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                let mut matches = properties.keys().filter(|field| one_edit_apart(unknown, field));
+                if let (Some(suggestion), None) = (matches.next(), matches.next()) {
+                    issue["suggestion"] = json!(suggestion);
+                }
+            }
+            return Some(issue);
         }
         if let Some(scope) = args.get("scope")
             && !matches!(scope.as_str(), Some("all" | "long-term"))
         {
-            return false;
+            return Some(field_issue("scope", "invalid_value"));
         }
         match self {
-            Self::Add => args.get("longTerm").is_none_or(|value| value.as_bool() == Some(true)),
-            Self::Update => args.len() > 1 && args.get("memoryId").and_then(Value::as_str).is_some_and(valid_id),
-            Self::Delete => match (args.get("query"), args.get("memoryId")) {
-                (Some(query), None) => query.as_str().is_some_and(|text| !text.trim().is_empty()),
-                (None, Some(id)) => id.as_str().is_some_and(valid_id),
-                _ => false,
+            Self::Add => args
+                .get("longTerm")
+                .filter(|value| value.as_bool() != Some(true))
+                .map(|_| field_issue("longTerm", "invalid_value")),
+            Self::Update => match args.get("memoryId") {
+                None => Some(field_issue("memoryId", "missing")),
+                Some(id) => memory_id_issue(id).or_else(|| {
+                    (args.len() == 1).then(|| {
+                        json!({"path":[],"reason":"empty_patch","fields":["text","category","importance","metadata"]})
+                    })
+                }),
             },
-            _ => true,
+            Self::Delete => match (args.get("query"), args.get("memoryId")) {
+                (Some(query), None) => match query.as_str() {
+                    Some(text) if !text.trim().is_empty() => None,
+                    Some(_) => Some(field_issue("query", "invalid_value")),
+                    None => Some(field_issue("query", "invalid_type")),
+                },
+                (None, Some(id)) => memory_id_issue(id),
+                (query, _) => {
+                    let reason = if query.is_some() {
+                        "conflicting_fields"
+                    } else {
+                        "missing_choice"
+                    };
+                    Some(json!({"path":[],"reason":reason,"fields":["memoryId","query"]}))
+                }
+            },
+            _ => None,
         }
     }
+}
+
+fn field_issue(field: &str, reason: &str) -> Value {
+    json!({"path":[field],"reason":reason})
+}
+
+fn memory_id_issue(id: &Value) -> Option<Value> {
+    match id.as_str() {
+        Some(id) if valid_id(id) => None,
+        Some(_) => Some(field_issue("memoryId", "invalid_value")),
+        None => Some(field_issue("memoryId", "invalid_type")),
+    }
+}
+
+fn one_edit_apart(name: &str, field: &str) -> bool {
+    let (short, long) = if name.len() <= field.len() {
+        (name.as_bytes(), field.as_bytes())
+    } else {
+        (field.as_bytes(), name.as_bytes())
+    };
+    if long.len() - short.len() > 1 {
+        return false;
+    }
+    let first = short.iter().zip(long).position(|(a, b)| a != b).unwrap_or(short.len());
+    if short.len() != long.len() {
+        return short[first..] == long[first + 1..];
+    }
+    first < short.len()
+        && (short[first + 1..] == long[first + 1..]
+            || (first + 1 < short.len()
+                && short[first] == long[first + 1]
+                && short[first + 1] == long[first]
+                && short[first + 2..] == long[first + 2..]))
 }
 
 fn valid_id(id: &str) -> bool {
@@ -199,10 +266,7 @@ impl Mem0Client {
             });
         };
         if reply.is_error {
-            return Err(ToolResult {
-                content: result.to_string(),
-                is_error: true,
-            });
+            return Err(error_result(result));
         }
         Ok(result)
     }
@@ -289,19 +353,24 @@ pub(super) fn tools(binding: Mem0Binding, approvals: Arc<Mem0DeleteApprovals>) -
 }
 
 fn failure(code: &str, message: &str) -> ToolResult {
+    error_result(json!({"code": code, "message": message}))
+}
+
+fn error_result(data: Value) -> ToolResult {
     ToolResult {
-        content: json!({"code": code, "message": message}).to_string(),
+        content: data.to_string(),
         is_error: true,
     }
 }
 
 impl Mem0Tool {
     async fn run(&self, input: Value) -> Result<Value, ToolResult> {
-        if !self.action.accepts(&input) {
-            return Err(failure(
-                "invalid_memory_arguments",
-                "Use valid arguments within the assistant's long-term memory scope.",
-            ));
+        if let Some(issue) = self.action.argument_issue(&input) {
+            return Err(error_result(json!({
+                "code":"invalid_memory_arguments",
+                "message":"Use valid arguments within the assistant's long-term memory scope.",
+                "issues":[issue]
+            })));
         }
         if !self.client.binding.is_entitled().await {
             return Err(failure(

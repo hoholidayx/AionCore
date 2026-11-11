@@ -351,6 +351,8 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
     const KEY: &str = "fixture-mem0-service-key-not-for-production";
     const SEARCH_ARGS: &str = r#"{"query":"fixture preference","includeExpired":true,"since":"2026-11-01","until":"2026-11-02T08:00:00+08:00","timeField":"updated_at"}"#;
     const UPDATE_ARGS: &str = r#"{"memoryId":"fixture-id","category":"rp.habit"}"#;
+    const INVALID_SEARCH_ARGS: &str = r#"{"query":"fixture preference","limit":"fixture-private-value"}"#;
+    const CONFLICTING_DELETE_ARGS: &str = r#"{"memoryId":"fixture-id","query":"fixture-private-value"}"#;
     const PRIVATE_MARKER: &str = "fixture-private-remote-value";
     let (calls, mut captured) = mpsc::unbounded_channel();
     let (results, mut captured_results) = mpsc::unbounded_channel();
@@ -362,8 +364,13 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
             post(move |Json(request): Json<Value>| {
                 let last = request["messages"].as_array().unwrap().last().unwrap();
                 let response = if last["role"] == "user" {
-                    let (tool_name, arguments) = if last["content"].to_string().contains("Reclassify") {
+                    let prompt = last["content"].to_string();
+                    let (tool_name, arguments) = if prompt.contains("Reclassify") {
                         ("memory_update", UPDATE_ARGS)
+                    } else if prompt.contains("Invalid search") {
+                        ("memory_search", INVALID_SEARCH_ARGS)
+                    } else if prompt.contains("Conflicting deletion") {
+                        ("memory_delete", CONFLICTING_DELETE_ARGS)
                     } else {
                         ("memory_search", SEARCH_ARGS)
                     };
@@ -378,7 +385,7 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
                     if tool_name == "memory_update" {
                         assert_eq!(parameters["properties"]["category"]["type"], "string");
                         assert_eq!(parameters["required"], json!(["memoryId"]));
-                    } else {
+                    } else if tool_name == "memory_search" {
                         assert_eq!(parameters["properties"]["includeExpired"]["type"], "boolean");
                         assert_eq!(parameters["properties"]["since"]["type"], "string");
                         assert_eq!(parameters["properties"]["until"]["type"], "string");
@@ -447,6 +454,9 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
                         "tools/call" => {
                             let action = request["params"]["name"].as_str().unwrap();
                             let expected = match action {
+                                "memory_search" if failure == Some(("tools/call", StatusCode::OK)) => {
+                                    INVALID_SEARCH_ARGS
+                                }
                                 "memory_search" => SEARCH_ARGS,
                                 "memory_update" => UPDATE_ARGS,
                                 other => panic!("unexpected memory tool {other}"),
@@ -459,9 +469,18 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
                                 .send((user.to_owned(), agent.to_owned(), action.to_owned()))
                                 .unwrap();
                             if let Some(("tools/call", status)) = failure {
-                                return (status, Json(json!({"error": PRIVATE_MARKER}))).into_response();
+                                if !status.is_success() {
+                                    return (status, Json(json!({"error": PRIVATE_MARKER}))).into_response();
+                                }
+                                let diagnostic = json!({
+                                    "code":"invalid_arguments",
+                                    "message":"Arguments do not match the tool schema.",
+                                    "issues":[{"path":["limit"],"reason":"invalid_type"}]
+                                });
+                                json!({"isError":true,"content":[{"type":"text","text":diagnostic.to_string()}]})
+                            } else {
+                                json!({"content":[{"type":"text","text":"{\"memory\":\"fixture memory result\"}"}]})
                             }
-                            json!({"content":[{"type":"text","text":"{\"memory\":\"fixture memory result\"}"}]})
                         }
                         method => panic!("unexpected MCP method {method}"),
                     };
@@ -538,15 +557,26 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
             "memory_update",
             Some("write_unconfirmed"),
         ),
+        (
+            Some(("tools/call", StatusCode::OK)),
+            "memory_search",
+            Some("invalid_arguments"),
+        ),
+        (
+            Some(("initialize", StatusCode::BAD_REQUEST)),
+            "memory_delete",
+            Some("invalid_memory_arguments"),
+        ),
     ]
     .into_iter()
     .enumerate()
     {
         *rejection.lock().unwrap() = failure;
-        let prompt = if action == "memory_search" {
-            "Recall a fixture preference"
-        } else {
-            "Reclassify a fixture preference"
+        let prompt = match (action, expected_code) {
+            ("memory_search", Some("invalid_arguments")) => "Invalid search limit",
+            ("memory_search", _) => "Recall a fixture preference",
+            ("memory_delete", _) => "Conflicting deletion arguments",
+            _ => "Reclassify a fixture preference",
         };
         let assistant = send_json(
             &app,
@@ -615,23 +645,20 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
             StatusCode::OK,
         )
         .await;
-        let scope = tokio::time::timeout(Duration::from_secs(12), captured.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            scope,
-            (
-                format!("aion-user-{}", user.id),
-                format!("aion-assistant-{}", definition.id),
-                if matches!(failure, Some(("initialize", _))) {
-                    "initialize"
-                } else {
-                    action
-                }
-                .to_owned(),
-            )
-        );
+        let user_scope = format!("aion-user-{}", user.id);
+        let agent_scope = format!("aion-assistant-{}", definition.id);
+        if action != "memory_delete" {
+            let scope = tokio::time::timeout(Duration::from_secs(12), captured.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let method = if matches!(failure, Some(("initialize", _))) {
+                "initialize"
+            } else {
+                action
+            };
+            assert_eq!(scope, (user_scope.clone(), agent_scope.clone(), method.to_owned()));
+        }
         let result = tokio::time::timeout(Duration::from_secs(12), captured_results.recv())
             .await
             .unwrap()
@@ -641,8 +668,22 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
             assert_eq!(result_json["code"], code);
             assert!(!result.contains(PRIVATE_MARKER));
             assert!(!result.contains(KEY));
-            assert!(!result.contains(&scope.0));
-            assert!(!result.contains(&scope.1));
+            assert!(!result.contains(&user_scope));
+            assert!(!result.contains(&agent_scope));
+            assert!(!result.contains("fixture-private-value"));
+            if code == "invalid_arguments" {
+                assert_eq!(
+                    result_json["issues"],
+                    json!([{"path":["limit"],"reason":"invalid_type"}])
+                );
+            }
+            if code == "invalid_memory_arguments" {
+                assert_eq!(
+                    result_json["issues"],
+                    json!([{"path":[],"reason":"conflicting_fields","fields":["memoryId","query"]}])
+                );
+                assert!(matches!(captured.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+            }
         } else {
             assert_eq!(result_json["memory"], "fixture memory result");
         }
