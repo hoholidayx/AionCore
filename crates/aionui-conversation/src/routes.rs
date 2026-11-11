@@ -172,11 +172,34 @@ pub fn conversation_attachment_routes(jobs: Arc<AsyncImageJobs>, service: Arc<Co
                     "/api/conversations/{conversation_id}/messages/{message_id}/image",
                     get(read_tool_image),
                 )
+                .route(
+                    "/api/conversations/{conversation_id}/dots-attachments/{attachment_id}",
+                    get(read_dots_attachment),
+                )
                 .with_state(service),
         )
 }
 
 // ── Handlers ───────────────────────────────────────────────────────
+
+async fn read_dots_attachment(
+    State(service): State<Arc<ConversationService>>,
+    Extension(user): Extension<CurrentUser>,
+    Path((conversation_id, attachment_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let file = service
+        .read_dots_attachment(&user.id, &conversation_id, &attachment_id)
+        .await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, file.content_type),
+            (header::CACHE_CONTROL, "private, no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        file.bytes,
+    )
+        .into_response())
+}
 
 async fn read_async_image(
     State(jobs): State<Arc<AsyncImageJobs>>,

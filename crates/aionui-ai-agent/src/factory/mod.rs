@@ -41,6 +41,7 @@ pub struct AgentFactoryDeps {
     /// inject enabled servers into `session/new` (ELECTRON-1JG fix).
     /// `None` for tests/composition paths that do not need MCP injection.
     pub mcp_server_repo: Option<Arc<dyn IMcpServerRepository>>,
+    pub dots_turns: Option<Arc<dyn crate::dots::DotsTurns>>,
     pub async_image_queue: Option<Arc<dyn crate::async_image::AsyncImageQueue>>,
     /// Subprocess spawner for the clean-slate session model. claude/codex always
     /// run through `SessionAgentTask` (direct-CLI) instead of the ACP manager, so

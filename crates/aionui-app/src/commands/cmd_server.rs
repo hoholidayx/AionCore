@@ -330,6 +330,13 @@ pub(crate) async fn run_server(
     let mut async_image_handle = tokio::spawn(async move {
         async_image_jobs.run(async_image_shutdown).await;
     });
+    if let Err(error) = services.conversation_service.recover_dots_turns().await {
+        warn!(%error, "Dots turn recovery failed");
+    }
+    let dots_handle = services.conversation_service.dots().cloned().map(|dots| {
+        let shutdown = shutdown_rx.clone();
+        tokio::spawn(async move { dots.run(shutdown).await })
+    });
     let (shutdown_error_tx, shutdown_error_rx) = tokio::sync::oneshot::channel::<BootstrapError>();
     let idle_cleanup_coordinator: Arc<dyn aionui_ai_agent::IdleCleanupCoordinator> =
         Arc::new(TeamIdleCleanupCoordinator::new(
@@ -493,6 +500,15 @@ pub(crate) async fn run_server(
             async_image_handle.abort();
             let _ = async_image_handle.await;
         }
+    }
+
+    if let Some(mut handle) = dots_handle
+        && tokio::time::timeout(SHUTDOWN_ASYNC_IMAGE_JOIN_TIMEOUT, &mut handle)
+            .await
+            .is_err()
+    {
+        handle.abort();
+        let _ = handle.await;
     }
 
     // `sqlx::Pool::close()` waits for all checked-out connections to be

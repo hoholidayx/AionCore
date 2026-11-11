@@ -9,6 +9,7 @@ pub mod conversation;
 pub mod cron;
 pub mod diagnostics;
 mod diagnostics_sanitizer;
+pub mod dots;
 pub mod mcp_server;
 pub mod oauth_token;
 pub mod project;

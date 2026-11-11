@@ -349,6 +349,8 @@ fn reject_deprecated_runtime_row(row: &ConversationRow) -> Result<(), Conversati
 #[derive(Clone)]
 pub struct ConversationService {
     workspace_root: PathBuf,
+    dots: Option<Arc<crate::dots::DotsService>>,
+    dots_repo: Option<Arc<dyn aionui_db::IDotsRepository>>,
     broadcaster: Arc<dyn EventBroadcaster>,
     skill_resolver: Arc<dyn SkillResolver>,
     task_manager: Arc<dyn IWorkerTaskManager>,
@@ -453,6 +455,8 @@ impl ConversationService {
         acp_session_repo: Arc<dyn IAcpSessionRepository>,
     ) -> Self {
         Self {
+            dots: None,
+            dots_repo: None,
             workspace_root,
             broadcaster,
             skill_resolver,
@@ -480,6 +484,132 @@ impl ConversationService {
             agent_metadata_repo,
             acp_session_repo,
         }
+    }
+
+    pub fn with_dots(
+        mut self,
+        dots: Option<Arc<crate::dots::DotsService>>,
+        repo: Option<Arc<dyn aionui_db::IDotsRepository>>,
+    ) -> Self {
+        self.dots = dots;
+        self.dots_repo = repo;
+        self
+    }
+
+    pub fn dots(&self) -> Option<&Arc<crate::dots::DotsService>> {
+        self.dots.as_ref()
+    }
+
+    pub fn dots_repo(&self) -> Option<&Arc<dyn aionui_db::IDotsRepository>> {
+        self.dots_repo.as_ref()
+    }
+
+    /// Reconcile the server-managed conversation with the configured owner.
+    pub async fn reconcile_dots(&self, repo: &dyn aionui_db::IDotsRepository) -> Result<(), ConversationError> {
+        let mut existing = None;
+        for (owner, id) in repo.defaults().await? {
+            if self.dots.as_ref().is_some_and(|dots| dots.owns(&owner)) {
+                existing = Some(id);
+            } else {
+                let _lifecycle = self.runtime_state.lock_lifecycle(&id).await?;
+                self.delete_local(&owner, &id).await?;
+            }
+        }
+        if let Some(dots) = &self.dots {
+            let id = match existing {
+                Some(id) => id,
+                None => {
+                    self.create_with_origin(
+                        dots.owner(),
+                        CreateConversationRequest {
+                            r#type: Some(AgentType::Acp),
+                            name: Some("Dots".into()),
+                            model: None,
+                            assistant: None,
+                            source: None,
+                            channel_chat_id: None,
+                            extra: serde_json::json!({"backend": crate::dots::BACKEND}),
+                        },
+                        false,
+                        true,
+                    )
+                    .await?
+                    .id
+                }
+            };
+            dots.set_default(id);
+        }
+        Ok(())
+    }
+
+    /// Re-attach live turn status to requests that outlived the Aion process.
+    /// The Dots worker still owns submission and receipt persistence.
+    pub async fn recover_dots_turns(&self) -> Result<(), ConversationError> {
+        let Some(dots) = &self.dots else { return Ok(()) };
+        let user = dots.owner();
+        for pending in dots.pending().await? {
+            let Some(row) = self.conversation_repo.get(user, &pending.conversation_id).await? else {
+                continue;
+            };
+            let turn_id = Self::mint_turn_id();
+            let Ok(turn_claim) = self.runtime_state.try_claim_turn(&row.id, &turn_id) else {
+                continue;
+            };
+            let build_options = match self.build_task_options_for_session(&row, None, false).await {
+                Ok(options) => options,
+                Err(error) => {
+                    warn!(conversation_id = %row.id, code = error.error_code(), "Dots runtime status recovery failed");
+                    continue;
+                }
+            };
+            let stored_workspace = build_options.context.workspace.stored_path.clone();
+            ConversationTurnOrchestrator::new(self.clone(), self.task_manager.clone()).spawn_user_turn(
+                TurnStartInput {
+                    user_id: user.to_owned(),
+                    conversation: row,
+                    content: pending.text,
+                    files: Vec::new(),
+                    durable_message_id: Some(pending.message_id),
+                    inject_skills: Vec::new(),
+                    required_runtime_mode: None,
+                    build_options,
+                    stored_workspace,
+                    turn_id,
+                    turn_claim,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn read_dots_attachment(
+        &self,
+        user: &str,
+        conversation: &str,
+        attachment: &str,
+    ) -> Result<crate::dots::DotsDownload, ConversationError> {
+        let row = self.require_conversation(user, conversation).await?;
+        let not_found = || ConversationError::NotFound { id: attachment.into() };
+        let repo = self
+            .dots_repo
+            .as_ref()
+            .filter(|_| crate::dots::is_dots(&row) && crate::dots::is_artifact_id(attachment))
+            .ok_or_else(not_found)?;
+        let binding = repo
+            .artifact_binding(user, conversation, attachment)
+            .await?
+            .ok_or_else(not_found)?;
+        let workspace =
+            auto_provisioned_workspace_to_delete(&self.workspace_root, &row, conversation).ok_or_else(not_found)?;
+        if let Some(file) = crate::dots::local_attachment(&workspace, attachment).await {
+            return Ok(file);
+        }
+        let dots = self
+            .dots
+            .as_ref()
+            .filter(|dots| dots.is_attachment_source(user, &binding))
+            .ok_or_else(not_found)?;
+        dots.fetch_attachment(&workspace, attachment).await
     }
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
@@ -1116,6 +1246,17 @@ impl ConversationService {
         req: CreateConversationRequest,
         authenticated_session: bool,
     ) -> Result<ConversationResponse, ConversationError> {
+        self.create_with_origin(user_id, req, authenticated_session, false)
+            .await
+    }
+
+    async fn create_with_origin(
+        &self,
+        user_id: &str,
+        req: CreateConversationRequest,
+        authenticated_session: bool,
+        dots_default: bool,
+    ) -> Result<ConversationResponse, ConversationError> {
         let id = generate_short_id();
         let now = now_ms();
         let source = req.source.unwrap_or(ConversationSource::Aionui);
@@ -1128,6 +1269,7 @@ impl ConversationService {
         strip_request_fork_spec(&mut extra);
         if let Some(obj) = extra.as_object_mut() {
             obj.remove(ASSISTANT_RUNTIME_PROVENANCE_KEY);
+            obj.remove(crate::dots::DEFAULT_MARKER);
         }
 
         let assistant_id = req
@@ -1257,18 +1399,6 @@ impl ConversationService {
         // `{data_dir}/conversations/YYYY/MM/DD/{label}-temp-{id}/`.
         // Skill wiring runs for both kinds so native CLI discovery behaves
         // consistently.
-        let user_supplied_workspace = match extra
-            .get("workspace")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            Some(workspace) => Some(normalize_workspace_path(workspace)?),
-            None => None,
-        };
-        if let Some(workspace) = user_supplied_workspace.as_ref() {
-            extra["workspace"] = serde_json::Value::String(workspace.clone());
-        }
-
         let assistant_backend = assistant_snapshot
             .as_ref()
             .map(|snapshot| snapshot.runtime_backend.clone())
@@ -1280,6 +1410,55 @@ impl ConversationService {
                 .filter(|backend| !backend.is_empty())
                 .map(str::to_owned)
         });
+
+        let explicit_dots_agent =
+            extra.get("agent_id").and_then(serde_json::Value::as_str) == Some(aionui_ai_agent::dots::AGENT_ID);
+        let dots = effective_type == AgentType::Acp
+            && (effective_backend.as_deref() == Some(crate::dots::BACKEND)
+                || (effective_backend.is_none() && explicit_dots_agent));
+        if explicit_dots_agent && !dots {
+            return Err(ConversationError::BadRequest {
+                reason: "Dots agent requires the Dots backend".into(),
+            });
+        }
+        let effective_backend = if dots {
+            Some(crate::dots::BACKEND.into())
+        } else {
+            effective_backend
+        };
+        if dots {
+            if !self.dots.as_ref().is_some_and(|dots| dots.owns(user_id)) {
+                return Err(ConversationError::NotFound {
+                    id: crate::dots::BACKEND.into(),
+                });
+            }
+            if source != ConversationSource::Aionui || req.channel_chat_id.is_some() || extra.get("team_id").is_some() {
+                return Err(ConversationError::BadRequest {
+                    reason: "Dots is only available in personal conversations".into(),
+                });
+            }
+            if let Some(obj) = extra.as_object_mut() {
+                obj.remove("workspace");
+                obj.insert("backend".into(), crate::dots::BACKEND.into());
+                obj.insert("agent_id".into(), aionui_ai_agent::dots::AGENT_ID.into());
+                obj.insert("agent_source".into(), "builtin".into());
+                if dots_default {
+                    obj.insert(crate::dots::DEFAULT_MARKER.into(), true.into());
+                }
+            }
+        }
+
+        let user_supplied_workspace = match extra
+            .get("workspace")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            Some(workspace) => Some(normalize_workspace_path(workspace)?),
+            None => None,
+        };
+        if let Some(workspace) = user_supplied_workspace.as_ref() {
+            extra["workspace"] = serde_json::Value::String(workspace.clone());
+        }
 
         // Statement, not a binding: the path itself is no longer needed now that
         // skill delivery does not write into the workspace. The side effects still
@@ -2280,6 +2459,15 @@ impl ConversationService {
         } else {
             false
         };
+        if crate::dots::is_dots(&row) {
+            extra["dots_connection"] = serde_json::Value::String(
+                self.dots
+                    .as_ref()
+                    .filter(|dots| dots.owns(user_id))
+                    .map_or("disabled", |dots| dots.health())
+                    .into(),
+            );
+        }
         let row_agent_type = parse_agent_type_from_row(&row);
         let mut response = row_to_response_with_extra(row, extra, &self.workspace_root)?;
         self.attach_assistant_identity(user_id, &mut response).await?;
@@ -2386,6 +2574,22 @@ impl ConversationService {
         self.reject_pending_codex_delete(&existing).await?;
 
         let existing_type: AgentType = string_to_enum(&existing.r#type)?;
+
+        if let Some(incoming) = &req.extra {
+            let dots = crate::dots::is_dots(&existing);
+            let stored: serde_json::Value = serde_json::from_str(&existing.extra).unwrap_or_default();
+            let changes_dots_identity = ["backend", "agent_id", "agent_source", "workspace"]
+                .iter()
+                .any(|key| incoming.get(key).is_some_and(|value| stored.get(key) != Some(value)));
+            if incoming.get(crate::dots::DEFAULT_MARKER).is_some()
+                || (dots && changes_dots_identity)
+                || incoming.get("backend").and_then(serde_json::Value::as_str) == Some(crate::dots::BACKEND) && !dots
+            {
+                return Err(ConversationError::BadRequest {
+                    reason: "Dots conversation identity cannot be changed".into(),
+                });
+            }
+        }
 
         // Skill and MCP projections, and the provenance that authorizes their
         // next-turn refresh, are controlled by the server.
@@ -2753,7 +2957,13 @@ impl ConversationService {
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
     pub async fn delete(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
         let _lifecycle = self.runtime_state.lock_lifecycle(id).await?;
-        self.delete_local(user_id, id).await
+        let row = self.require_conversation(user_id, id).await?;
+        if crate::dots::is_default(&row) {
+            return Err(ConversationError::Forbidden {
+                reason: "The default Dots conversation is managed by the server".into(),
+            });
+        }
+        self.delete_local_row(user_id, id, row).await
     }
 
     async fn require_conversation(&self, user_id: &str, id: &str) -> Result<ConversationRow, ConversationError> {
@@ -2766,6 +2976,15 @@ impl ConversationService {
     async fn delete_local(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
         let existing = self.require_conversation(user_id, id).await?;
 
+        self.delete_local_row(user_id, id, existing).await
+    }
+
+    async fn delete_local_row(
+        &self,
+        user_id: &str,
+        id: &str,
+        existing: ConversationRow,
+    ) -> Result<(), ConversationError> {
         let source: Option<ConversationSource> = existing
             .source
             .as_deref()
@@ -4050,7 +4269,7 @@ impl ConversationService {
         task_manager: &Arc<dyn IWorkerTaskManager>,
         origin: ConversationSendOrigin,
     ) -> Result<SendMessageResponse, ConversationError> {
-        if req.content.trim().is_empty() {
+        if req.content.trim().is_empty() && req.files.is_empty() {
             return Err(ConversationError::BadRequest {
                 reason: "Message content must not be empty".into(),
             });
@@ -4080,6 +4299,29 @@ impl ConversationService {
         }
 
         reject_deprecated_runtime_row(&row)?;
+
+        let dots =
+            if crate::dots::is_dots(&row) {
+                let service = self.dots.as_ref().filter(|dots| dots.owns(user_id)).ok_or_else(|| {
+                    ConversationError::NotFound {
+                        id: crate::dots::BACKEND.into(),
+                    }
+                })?;
+                crate::dots::DotsService::validate(&req.content, req.files.len())?;
+                if !req.sessions.is_empty() || !req.inject_skills.is_empty() {
+                    return Err(ConversationError::BadRequest {
+                        reason: "Dots accepts message text and explicit file attachments".into(),
+                    });
+                }
+                Some(service)
+            } else {
+                if req.content.trim().is_empty() {
+                    return Err(ConversationError::BadRequest {
+                        reason: "Message content must not be empty".into(),
+                    });
+                }
+                None
+            };
 
         // `@@` references resolve at the same boundary and with the same
         // atomicity as file attachments. Sender workspace comes from the row so
@@ -4229,7 +4471,12 @@ impl ConversationService {
         // (with the statusChanged flip) — doing it again would duplicate the
         // row and the live-view bubble.
         if !was_fallback {
-            if let Err(e) = self.conversation_repo.insert_message(user_id, &user_msg).await {
+            if let Some(dots) = dots {
+                let workspace = auto_provisioned_workspace_to_delete(&self.workspace_root, &row, conversation_id)
+                    .ok_or_else(|| ConversationError::internal("Dots workspace is unavailable"))?;
+                dots.enqueue(&workspace, &user_msg, &req.content, &resolved.files)
+                    .await?;
+            } else if let Err(e) = self.conversation_repo.insert_message(user_id, &user_msg).await {
                 warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert user message");
                 return Err(e.into());
             }
@@ -4285,8 +4532,9 @@ impl ConversationService {
         ConversationTurnOrchestrator::new(self.clone(), Arc::clone(task_manager)).spawn_user_turn(TurnStartInput {
             user_id: user_id.to_owned(),
             conversation: row,
-            content: resolved.content,
-            files: resolved.files,
+            content: if dots.is_some() { req.content } else { resolved.content },
+            files: if dots.is_some() { Vec::new() } else { resolved.files },
+            durable_message_id: dots.map(|_| user_msg_id.clone()),
             inject_skills: req.inject_skills,
             required_runtime_mode: None,
             build_options: build_opts,
@@ -4410,6 +4658,7 @@ impl ConversationService {
                 conversation: row,
                 content: request.content,
                 files: request.files,
+                durable_message_id: None,
                 inject_skills: request.inject_skills,
                 required_runtime_mode: request.required_runtime_mode,
                 build_options: build_opts,
@@ -4589,12 +4838,19 @@ impl ConversationService {
         cause: TurnCancelCause,
     ) -> Result<CancelConversationResponse, ConversationError> {
         // Verify conversation exists and belongs to user
-        self.conversation_repo
+        let row = self
+            .conversation_repo
             .get(user_id, conversation_id)
             .await?
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
+
+        if crate::dots::is_dots(&row) {
+            return Err(ConversationError::Unprocessable {
+                reason: "Dots does not support remote turn cancellation".into(),
+            });
+        }
 
         let active_turn_id = self.runtime_state.active_turn_id_for(conversation_id);
         if active_turn_id.as_deref() != Some(turn_id) {

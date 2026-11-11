@@ -101,6 +101,7 @@ fn make_factory(
         broadcaster: Arc::new(BroadcastEventBus::new(16)),
         backend_binary_path: Arc::new(data_dir.join("aioncore")),
         mcp_server_repo: None,
+        dots_turns: None,
         async_image_queue: None,
         session_spawner,
         // No hook bridge in this test: it exercises provider wiring, not the

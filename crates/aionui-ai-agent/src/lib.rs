@@ -11,6 +11,7 @@ pub mod cc_switch;
 mod claude_flags;
 pub(crate) mod cli_probe;
 pub(crate) mod dev_prompt_dump;
+pub mod dots;
 pub mod error;
 pub mod factory;
 pub(crate) mod idle_scanner;

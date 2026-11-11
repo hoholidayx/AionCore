@@ -11,10 +11,10 @@ use aionui_ai_agent::{
 };
 use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_encryption_secret, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
+use aionui_conversation::dots::{DotsConfig, DotsService};
 use aionui_conversation::image_jobs::AsyncImageJobs;
 use aionui_conversation::service::CodexHistoryDeletion;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
-use aionui_db::SqliteAsyncImageJobRepository;
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
     IProjectStore, ISkillRepository, IUserOrderStore, IUserRepository, SqliteAcpSessionRepository,
@@ -23,6 +23,7 @@ use aionui_db::{
     SqliteMcpServerRepository, SqliteProjectStore, SqliteProviderRepository, SqliteSettingsRepository,
     SqliteSkillRepository, SqliteUserOrderStore, SqliteUserRepository,
 };
+use aionui_db::{IDotsRepository, SqliteAsyncImageJobRepository, SqliteDotsRepository, UpsertAgentMetadataParams};
 use aionui_project::ProjectService;
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 use aionui_session_message::QueueClearingCancelHook;
@@ -144,6 +145,10 @@ impl AppServices {
             user_repo: self.user_repo.clone(),
             identity_mode: self.identity_mode,
         })
+        .with_dots(
+            self.conversation_service.dots().cloned(),
+            self.conversation_service.dots_repo().cloned(),
+        )
         .with_codex_history_deletion(codex_history_deletion);
         self
     }
@@ -289,6 +294,52 @@ impl AppServices {
 
         let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
             Arc::new(SqliteAgentMetadataRepository::new(database.pool().clone()));
+        let dots_repo: Arc<dyn IDotsRepository> = Arc::new(SqliteDotsRepository::new(database.pool().clone()));
+        let (dots, dots_configuration_valid) = match DotsConfig::load(&data_dir) {
+            Ok(None) => (None, true),
+            Ok(Some(config)) => {
+                let owner = match config.owner_id.as_deref() {
+                    Some(id) => user_repo.find_by_id(id).await?,
+                    None => user_repo.get_primary_webui_user().await?,
+                };
+                match owner {
+                    Some(owner) => match DotsService::new(
+                        config,
+                        owner.id,
+                        dots_repo.clone(),
+                        conversation_repo.clone(),
+                        event_bus.clone(),
+                    ) {
+                        Ok(service) => (Some(Arc::new(service)), true),
+                        Err(error) => {
+                            tracing::warn!(%error, "Dots Bridge could not be configured");
+                            (None, false)
+                        }
+                    },
+                    None => {
+                        tracing::warn!("Dots Bridge owner is missing");
+                        (None, false)
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Dots Bridge could not be configured");
+                (None, false)
+            }
+        };
+        if dots_configuration_valid {
+            dots_repo
+                .remove_catalog_except(
+                    aionui_ai_agent::dots::AGENT_ID,
+                    dots.as_ref().map(|service| service.owner()),
+                )
+                .await?;
+            if let Some(service) = &dots {
+                agent_metadata_repo
+                    .upsert_for_user(service.owner(), &dots_agent_metadata())
+                    .await?;
+            }
+        }
         let agent_registry = AgentRegistry::new(agent_metadata_repo);
         agent_registry
             .hydrate()
@@ -404,6 +455,9 @@ impl AppServices {
             backend_binary_path: backend_binary_path.clone(),
             mcp_server_repo: Some(mcp_server_repo),
             async_image_queue: Some(async_image_jobs.clone()),
+            dots_turns: dots
+                .clone()
+                .map(|service| service as Arc<dyn aionui_ai_agent::dots::DotsTurns>),
             session_spawner,
             // agy cannot prompt for tool permission in headless mode, so AionUi
             // registers itself as its PreToolUse hook; the hook process calls
@@ -444,7 +498,27 @@ impl AppServices {
             identity_mode,
         });
 
-        let conversation_service = conversation_service.with_codex_history_deletion(codex_history_deletion);
+        let conversation_service = conversation_service
+            .with_dots(dots, Some(dots_repo.clone()))
+            .with_codex_history_deletion(codex_history_deletion);
+        if dots_configuration_valid {
+            conversation_service.reconcile_dots(dots_repo.as_ref()).await?;
+        }
+        if let Some(dots) = conversation_service.dots()
+            && let Some(id) = dots.default_id()
+        {
+            user_order_store
+                .pin(
+                    dots.owner(),
+                    aionui_db::OrderScene::Pinned,
+                    &aionui_db::OrderItemRef {
+                        item_type: aionui_db::OrderItemType::Conversation,
+                        item_id: id.into(),
+                    },
+                )
+                .await?;
+        }
+
         let session_message_queue = Arc::new(DeliveryQueue::new(Arc::new(SystemClock)));
         let session_message_notify = Arc::new(Notify::new());
         let session_message_service = Arc::new(SessionMessageService::new(SessionMessageDeps {
@@ -501,6 +575,36 @@ impl AppServices {
             runtime_helper_bin,
             runtime_base_url,
         })
+    }
+}
+
+fn dots_agent_metadata() -> UpsertAgentMetadataParams<'static> {
+    UpsertAgentMetadataParams {
+        id: aionui_ai_agent::dots::AGENT_ID,
+        name: "Dots",
+        backend: Some(aionui_ai_agent::dots::BACKEND),
+        agent_type: "acp",
+        agent_source: "builtin",
+        enabled: true,
+        icon: None,
+        name_i18n: None,
+        description: None,
+        description_i18n: None,
+        agent_source_info: None,
+        command: None,
+        args: None,
+        env: None,
+        native_skills_dirs: None,
+        skill_delivery: None,
+        behavior_policy: Some(r#"{"supports_side_question":false}"#),
+        yolo_id: None,
+        agent_capabilities: None,
+        auth_methods: None,
+        config_options: None,
+        available_modes: None,
+        available_models: None,
+        available_commands: None,
+        sort_order: 1320,
     }
 }
 

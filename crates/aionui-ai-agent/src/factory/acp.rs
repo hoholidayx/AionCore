@@ -80,6 +80,28 @@ pub(super) async fn build(
         config.backend.clone_from(&meta.backend);
     }
 
+    if config.backend.as_deref() == Some(crate::dots::BACKEND) {
+        let turns = deps
+            .dots_turns
+            .clone()
+            .filter(|turns| turns.allowed(&ctx.user_id))
+            .ok_or_else(|| AgentError::not_found("Dots backend is not configured"))?;
+        if config.fork.is_some() || build_context.belongs_to_team {
+            return Err(AgentError::Conflict(
+                "Dots sessions do not support forks or teams".into(),
+            ));
+        }
+        let backend = Arc::new(crate::dots::DotsSession::new(ctx.conversation_id.clone(), turns));
+        return Ok(AgentInstance::Session(crate::session_agent::SessionAgentTask::new(
+            aionui_common::AgentType::Acp,
+            ctx.conversation_id,
+            ctx.user_id,
+            ctx.workspace,
+            backend,
+            None,
+        )));
+    }
+
     if matches!(route_for_backend(config.backend.as_deref()), BackendRoute::Antigravity) {
         // Product decision: antigravity has no fork surface. The fork API's
         // capability gate already refuses agy; this is defense in depth so a

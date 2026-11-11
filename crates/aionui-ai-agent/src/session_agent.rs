@@ -528,6 +528,7 @@ impl SessionAgentTask {
             task.user_id.clone(),
             task.session_repo.clone(),
             broadcaster,
+            task.backend.output_persisted_externally(),
         );
         task
     }
@@ -2736,6 +2737,7 @@ fn spawn_event_pump(
     user_id: String,
     session_repo: Option<Arc<dyn IAcpSessionRepository>>,
     broadcaster: Option<Arc<dyn EventBroadcaster>>,
+    output_persisted_externally: bool,
 ) {
     use futures_util::StreamExt as _;
     // The pump owns ONLY the event stream (a broadcast `Receiver` handle — see
@@ -3344,6 +3346,7 @@ fn spawn_event_pump(
                         ..
                     } = &env.event
                         && !saw_visible_output
+                        && !output_persisted_externally
                     {
                         pending_empty_turn_tip = empty_turn_tip(outcome);
                     }

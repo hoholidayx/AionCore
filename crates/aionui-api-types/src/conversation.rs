@@ -394,6 +394,14 @@ pub struct MessageResponse {
     pub backend_turn_id: Option<String>,
 }
 
+/// A Dots attachment stored in the conversation and served by Aion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DotsMessageAttachment {
+    pub artifact_id: String,
+    pub filename: String,
+    pub preview: bool,
+}
+
 /// Cursor-paginated list of messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageListResponse {

@@ -37,6 +37,7 @@ pub(crate) struct TurnStartInput {
     pub content: String,
     /// Attachment absolute paths, already resolved.
     pub files: Vec<String>,
+    pub durable_message_id: Option<String>,
     pub inject_skills: Vec<String>,
     pub required_runtime_mode: Option<String>,
     pub build_options: BuildTaskOptions,
@@ -464,7 +465,10 @@ impl ConversationTurnOrchestrator {
         let turn_id = input.turn_id.clone();
         let runtime_state = self.service.runtime_state();
         let allowed_skill_names = input.build_options.context.skills.clone();
-        let first_turn_msg_id = ConversationService::mint_msg_id();
+        let first_turn_msg_id = input
+            .durable_message_id
+            .take()
+            .unwrap_or_else(ConversationService::mint_msg_id);
         let initial_send = SendMessageData {
             content: input.content,
             msg_id: first_turn_msg_id.clone(),

@@ -95,6 +95,12 @@ pub trait SessionBackend: Send + Sync {
     /// within a session; reconnect mints a NEW handle with a fresh snapshot.
     fn capabilities(&self) -> Capabilities;
 
+    /// Whether the backend's durable receiver writes visible output directly
+    /// into the conversation rather than projecting it from the live session.
+    fn output_persisted_externally(&self) -> bool {
+        false
+    }
+
     /// Read-only snapshot of currently-open (unanswered) permission requests, for
     /// REST recovery (`GET /confirmations`) of a reloaded `waiting_confirmation`
     /// conversation — the live process is still alive, but the permission-card

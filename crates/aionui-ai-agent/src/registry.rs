@@ -917,7 +917,10 @@ fn is_internal_aion_cli(meta: &AgentMetadata) -> bool {
 }
 
 fn is_internal_commandless_agent(meta: &AgentMetadata) -> bool {
-    meta.enabled && meta.command.is_none() && meta.agent_source == AgentSource::Internal
+    meta.enabled
+        && meta.command.is_none()
+        && (meta.agent_source == AgentSource::Internal
+            || (meta.agent_source == AgentSource::Builtin && meta.id == crate::dots::AGENT_ID))
 }
 
 fn apply_probe_availability(meta: &mut AgentMetadata) -> Option<UnavailableReason> {

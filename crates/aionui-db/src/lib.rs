@@ -45,6 +45,7 @@ pub use repository::conversation::{
 pub use repository::cron::{
     ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, RecoverableCronRun, UpdateCronJobParams,
 };
+pub use repository::dots::{DotsReceiptWrite, DotsRequest, IDotsRepository, SqliteDotsRepository};
 pub use repository::mcp_server::{CreateMcpServerParams, UpdateMcpServerParams};
 pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};

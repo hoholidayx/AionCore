@@ -6,6 +6,7 @@ mod agent_health_policy;
 mod assistant_runtime_provenance;
 mod background_stream;
 mod convert;
+pub mod dots;
 pub mod error;
 pub mod image_jobs;
 pub(crate) mod message_cursor;

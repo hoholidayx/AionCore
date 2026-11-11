@@ -102,10 +102,10 @@ pub use conversation::{
     ConversationArtifactStatus, ConversationAssistantIdentityResponse, ConversationDeleteOptions,
     ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind, ConversationNameUpdatedPayload,
     ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary, CreateConversationRequest,
-    EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse, MessageSearchItem,
-    MessageSearchResponse, MessageStatusChangedPayload, PromptCapabilityView, SearchMessagesQuery, SendMessageRequest,
-    SendMessageResponse, SessionRef, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    DotsMessageAttachment, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
+    ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse,
+    MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, PromptCapabilityView, SearchMessagesQuery,
+    SendMessageRequest, SendMessageResponse, SessionRef, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use conversation_tools::{
     CONVERSATION_TOOLS_SCHEMA_VERSION, ConversationCliEnvelope, ConversationCliMeta, ConversationCreateAssistant,

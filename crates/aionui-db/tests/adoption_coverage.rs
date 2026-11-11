@@ -24,6 +24,8 @@ const PARENT_SCOPED: &[(&str, &str, &str)] = &[
     // `cron_job_runs.owner_id` is the scheduler's run-lease holder, NOT a
     // user reference — ownership flows from `job_id`.
     ("cron_job_runs", "job_id", "cron_jobs"),
+    ("dots_bridge_attachments", "conversation_id", "conversations"),
+    ("dots_bridge_requests", "conversation_id", "conversations"),
     ("mailbox", "team_id", "teams"),
     ("messages", "conversation_id", "conversations"),
     ("team_tasks", "team_id", "teams"),
@@ -35,6 +37,9 @@ const GLOBAL_TABLES: &[(&str, &str)] = &[
     // Canonical filesystem-path registry shared by all users by design
     // (project-bind: folders are reused globally by resource_canonical).
     ("folders", "global canonical path registry"),
+    // Consumer positions belong to a Bridge binding, which includes the
+    // configured owner's identity. Adopting history does not rebind delivery.
+    ("dots_bridge_consumers", "cursor for the configured Bridge binding"),
 ];
 
 /// Tables whose `user_id` column is NOT a Core-user ownership column — it

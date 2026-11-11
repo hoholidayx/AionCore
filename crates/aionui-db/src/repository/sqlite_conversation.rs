@@ -15,6 +15,54 @@ use crate::repository::conversation::{
 };
 use crate::repository::sqlite_acp_session::delete_acp_session_for_user;
 
+pub(super) async fn insert_scoped_message(
+    connection: &mut sqlx::SqliteConnection,
+    user_id: &str,
+    message: &MessageRow,
+) -> Result<(), DbError> {
+    // Ownership check inside the same transaction as the insert +
+    // bump, so parent-chain authorization and the write are atomic.
+    let exists: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE user_id = ? AND id = ?)")
+        .bind(user_id)
+        .bind(&message.conversation_id)
+        .fetch_one(&mut *connection)
+        .await?;
+    if exists == 0 {
+        return Err(DbError::NotFound(format!(
+            "Conversation '{}' not found",
+            message.conversation_id
+        )));
+    }
+    sqlx::query(
+        "INSERT INTO messages \
+            (id, conversation_id, msg_id, type, content, position, \
+             status, hidden, created_at, backend_turn_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&message.id)
+    .bind(&message.conversation_id)
+    .bind(&message.msg_id)
+    .bind(&message.r#type)
+    .bind(&message.content)
+    .bind(&message.position)
+    .bind(&message.status)
+    .bind(message.hidden)
+    .bind(message.created_at)
+    .bind(&message.backend_turn_id)
+    .execute(&mut *connection)
+    .await?;
+
+    // Persisting a message bumps the parent conversation's recency so
+    // the conversation-list sort floats fresh activity to the top;
+    // MAX() keeps recency monotonic under out-of-order upserts.
+    sqlx::query("UPDATE conversations SET updated_at = MAX(updated_at, ?) WHERE id = ?")
+        .bind(message.created_at)
+        .bind(&message.conversation_id)
+        .execute(&mut *connection)
+        .await?;
+    Ok(())
+}
+
 /// Bump `conversations.updated_at` so the conversation-list sort
 /// (ORDER BY conversations.updated_at DESC) floats a conversation with fresh
 /// activity to the top. Persisting a message never used to touch this column,
@@ -60,51 +108,7 @@ impl SqliteConversationRepository {
         let mut connection = self.pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
 
-        let result: Result<(), DbError> = async {
-            // Ownership check inside the same transaction as the insert +
-            // bump, so parent-chain authorization and the write are atomic.
-            let exists: i64 =
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE user_id = ? AND id = ?)")
-                    .bind(user_id)
-                    .bind(&message.conversation_id)
-                    .fetch_one(&mut *connection)
-                    .await?;
-            if exists == 0 {
-                return Err(DbError::NotFound(format!(
-                    "Conversation '{}' not found",
-                    message.conversation_id
-                )));
-            }
-            sqlx::query(
-                "INSERT INTO messages \
-                    (id, conversation_id, msg_id, type, content, position, \
-                     status, hidden, created_at, backend_turn_id) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&message.id)
-            .bind(&message.conversation_id)
-            .bind(&message.msg_id)
-            .bind(&message.r#type)
-            .bind(&message.content)
-            .bind(&message.position)
-            .bind(&message.status)
-            .bind(message.hidden)
-            .bind(message.created_at)
-            .bind(&message.backend_turn_id)
-            .execute(&mut *connection)
-            .await?;
-
-            // Persisting a message bumps the parent conversation's recency so
-            // the conversation-list sort floats fresh activity to the top;
-            // MAX() keeps recency monotonic under out-of-order upserts.
-            sqlx::query("UPDATE conversations SET updated_at = MAX(updated_at, ?) WHERE id = ?")
-                .bind(message.created_at)
-                .bind(&message.conversation_id)
-                .execute(&mut *connection)
-                .await?;
-            Ok(())
-        }
-        .await;
+        let result = insert_scoped_message(&mut connection, user_id, message).await;
 
         match result {
             Ok(()) => {

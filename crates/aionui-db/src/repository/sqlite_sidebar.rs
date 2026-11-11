@@ -153,10 +153,12 @@ impl ISidebarStore for SqliteSidebarStore {
     }
 
     async fn set_conversation_archived(&self, user_id: &str, id: &str, at: Option<i64>) -> Result<bool, DbError> {
-        let result = sqlx::query("UPDATE conversations SET archived_at = ? WHERE user_id = ? AND id = ?")
+        let result = sqlx::query("UPDATE conversations SET archived_at = ? WHERE user_id = ? AND id = ?
+            AND (? IS NULL OR CASE WHEN json_valid(extra) THEN json_extract(extra, '$.dots_default') IS NOT 1 ELSE 1 END)")
             .bind(at)
             .bind(user_id)
             .bind(id)
+            .bind(at)
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
