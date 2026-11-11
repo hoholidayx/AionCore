@@ -26,7 +26,9 @@ Independent messages from Dot appear in the default conversation. AionCore
 continues receiving messages while the browser is closed.
 
 The first connection skips the existing Bridge inbox. Later connections use
-the saved consumer position. Conversation attachments are cached in the
+the saved consumer position. Each Aion installation has its own consumer, so a
+test installation does not move the production inbox position. Conversation
+attachments are cached in the
 corresponding temporary workspace and can be downloaded again while the
 original remains in R2. The Bridge retains ownership of R2 credentials and
 operators manage the bucket's retention.

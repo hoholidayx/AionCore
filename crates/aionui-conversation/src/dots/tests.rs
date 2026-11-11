@@ -191,6 +191,7 @@ async fn restart_routes_out_of_order_replies_and_keeps_pushes_in_the_default_con
         let service = DotsService::new(
             config(&mock),
             OWNER.into(),
+            "test-installation",
             repo.clone(),
             conversations.clone(),
             Arc::new(BroadcastEventBus::new(16)),
@@ -200,6 +201,16 @@ async fn restart_routes_out_of_order_replies_and_keeps_pushes_in_the_default_con
         service
     };
     let service = new_service();
+    let other_installation = DotsService::new(
+        config(&mock),
+        OWNER.into(),
+        "another-installation",
+        repo.clone(),
+        conversations.clone(),
+        Arc::new(BroadcastEventBus::new(16)),
+    )
+    .unwrap();
+    assert_ne!(service.consumer, other_installation.consumer);
     let source = temp.path().join("arbitrary.dataformat");
     tokio::fs::write(&source, b"abc").await.unwrap();
     service

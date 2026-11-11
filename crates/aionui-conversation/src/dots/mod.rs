@@ -123,13 +123,14 @@ impl DotsService {
     pub fn new(
         config: DotsConfig,
         owner: String,
+        instance_id: &str,
         repo: Arc<dyn IDotsRepository>,
         conversations: Arc<dyn IConversationRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
     ) -> Result<Self, String> {
         let binding = format!(
             "{:x}",
-            Sha256::digest(format!("{owner}\n{}\n{}", config.base, config.channel))
+            Sha256::digest(format!("{instance_id}\n{owner}\n{}\n{}", config.base, config.channel))
         );
         let consumer = format!("aion-{binding}");
         Ok(Self {

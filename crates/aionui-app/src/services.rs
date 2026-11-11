@@ -294,6 +294,7 @@ impl AppServices {
 
         let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
             Arc::new(SqliteAgentMetadataRepository::new(database.pool().clone()));
+        let machine_id = aionui_process::local_machine_id(&data_dir);
         let dots_repo: Arc<dyn IDotsRepository> = Arc::new(SqliteDotsRepository::new(database.pool().clone()));
         let (dots, dots_configuration_valid) = match DotsConfig::load(&data_dir) {
             Ok(None) => (None, true),
@@ -306,6 +307,7 @@ impl AppServices {
                     Some(owner) => match DotsService::new(
                         config,
                         owner.id,
+                        &machine_id,
                         dots_repo.clone(),
                         conversation_repo.clone(),
                         event_bus.clone(),
@@ -430,7 +432,6 @@ impl AppServices {
         // for the port's spawn path). claude/codex always run through the direct-CLI
         // SessionAgentTask now — the spawner is unconditionally wired.
         let process_registry = Arc::new(aionui_process::FileRegistryStore::new(&data_dir));
-        let machine_id = aionui_process::local_machine_id(&data_dir);
         let session_spawner: Arc<dyn aionui_process::Spawner> = Arc::new(aionui_process::RealSpawner::new(
             process_registry,
             uuid::Uuid::now_v7(),
