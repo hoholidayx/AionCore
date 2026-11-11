@@ -93,7 +93,11 @@ impl Action {
             Self::Add => (
                 json!({
                     "facts":{"type":"array","items":text(),"minItems":1,"maxItems":25},
-                    "text":text(), "category":{"type":"string"}, "importance":{"type":"number","minimum":0,"maximum":1},
+                    "text":text(), "category":{"type":"string"},
+                    "importance":{
+                        "type":"number","minimum":0,"maximum":1,
+                        "description":"Overrides metadata.importance, including an explicit 0. If both are omitted and a category is set, use its built-in default or 0.5 for a custom category."
+                    },
                     "metadata":{"type":"object"}, "longTerm":{"type":"boolean","enum":[true]},
                     "expirationDate":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"Last visible date in UTC (YYYY-MM-DD)."}
                 }),
@@ -102,7 +106,10 @@ impl Action {
             Self::Update => (
                 json!({
                     "memoryId":id(), "text":text(), "category":{"type":"string","minLength":1,"maxLength":80},
-                    "importance":{"type":"number","minimum":0,"maximum":1},
+                    "importance":{
+                        "type":"number","minimum":0,"maximum":1,
+                        "description":"Overrides metadata.importance, including an explicit 0. Omit both to keep the existing importance, even when changing category."
+                    },
                     "metadata":{"type":"object","maxProperties":40,"description":"Top-level metadata keys to merge."}
                 }),
                 vec!["memoryId"],
