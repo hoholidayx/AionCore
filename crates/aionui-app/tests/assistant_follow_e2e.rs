@@ -351,6 +351,8 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
     const KEY: &str = "fixture-mem0-service-key-not-for-production";
     const SEARCH_ARGS: &str = r#"{"query":"fixture preference","includeExpired":true,"since":"2026-11-01","until":"2026-11-02T08:00:00+08:00","timeField":"updated_at"}"#;
     const UPDATE_ARGS: &str = r#"{"memoryId":"fixture-id","category":"rp.habit"}"#;
+    const LIST_ARGS: &str =
+        r#"{"categories":["work.todo"],"filters":{"priority":{"gte":2}},"limit":2,"cursor":"fixture-cursor"}"#;
     const INVALID_SEARCH_ARGS: &str = r#"{"query":"fixture preference","limit":"fixture-private-value"}"#;
     const CONFLICTING_DELETE_ARGS: &str = r#"{"memoryId":"fixture-id","query":"fixture-private-value"}"#;
     const PRIVATE_MARKER: &str = "fixture-private-remote-value";
@@ -371,6 +373,8 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
                         ("memory_search", INVALID_SEARCH_ARGS)
                     } else if prompt.contains("Conflicting deletion") {
                         ("memory_delete", CONFLICTING_DELETE_ARGS)
+                    } else if prompt.contains("Continue listing") {
+                        ("memory_list", LIST_ARGS)
                     } else {
                         ("memory_search", SEARCH_ARGS)
                     };
@@ -393,6 +397,12 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
                             parameters["properties"]["timeField"]["enum"],
                             json!(["created_at", "updated_at"])
                         );
+                    } else if tool_name == "memory_list" {
+                        assert!(parameters["properties"].get("query").is_none());
+                        assert_eq!(parameters["properties"]["categories"]["type"], "array");
+                        assert_eq!(parameters["properties"]["filters"]["type"], "object");
+                        assert_eq!(parameters["properties"]["cursor"]["type"], "string");
+                        assert_eq!(parameters["properties"]["limit"]["maximum"], 1000);
                     }
                     model_stream(
                         json!({"tool_calls":[{
@@ -458,6 +468,7 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
                                     INVALID_SEARCH_ARGS
                                 }
                                 "memory_search" => SEARCH_ARGS,
+                                "memory_list" => LIST_ARGS,
                                 "memory_update" => UPDATE_ARGS,
                                 other => panic!("unexpected memory tool {other}"),
                             };
@@ -478,6 +489,10 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
                                     "issues":[{"path":["limit"],"reason":"invalid_type"}]
                                 });
                                 json!({"isError":true,"content":[{"type":"text","text":diagnostic.to_string()}]})
+                            } else if action == "memory_list" {
+                                let page =
+                                    json!({"memories":[],"count":0,"truncated":true,"nextCursor":"fixture-next"});
+                                json!({"content":[{"type":"text","text":page.to_string()}]})
                             } else {
                                 json!({"content":[{"type":"text","text":"{\"memory\":\"fixture memory result\"}"}]})
                             }
@@ -532,6 +547,7 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
     for (index, (failure, action, expected_code)) in [
         (None, "memory_search", None),
         (None, "memory_update", None),
+        (None, "memory_list", None),
         (
             Some(("initialize", StatusCode::BAD_REQUEST)),
             "memory_search",
@@ -575,6 +591,7 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
         let prompt = match (action, expected_code) {
             ("memory_search", Some("invalid_arguments")) => "Invalid search limit",
             ("memory_search", _) => "Recall a fixture preference",
+            ("memory_list", _) => "Continue listing fixture tasks",
             ("memory_delete", _) => "Conflicting deletion arguments",
             _ => "Reclassify a fixture preference",
         };
@@ -684,6 +701,9 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
                 );
                 assert!(matches!(captured.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
             }
+        } else if action == "memory_list" {
+            assert_eq!(result_json["nextCursor"], "fixture-next");
+            assert_eq!(result_json["truncated"], true);
         } else {
             assert_eq!(result_json["memory"], "fixture memory result");
         }

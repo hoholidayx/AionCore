@@ -61,7 +61,7 @@ impl Action {
                 "Search this assistant's long-term memories by meaning, optionally filtered by categories, flat metadata, or record time. Set includeExpired to view expired memories."
             }
             Self::List => {
-                "List this assistant's long-term memories, optionally filtered by record time. Set includeExpired to view expired memories."
+                "List this assistant's long-term memories by category, metadata, or record time. Pass nextCursor as cursor with the same filters to continue."
             }
             Self::Get => "Read a long-term memory by its exact ID.",
             Self::Add => {
@@ -82,13 +82,17 @@ impl Action {
         let (mut properties, required) = match self {
             Self::Search => (
                 json!({
-                    "query":text(), "limit":{"type":"integer","minimum":1,"maximum":50},
-                    "categories":{"type":"array","items":{"type":"string"}},
-                    "filters":{"type":"object","description":"Flat metadata fields and comparison operators."}
+                    "query":text(), "limit":{"type":"integer","minimum":1,"maximum":50}
                 }),
                 vec!["query"],
             ),
-            Self::List => (json!({}), vec![]),
+            Self::List => (
+                json!({
+                    "limit":{"type":"integer","minimum":1,"maximum":1000,"default":1000},
+                    "cursor":{"type":"string","minLength":1,"maxLength":128,"description":"nextCursor from the same list query."}
+                }),
+                vec![],
+            ),
             Self::Get => (json!({"memoryId":id()}), vec!["memoryId"]),
             Self::Add => (
                 json!({
@@ -117,6 +121,9 @@ impl Action {
             Self::Delete => (json!({"memoryId":id(),"query":text()}), vec![]),
         };
         if matches!(self, Self::Search | Self::List) {
+            properties["categories"] = json!({"type":"array","items":{"type":"string"}});
+            properties["filters"] =
+                json!({"type":"object","description":"Flat metadata fields and comparison operators."});
             properties["scope"] = json!({"type":"string","enum":["all","long-term"]});
             properties["includeExpired"] = json!({"type":"boolean","default":false});
             properties["since"] =
