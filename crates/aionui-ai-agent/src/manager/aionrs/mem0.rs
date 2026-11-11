@@ -4,6 +4,7 @@ use std::sync::Arc;
 use aion_config::config::{McpServerConfig, TransportType};
 use aion_mcp::manager::McpManager;
 use aion_mcp::protocol::McpContent;
+use aion_mcp::transport::McpError;
 use aion_protocol::events::ToolCategory;
 use aion_tools::Tool;
 use aion_types::tool::{JsonSchema, ToolResult};
@@ -160,11 +161,7 @@ struct Mem0Client {
 
 impl Mem0Client {
     async fn request(&self, action: Action, input: Value, write: bool) -> Result<Value, ToolResult> {
-        let manager = self
-            .manager
-            .get_or_try_init(|| self.connect())
-            .await
-            .map_err(|()| failure("memory_unavailable", "The assistant's memory service is unavailable."))?;
+        let manager = self.manager.get_or_try_init(|| self.connect()).await?;
         let reply = manager
             .call_tool_structured(SERVER, action.name(), input)
             .await
@@ -203,7 +200,7 @@ impl Mem0Client {
         Ok(result)
     }
 
-    async fn connect(&self) -> Result<McpManager, ()> {
+    async fn connect(&self) -> Result<McpManager, ToolResult> {
         let mut headers = HashMap::from([("Authorization".into(), format!("Bearer {}", self.binding.bearer()))]);
         if let Some((user_id, agent_id)) = self.binding.namespace() {
             headers.insert("X-Mem0-User-Id".into(), user_id.into());
@@ -221,7 +218,21 @@ impl Mem0Client {
         };
         let manager = McpManager::connect_pinned_http_direct(SERVER, &config)
             .await
-            .map_err(|_| ())?;
+            .map_err(|error| match error {
+                McpError::HttpStatus { status: 400, .. } => failure(
+                    "memory_handshake_rejected",
+                    "The memory service rejected the MCP handshake (HTTP 400). Check the MCP response diagnostics.",
+                ),
+                McpError::HttpStatus { status: 401, .. } => failure(
+                    "memory_auth_failed",
+                    "The memory service rejected authentication (HTTP 401). Check the configured credential.",
+                ),
+                McpError::HttpStatus { status: 403, .. } => failure(
+                    "memory_access_denied",
+                    "The memory service denied access (HTTP 403). Check the MCP access configuration.",
+                ),
+                _ => failure("memory_unavailable", "The assistant's memory service is unavailable."),
+            })?;
         let tools = manager.all_tools();
         if !Action::ALL.iter().all(|action| {
             tools
@@ -229,7 +240,10 @@ impl Mem0Client {
                 .any(|(_, tool)| tool.name == action.name() && tool.input_schema["type"] == "object")
         }) {
             manager.shutdown().await;
-            return Err(());
+            return Err(failure(
+                "memory_unavailable",
+                "The assistant's memory service is unavailable.",
+            ));
         }
         Ok(manager)
     }

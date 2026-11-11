@@ -730,6 +730,8 @@ Create `mem0-mcp.json` in the effective AionCore data directory with mode `0600`
 
 Set the same `service_bearer` on the trusted MCP endpoint. AionCore uses direct Streamable HTTP with redirects disabled. It keeps the bearer out of the generic MCP registry, prompts, and agent runtime environment. Import the Memory Triage Skill separately and select it for each assistant through the existing Skills setting.
 
+The dedicated tools distinguish MCP handshake rejection (HTTP 400), authentication failure (401), and access denial (403) using fixed messages. For a rejected handshake, the MCP service can report which scope headers need attention in its `invalid_memory_scope` response. Generic MCP clients that send only a Bearer token use a fixed-role credential from the MCP service's `profiles` configuration.
+
 When migrating a role with stored memories, add an optional `namespace_aliases` array to the service configuration. Each entry contains `user_id`, `assistant_definition_id`, `mem0_user_id`, and `mem0_agent_id`. The first pair identifies the assistant in Aion. The second pair is the legacy Mem0 namespace. Each alias must target a unique pair outside the automatic namespace prefix pair. Both Mem0 IDs must contain 1–128 ASCII letters, digits, underscores, or hyphens. Legacy AionCore `profiles` configurations still use role-specific bearers and work with an MCP that has matching profiles. Use either `service_bearer` with optional aliases or `profiles` in the AionCore configuration.
 
 Use the assistant ID returned by `GET /api/assistants` to find the persisted definition ID. For a local Web installation, open `~/.aionui-web/aionui-backend.db` with `sqlite3 -readonly` and substitute the values in these queries.

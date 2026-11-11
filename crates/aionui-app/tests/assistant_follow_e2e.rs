@@ -340,9 +340,10 @@ async fn an_existing_conversation_adopts_a_saved_assistant_configuration_on_its_
 
 #[cfg(unix)]
 #[tokio::test]
-async fn two_assistants_share_one_mem0_key_with_distinct_host_scopes() {
+async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::Mutex;
 
     use aionui_db::{IAssistantDefinitionRepository, SqliteAssistantDefinitionRepository};
     use axum::http::HeaderMap;
@@ -350,13 +351,17 @@ async fn two_assistants_share_one_mem0_key_with_distinct_host_scopes() {
     const KEY: &str = "fixture-mem0-service-key-not-for-production";
     const SEARCH_ARGS: &str = r#"{"query":"fixture preference","includeExpired":true,"since":"2026-11-01","until":"2026-11-02T08:00:00+08:00","timeField":"updated_at"}"#;
     const UPDATE_ARGS: &str = r#"{"memoryId":"fixture-id","category":"rp.habit"}"#;
+    const PRIVATE_MARKER: &str = "fixture-private-remote-value";
     let (calls, mut captured) = mpsc::unbounded_channel();
+    let (results, mut captured_results) = mpsc::unbounded_channel();
+    let rejection = Arc::new(Mutex::new(None::<(&str, StatusCode)>));
+    let server_rejection = rejection.clone();
     let router = Router::new()
         .route(
             "/v1/chat/completions",
-            post(|Json(request): Json<Value>| async move {
+            post(move |Json(request): Json<Value>| {
                 let last = request["messages"].as_array().unwrap().last().unwrap();
-                if last["role"] == "user" {
+                let response = if last["role"] == "user" {
                     let (tool_name, arguments) = if last["content"].to_string().contains("Reclassify") {
                         ("memory_update", UPDATE_ARGS)
                     } else {
@@ -390,15 +395,18 @@ async fn two_assistants_share_one_mem0_key_with_distinct_host_scopes() {
                         "tool_calls",
                     )
                 } else {
-                    assert!(last["content"].to_string().contains("fixture memory result"));
+                    assert_eq!(last["role"], "tool");
+                    results.send(last["content"].as_str().unwrap().to_owned()).unwrap();
                     model_stream(json!({"content":"Fixture reply"}), "stop")
-                }
+                };
+                std::future::ready(response)
             }),
         )
         .route(
             "/mcp",
             post(move |headers: HeaderMap, Json(request): Json<Value>| {
                 let calls = calls.clone();
+                let failure = *server_rejection.lock().unwrap();
                 async move {
                     assert_eq!(
                         headers[header::AUTHORIZATION].to_str().unwrap(),
@@ -406,6 +414,18 @@ async fn two_assistants_share_one_mem0_key_with_distinct_host_scopes() {
                     );
                     let user = headers["x-mem0-user-id"].to_str().unwrap();
                     let agent = headers["x-mem0-agent-id"].to_str().unwrap();
+                    if let Some(("initialize", status)) = failure {
+                        assert_eq!(request["method"], "initialize");
+                        calls
+                            .send((user.to_owned(), agent.to_owned(), "initialize".to_owned()))
+                            .unwrap();
+                        return (
+                            status,
+                            [(header::WWW_AUTHENTICATE, PRIVATE_MARKER)],
+                            Json(json!({"error": PRIVATE_MARKER})),
+                        )
+                            .into_response();
+                    }
                     let result = match request["method"].as_str().unwrap() {
                         "initialize" => json!({
                             "protocolVersion":"2025-03-26", "capabilities":{"tools":{}},
@@ -438,6 +458,9 @@ async fn two_assistants_share_one_mem0_key_with_distinct_host_scopes() {
                             calls
                                 .send((user.to_owned(), agent.to_owned(), action.to_owned()))
                                 .unwrap();
+                            if let Some(("tools/call", status)) = failure {
+                                return (status, Json(json!({"error": PRIVATE_MARKER}))).into_response();
+                            }
                             json!({"content":[{"type":"text","text":"{\"memory\":\"fixture memory result\"}"}]})
                         }
                         method => panic!("unexpected MCP method {method}"),
@@ -487,16 +510,50 @@ async fn two_assistants_share_one_mem0_key_with_distinct_host_scopes() {
     )
     .await;
 
-    for (name, prompt, action) in [
-        ("Memory fixture A", "Recall a fixture preference", "memory_search"),
-        ("Memory fixture B", "Reclassify a fixture preference", "memory_update"),
-    ] {
+    for (index, (failure, action, expected_code)) in [
+        (None, "memory_search", None),
+        (None, "memory_update", None),
+        (
+            Some(("initialize", StatusCode::BAD_REQUEST)),
+            "memory_search",
+            Some("memory_handshake_rejected"),
+        ),
+        (
+            Some(("initialize", StatusCode::UNAUTHORIZED)),
+            "memory_update",
+            Some("memory_auth_failed"),
+        ),
+        (
+            Some(("initialize", StatusCode::FORBIDDEN)),
+            "memory_search",
+            Some("memory_access_denied"),
+        ),
+        (
+            Some(("initialize", StatusCode::SERVICE_UNAVAILABLE)),
+            "memory_update",
+            Some("memory_unavailable"),
+        ),
+        (
+            Some(("tools/call", StatusCode::SERVICE_UNAVAILABLE)),
+            "memory_update",
+            Some("write_unconfirmed"),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        *rejection.lock().unwrap() = failure;
+        let prompt = if action == "memory_search" {
+            "Recall a fixture preference"
+        } else {
+            "Reclassify a fixture preference"
+        };
         let assistant = send_json(
             &app,
             "POST",
             "/api/assistants",
             json!({
-                "name":name,"agent_id":"632f31d2"
+                "name":format!("Memory fixture {index}"),"agent_id":"632f31d2"
             }),
             auth,
             StatusCode::CREATED,
@@ -567,9 +624,28 @@ async fn two_assistants_share_one_mem0_key_with_distinct_host_scopes() {
             (
                 format!("aion-user-{}", user.id),
                 format!("aion-assistant-{}", definition.id),
-                action.to_owned(),
+                if matches!(failure, Some(("initialize", _))) {
+                    "initialize"
+                } else {
+                    action
+                }
+                .to_owned(),
             )
         );
+        let result = tokio::time::timeout(Duration::from_secs(12), captured_results.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let result_json: Value = serde_json::from_str(&result).unwrap();
+        if let Some(code) = expected_code {
+            assert_eq!(result_json["code"], code);
+            assert!(!result.contains(PRIVATE_MARKER));
+            assert!(!result.contains(KEY));
+            assert!(!result.contains(&scope.0));
+            assert!(!result.contains(&scope.1));
+        } else {
+            assert_eq!(result_json["memory"], "fixture memory result");
+        }
         wait_for_finished_turn(&app, &path, &token).await;
     }
     server.abort();
