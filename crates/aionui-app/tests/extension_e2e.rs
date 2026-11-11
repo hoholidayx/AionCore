@@ -1476,6 +1476,75 @@ fn write_skill(dir: &std::path::Path, name: &str, description: &str) {
 }
 
 #[tokio::test]
+async fn skill_import_and_scan_accept_path_and_legacy_fields() {
+    let tmp = TempDir::new().unwrap();
+    let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let source = tmp.path().join("import-source");
+    write_skill(&source, "first-skill", "First skill");
+    write_skill(&source, "second-skill", "Second skill");
+
+    for (operation, legacy, path) in [
+        ("scan", "folder_path", source.clone()),
+        ("import", "skill_path", source.join("first-skill")),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                &format!("/api/skills/{operation}"),
+                json!({ "path": path, (legacy): path }),
+                &token,
+                &csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "BAD_REQUEST");
+    }
+    let response = app
+        .clone()
+        .oneshot(get_with_token("/api/skills", &token))
+        .await
+        .unwrap();
+    assert_eq!(body_json(response).await["data"], json!([]));
+
+    for field in ["path", "folder_path"] {
+        let response = app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                "/api/skills/scan",
+                json!({ (field): source }),
+                &token,
+                &csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["data"]["skills"][0]["name"], "first-skill");
+        assert_eq!(body["data"]["skills"][1]["name"], "second-skill");
+    }
+
+    for (field, name) in [("path", "first-skill"), ("skill_path", "second-skill")] {
+        let response = app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                "/api/skills/import",
+                json!({ (field): source.join(name) }),
+                &token,
+                &csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["data"]["skill_names"], json!([name]));
+    }
+}
+
+#[tokio::test]
 async fn sl1_list_skills_tags_builtin_and_custom_with_source_field() {
     let tmp = TempDir::new().unwrap();
     let (mut app, services, paths) = build_app_with_skill_paths(tmp.path()).await;

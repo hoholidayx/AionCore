@@ -61,6 +61,7 @@ pub struct ReadSkillInfoResponse {
 /// Request body for `POST /api/skills/import` and `POST /api/skills/import-symlink`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImportSkillRequest {
+    #[serde(alias = "path")]
     pub skill_path: String,
 }
 
@@ -140,6 +141,7 @@ pub struct DeleteSkillRequest {
 /// Request body for `POST /api/skills/scan`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScanForSkillsRequest {
+    #[serde(alias = "path")]
     pub folder_path: String,
 }
 

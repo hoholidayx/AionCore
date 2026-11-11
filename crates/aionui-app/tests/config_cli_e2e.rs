@@ -478,6 +478,18 @@ async fn config_capabilities_prints_agent_readable_contract_without_runtime_env(
     let domains = stdout["data"]["domains"]
         .as_array()
         .expect("domains should be an array");
+    for (name, legacy) in [
+        ("config skills import", "skill_path"),
+        ("config skills scan", "folder_path"),
+    ] {
+        let skill = domains
+            .iter()
+            .flat_map(|domain| domain["commands"].as_array().into_iter().flatten())
+            .find(|command| command["command"] == name)
+            .expect("skill command should be advertised");
+        assert_eq!(skill["stdin_fields"], json!(["path"]));
+        assert!(skill["description"].as_str().unwrap().contains(legacy));
+    }
     let assistant_rule_write = domains
         .iter()
         .flat_map(|domain| domain["commands"].as_array().into_iter().flatten())

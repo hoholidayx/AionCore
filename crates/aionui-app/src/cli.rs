@@ -463,8 +463,14 @@ pub(crate) enum ConfigSkillsCommand {
     List,
     Info,
     Paths,
+    /// Import a Skill from a directory, SKILL.md file, or ZIP.
+    ///
+    /// Send a JSON object on stdin with a string field named `path`. Older callers can use `skill_path` in its place.
     Import,
     Delete,
+    /// Scan a directory for importable Skills.
+    ///
+    /// Send a JSON object on stdin with a string field named `path`. Older callers can use `folder_path` in its place.
     Scan,
     ExternalPaths(ConfigSkillsExternalPathsArgs),
     Market(ConfigSkillsMarketArgs),
