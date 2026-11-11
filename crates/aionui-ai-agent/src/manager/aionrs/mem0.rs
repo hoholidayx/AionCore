@@ -57,9 +57,11 @@ impl Action {
     fn description(self) -> &'static str {
         match self {
             Self::Search => {
-                "Search this assistant's long-term memories by meaning, optionally filtered by categories or flat metadata. Set includeExpired to view expired memories."
+                "Search this assistant's long-term memories by meaning, optionally filtered by categories, flat metadata, or record time. Set includeExpired to view expired memories."
             }
-            Self::List => "List this assistant's long-term memories. Set includeExpired to view expired memories.",
+            Self::List => {
+                "List this assistant's long-term memories, optionally filtered by record time. Set includeExpired to view expired memories."
+            }
             Self::Get => "Read a long-term memory by its exact ID.",
             Self::Add => {
                 "Save durable facts. Follow the Memory Triage Skill, search first, and pass either facts or text. Optionally set expirationDate (YYYY-MM-DD, UTC). Omit secrets."
@@ -76,21 +78,16 @@ impl Action {
     fn schema(self) -> JsonSchema {
         let text = || json!({"type":"string", "minLength":1, "maxLength":8000});
         let id = || json!({"type":"string", "pattern":"^[A-Za-z0-9_-]{1,128}$"});
-        let scope = || json!({"type":"string", "enum":["all","long-term"]});
-        let (properties, required) = match self {
+        let (mut properties, required) = match self {
             Self::Search => (
                 json!({
                     "query":text(), "limit":{"type":"integer","minimum":1,"maximum":50},
-                    "scope":scope(), "includeExpired":{"type":"boolean","default":false},
                     "categories":{"type":"array","items":{"type":"string"}},
                     "filters":{"type":"object","description":"Flat metadata fields and comparison operators."}
                 }),
                 vec!["query"],
             ),
-            Self::List => (
-                json!({"scope":scope(),"includeExpired":{"type":"boolean","default":false}}),
-                vec![],
-            ),
+            Self::List => (json!({}), vec![]),
             Self::Get => (json!({"memoryId":id()}), vec!["memoryId"]),
             Self::Add => (
                 json!({
@@ -111,6 +108,16 @@ impl Action {
             ),
             Self::Delete => (json!({"memoryId":id(),"query":text()}), vec![]),
         };
+        if matches!(self, Self::Search | Self::List) {
+            properties["scope"] = json!({"type":"string","enum":["all","long-term"]});
+            properties["includeExpired"] = json!({"type":"boolean","default":false});
+            properties["since"] =
+                json!({"type":"string","description":"Inclusive record time (UTC date or timestamp with an offset)."});
+            properties["until"] =
+                json!({"type":"string","description":"Exclusive record time (UTC date or timestamp with an offset)."});
+            properties["timeField"] =
+                json!({"type":"string","enum":["created_at","updated_at"],"default":"created_at"});
+        }
         json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
     }
 
