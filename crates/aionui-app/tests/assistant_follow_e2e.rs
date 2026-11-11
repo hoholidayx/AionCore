@@ -348,6 +348,8 @@ async fn two_assistants_share_one_mem0_key_with_distinct_host_scopes() {
     use axum::http::HeaderMap;
 
     const KEY: &str = "fixture-mem0-service-key-not-for-production";
+    const SEARCH_ARGS: &str = r#"{"query":"fixture preference"}"#;
+    const UPDATE_ARGS: &str = r#"{"memoryId":"fixture-id","category":"rp.habit"}"#;
     let (calls, mut captured) = mpsc::unbounded_channel();
     let router = Router::new()
         .route(
@@ -355,14 +357,27 @@ async fn two_assistants_share_one_mem0_key_with_distinct_host_scopes() {
             post(|Json(request): Json<Value>| async move {
                 let last = request["messages"].as_array().unwrap().last().unwrap();
                 if last["role"] == "user" {
-                    assert!(request["tools"].as_array().unwrap().iter().any(|tool| {
-                        tool["function"]["name"] == "memory_search"
-                            && tool["function"]["parameters"]["properties"].get("agentId").is_none()
-                    }));
+                    let (tool_name, arguments) = if last["content"].to_string().contains("Reclassify") {
+                        ("memory_update", UPDATE_ARGS)
+                    } else {
+                        ("memory_search", SEARCH_ARGS)
+                    };
+                    let tool = request["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|tool| tool["function"]["name"] == tool_name)
+                        .unwrap();
+                    let parameters = &tool["function"]["parameters"];
+                    assert!(parameters["properties"].get("agentId").is_none());
+                    if tool_name == "memory_update" {
+                        assert_eq!(parameters["properties"]["category"]["type"], "string");
+                        assert_eq!(parameters["required"], json!(["memoryId"]));
+                    }
                     model_stream(
                         json!({"tool_calls":[{
                             "index":0,"id":"call_memory_fixture","type":"function",
-                            "function":{"name":"memory_search","arguments":"{\"query\":\"fixture preference\"}"}
+                            "function":{"name":tool_name,"arguments":arguments}
                         }]}),
                         "tool_calls",
                     )
@@ -402,9 +417,19 @@ async fn two_assistants_share_one_mem0_key_with_distinct_host_scopes() {
                             json!({"tools":tools})
                         }
                         "tools/call" => {
-                            assert_eq!(request["params"]["name"], "memory_search");
-                            assert_eq!(request["params"]["arguments"], json!({"query":"fixture preference"}));
-                            calls.send((user.to_owned(), agent.to_owned())).unwrap();
+                            let action = request["params"]["name"].as_str().unwrap();
+                            let expected = match action {
+                                "memory_search" => SEARCH_ARGS,
+                                "memory_update" => UPDATE_ARGS,
+                                other => panic!("unexpected memory tool {other}"),
+                            };
+                            assert_eq!(
+                                request["params"]["arguments"],
+                                serde_json::from_str::<Value>(expected).unwrap()
+                            );
+                            calls
+                                .send((user.to_owned(), agent.to_owned(), action.to_owned()))
+                                .unwrap();
                             json!({"content":[{"type":"text","text":"{\"memory\":\"fixture memory result\"}"}]})
                         }
                         method => panic!("unexpected MCP method {method}"),
@@ -454,7 +479,10 @@ async fn two_assistants_share_one_mem0_key_with_distinct_host_scopes() {
     )
     .await;
 
-    for name in ["Memory fixture A", "Memory fixture B"] {
+    for (name, prompt, action) in [
+        ("Memory fixture A", "Recall a fixture preference", "memory_search"),
+        ("Memory fixture B", "Reclassify a fixture preference", "memory_update"),
+    ] {
         let assistant = send_json(
             &app,
             "POST",
@@ -506,7 +534,7 @@ async fn two_assistants_share_one_mem0_key_with_distinct_host_scopes() {
             &app,
             "POST",
             &format!("{path}/messages"),
-            json!({"content":"Recall a fixture preference"}),
+            json!({"content":prompt}),
             auth,
             StatusCode::ACCEPTED,
         )
@@ -530,7 +558,8 @@ async fn two_assistants_share_one_mem0_key_with_distinct_host_scopes() {
             scope,
             (
                 format!("aion-user-{}", user.id),
-                format!("aion-assistant-{}", definition.id)
+                format!("aion-assistant-{}", definition.id),
+                action.to_owned(),
             )
         );
         wait_for_finished_turn(&app, &path, &token).await;

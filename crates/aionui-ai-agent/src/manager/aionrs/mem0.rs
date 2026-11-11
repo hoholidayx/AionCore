@@ -64,7 +64,9 @@ impl Action {
             Self::Add => {
                 "Save durable facts. Follow the Memory Triage Skill, search first, and pass either facts or text. Omit secrets."
             }
-            Self::Update => "Update a changed long-term fact in place by ID. Omit secrets.",
+            Self::Update => {
+                "Update a long-term memory in place by ID. Provide text, category, importance, or metadata. Omit secrets."
+            }
             Self::Delete => {
                 "Preview candidates with query, or propose deleting one memory with memoryId. Wait for the user's confirmation and the tool result."
             }
@@ -94,7 +96,14 @@ impl Action {
                 }),
                 vec![],
             ),
-            Self::Update => (json!({"memoryId":id(),"text":text()}), vec!["memoryId", "text"]),
+            Self::Update => (
+                json!({
+                    "memoryId":id(), "text":text(), "category":{"type":"string","minLength":1,"maxLength":80},
+                    "importance":{"type":"number","minimum":0,"maximum":1},
+                    "metadata":{"type":"object","maxProperties":40,"description":"Top-level metadata keys to merge."}
+                }),
+                vec!["memoryId"],
+            ),
             Self::Delete => (json!({"memoryId":id(),"query":text()}), vec![]),
         };
         json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
@@ -113,6 +122,7 @@ impl Action {
         }
         match self {
             Self::Add => args.get("longTerm").is_none_or(|value| value.as_bool() == Some(true)),
+            Self::Update => args.len() > 1 && args.get("memoryId").and_then(Value::as_str).is_some_and(valid_id),
             Self::Delete => match (args.get("query"), args.get("memoryId")) {
                 (Some(query), None) => query.as_str().is_some_and(|text| !text.trim().is_empty()),
                 (None, Some(id)) => id.as_str().is_some_and(valid_id),
