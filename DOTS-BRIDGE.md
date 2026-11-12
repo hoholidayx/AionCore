@@ -1,9 +1,10 @@
 # Configure Dots in Aion Web
 
 AionCore reads `dots-bridge.json` from its data directory at startup. A standalone Web installation defaults to
-`~/.aionui-web`. Use the
-Bridge's private application API. If the Bridge runs on a VPS, forward a local
-loopback port to the VPS's loopback Bridge port using SSH.
+`~/.aionui-web`. Use the Bridge's private application API. A remote Bridge can be
+reached through a local loopback relay, either through a NAS with TLS and
+Tailscale or through SSH port forwarding. See the Bridge repository's deployment
+guide for both routes.
 
 ```json
 {
@@ -24,6 +25,12 @@ when starting a conversation and can open **Dots default conversation** from
 the pinned section of the sidebar. Replies use the original conversation.
 Independent messages from Dot appear in the default conversation. AionCore
 continues receiving messages while the browser is closed.
+
+Keep the same `url` and data directory when changing the relay transport so the
+running AionCore can reuse the current inbox cursor and request associations.
+With the workspace relay installed, run `./manage-services.py status dots-bridge`
+from the Aion workspace root to check the local listener and the Bridge health.
+The same target supports `start`, `stop`, and `restart`.
 
 The first connection skips the existing Bridge inbox. Later connections use
 the saved consumer position. Each Aion installation has its own consumer, so a
