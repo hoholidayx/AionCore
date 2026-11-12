@@ -352,6 +352,8 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
     const KEY: &str = "fixture-mem0-service-key-not-for-production";
     const SEARCH_ARGS: &str = r#"{"query":"fixture preference","minScore":0.4,"includeExpired":true,"since":"2026-11-01","until":"2026-11-02T08:00:00+08:00","timeField":"updated_at"}"#;
     const UPDATE_ARGS: &str = r#"{"memoryId":"fixture-id","category":"rp.habit"}"#;
+    const ADD_ARGS: &str = r#"{"items":[{"text":"Fixture work","category":"work.pref"},{"text":"Fixture role","category":"rp.master","importance":0},{"text":"Fixture todo","category":"work.todo"}],"expirationDate":"2030-02-01"}"#;
+    const ADD_RESULT: &str = r#"{"results":[{"index":0,"status":"stored","memoryId":"fixture-id"},{"index":1,"status":"write_unconfirmed","code":"write_unconfirmed"},{"index":2,"status":"not_attempted"}]}"#;
     const LIST_ARGS: &str =
         r#"{"categories":["work.todo"],"filters":{"priority":{"gte":2}},"limit":2,"cursor":"fixture-cursor"}"#;
     const INVALID_SEARCH_ARGS: &str = r#"{"query":"fixture preference","limit":"fixture-private-value"}"#;
@@ -390,6 +392,8 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
                         ("memory_delete", DELETE_ARGS)
                     } else if prompt.contains("Continue listing") {
                         ("memory_list", LIST_ARGS)
+                    } else if prompt.contains("Write facts across categories") {
+                        ("memory_add", ADD_ARGS)
                     } else {
                         ("memory_search", SEARCH_ARGS)
                     };
@@ -404,6 +408,14 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
                     if tool_name == "memory_update" {
                         assert_eq!(parameters["properties"]["category"]["type"], "string");
                         assert_eq!(parameters["required"], json!(["memoryId"]));
+                    } else if tool_name == "memory_add" {
+                        let batch = &parameters["properties"]["items"];
+                        assert_eq!(batch["minItems"], 1);
+                        assert_eq!(batch["maxItems"], 25);
+                        assert_eq!(batch["items"]["required"], json!(["text"]));
+                        assert_eq!(batch["items"]["additionalProperties"], false);
+                        assert_eq!(batch["items"]["properties"]["category"]["type"], "string");
+                        assert_eq!(batch["items"]["properties"]["importance"]["minimum"], 0);
                     } else if tool_name == "memory_search" {
                         let score = &parameters["properties"]["minScore"];
                         assert_eq!(score["type"], "number");
@@ -493,6 +505,7 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
                                 }
                                 "memory_search" => SEARCH_ARGS,
                                 "memory_list" => LIST_ARGS,
+                                "memory_add" => ADD_ARGS,
                                 "memory_update" => UPDATE_ARGS,
                                 "memory_get" => DELETE_ARGS,
                                 "memory_delete" if arguments.get("query").is_some() => PREVIEW_REQUEST,
@@ -513,6 +526,9 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
                                     "issues":[{"path":["limit"],"reason":"invalid_type"}]
                                 });
                                 json!({"isError":true,"content":[{"type":"text","text":diagnostic.to_string()}]})
+                            } else if action == "memory_add" {
+                                let receipt = serde_json::from_str::<Value>(ADD_RESULT).unwrap();
+                                json!({"content":[{"type":"text","text":ADD_RESULT}],"structuredContent":receipt})
                             } else if action == "memory_list" {
                                 let page =
                                     json!({"memories":[],"count":0,"truncated":true,"nextCursor":"fixture-next"});
@@ -580,6 +596,7 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
         (None, "memory_search", None),
         (None, "memory_update", None),
         (None, "memory_list", None),
+        (None, "memory_add", None),
         (
             Some(("initialize", StatusCode::BAD_REQUEST)),
             "memory_search",
@@ -606,6 +623,11 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
             Some("write_unconfirmed"),
         ),
         (
+            Some(("tools/call", StatusCode::SERVICE_UNAVAILABLE)),
+            "memory_add",
+            Some("write_unconfirmed"),
+        ),
+        (
             Some(("tools/call", StatusCode::OK)),
             "memory_search",
             Some("invalid_arguments"),
@@ -622,6 +644,7 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
             ("memory_search", Some("invalid_arguments")) => "Invalid search limit",
             ("memory_search", _) => "Recall a fixture preference",
             ("memory_list", _) => "Continue listing fixture tasks",
+            ("memory_add", _) => "Write facts across categories",
             ("memory_delete", _) => "Conflicting deletion arguments",
             _ => "Reclassify a fixture preference",
         };
@@ -776,6 +799,8 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
         } else if action == "memory_list" {
             assert_eq!(result_json["nextCursor"], "fixture-next");
             assert_eq!(result_json["truncated"], true);
+        } else if action == "memory_add" {
+            assert_eq!(result_json, serde_json::from_str::<Value>(ADD_RESULT).unwrap());
         } else {
             assert_eq!(result_json["memory"], "fixture memory result");
         }

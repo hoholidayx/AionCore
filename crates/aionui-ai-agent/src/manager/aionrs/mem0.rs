@@ -65,7 +65,7 @@ impl Action {
             }
             Self::Get => "Read a long-term memory by its exact ID.",
             Self::Add => {
-                "Save durable facts. Follow the Memory Triage Skill, search first, and pass either facts or text. Optionally set expirationDate (YYYY-MM-DD, UTC). Omit secrets."
+                "Save durable facts. Follow the Memory Triage Skill and search first. Pass text, facts, or items. Use items for different categories or importance values and inspect each indexed result. Optionally set expirationDate (YYYY-MM-DD, UTC). Omit secrets."
             }
             Self::Update => {
                 "Update a long-term memory in place by ID. Provide text, category, importance, or metadata. Omit secrets."
@@ -99,6 +99,18 @@ impl Action {
                 json!({
                     "facts":{"type":"array","items":text(),"minItems":1,"maxItems":25},
                     "text":text(), "category":{"type":"string"},
+                    "items":{
+                        "type":"array","minItems":1,"maxItems":25,
+                        "description":"Use instead of text or facts. Put category and importance on each item and omit top-level category, importance and metadata.",
+                        "items":{
+                            "type":"object","required":["text"],"additionalProperties":false,
+                            "properties":{
+                                "text":text(),
+                                "category":{"type":"string","minLength":1,"maxLength":80},
+                                "importance":{"type":"number","minimum":0,"maximum":1}
+                            }
+                        }
+                    },
                     "importance":{
                         "type":"number","minimum":0,"maximum":1,
                         "description":"Overrides metadata.importance, including an explicit 0. If both are omitted and a category is set, use its built-in default or 0.5 for a custom category."
