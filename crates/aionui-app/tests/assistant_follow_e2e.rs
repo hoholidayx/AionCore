@@ -350,7 +350,7 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
     use axum::http::HeaderMap;
 
     const KEY: &str = "fixture-mem0-service-key-not-for-production";
-    const SEARCH_ARGS: &str = r#"{"query":"fixture preference","includeExpired":true,"since":"2026-11-01","until":"2026-11-02T08:00:00+08:00","timeField":"updated_at"}"#;
+    const SEARCH_ARGS: &str = r#"{"query":"fixture preference","minScore":0.4,"includeExpired":true,"since":"2026-11-01","until":"2026-11-02T08:00:00+08:00","timeField":"updated_at"}"#;
     const UPDATE_ARGS: &str = r#"{"memoryId":"fixture-id","category":"rp.habit"}"#;
     const LIST_ARGS: &str =
         r#"{"categories":["work.todo"],"filters":{"priority":{"gte":2}},"limit":2,"cursor":"fixture-cursor"}"#;
@@ -405,6 +405,10 @@ async fn mem0_tools_bind_assistant_scopes_and_report_handshake_failures() {
                         assert_eq!(parameters["properties"]["category"]["type"], "string");
                         assert_eq!(parameters["required"], json!(["memoryId"]));
                     } else if tool_name == "memory_search" {
+                        let score = &parameters["properties"]["minScore"];
+                        assert_eq!(score["type"], "number");
+                        assert_eq!(score["minimum"], 0);
+                        assert_eq!(score["maximum"], 1);
                         assert_eq!(parameters["properties"]["includeExpired"]["type"], "boolean");
                         assert_eq!(parameters["properties"]["since"]["type"], "string");
                         assert_eq!(parameters["properties"]["until"]["type"], "string");

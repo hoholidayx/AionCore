@@ -58,7 +58,7 @@ impl Action {
     fn description(self) -> &'static str {
         match self {
             Self::Search => {
-                "Search this assistant's long-term memories by meaning, optionally filtered by categories, flat metadata, or record time. Set includeExpired to view expired memories."
+                "Search this assistant's long-term memories by meaning. Filter by relevance with minScore, or narrow by categories, flat metadata, or record time. Set includeExpired to view expired memories."
             }
             Self::List => {
                 "List this assistant's long-term memories by category, metadata, or record time. Pass nextCursor as cursor with the same filters to continue."
@@ -82,7 +82,8 @@ impl Action {
         let (mut properties, required) = match self {
             Self::Search => (
                 json!({
-                    "query":text(), "limit":{"type":"integer","minimum":1,"maximum":50}
+                    "query":text(), "limit":{"type":"integer","minimum":1,"maximum":50},
+                    "minScore":{"type":"number","minimum":0,"maximum":1,"description":"Inclusive minimum returned relevance score."}
                 }),
                 vec!["query"],
             ),
