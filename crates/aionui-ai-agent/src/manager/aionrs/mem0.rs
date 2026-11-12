@@ -65,7 +65,7 @@ impl Action {
             }
             Self::Get => "Read a long-term memory by its exact ID.",
             Self::Add => {
-                "Save durable facts. Follow the Memory Triage Skill and search first. Pass text, facts, or items. Use items for different categories or importance values and inspect each indexed result. Optionally set expirationDate (YYYY-MM-DD, UTC). Omit secrets."
+                "Save durable facts. Follow the memory-common skill when enabled and search first. Pass text, facts, or items. Use items for different categories or importance values and inspect each indexed result. Optionally set expirationDate (YYYY-MM-DD, UTC). Omit secrets."
             }
             Self::Update => {
                 "Update a long-term memory in place by ID. Provide text, category, importance, or metadata. Omit secrets."
